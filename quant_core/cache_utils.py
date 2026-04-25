@@ -11,7 +11,7 @@ from .config import BASE_DIR, DIPBUY_PREMIUM_MODEL_PATH, MIN_COMPOSITE_SCORE, PR
 from .storage import database_overview
 
 
-CACHE_VERSION = "strategy-cache-v3-dipbuy"
+CACHE_VERSION = "strategy-cache-v4-dipbuy-strategy-type"
 CACHE_DIR = BASE_DIR / "data" / "strategy_cache"
 
 

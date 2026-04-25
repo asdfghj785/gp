@@ -86,6 +86,7 @@ def init_db() -> None:
                 selected_at TEXT NOT NULL,
                 code TEXT NOT NULL,
                 name TEXT NOT NULL,
+                strategy_type TEXT NOT NULL DEFAULT '尾盘突破',
                 win_rate REAL NOT NULL,
                 selection_price REAL NOT NULL,
                 selection_change REAL,
@@ -118,6 +119,18 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_market_sync_runs_finished_at ON market_sync_runs(finished_at);
             CREATE INDEX IF NOT EXISTS idx_market_sync_runs_status ON market_sync_runs(status);
+            """
+        )
+        _ensure_column(conn, "daily_picks", "strategy_type", "TEXT NOT NULL DEFAULT '尾盘突破'")
+        conn.execute(
+            """
+            UPDATE daily_picks
+            SET strategy_type = COALESCE(
+                NULLIF(json_extract(raw_json, '$.winner.strategy_type'), ''),
+                strategy_type,
+                '尾盘突破'
+            )
+            WHERE strategy_type IS NULL OR strategy_type = ''
             """
         )
 
@@ -362,14 +375,15 @@ def latest_prediction_snapshot() -> dict[str, Any] | None:
 
 def save_daily_pick(pick: dict[str, Any]) -> int:
     init_db()
+    strategy_type = pick.get("strategy_type") or (pick.get("raw") or {}).get("winner", {}).get("strategy_type") or "尾盘突破"
     with connect() as conn:
         cursor = conn.execute(
             """
             INSERT INTO daily_picks (
-                selection_date, target_date, selected_at, code, name, win_rate,
+                selection_date, target_date, selected_at, code, name, strategy_type, win_rate,
                 selection_price, selection_change, model_status, status, raw_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(selection_date) DO NOTHING
             """,
             (
@@ -378,6 +392,7 @@ def save_daily_pick(pick: dict[str, Any]) -> int:
                 pick["selected_at"],
                 pick["code"],
                 pick["name"],
+                strategy_type,
                 pick["win_rate"],
                 pick["selection_price"],
                 pick.get("selection_change"),
@@ -443,8 +458,14 @@ def _decode_daily_pick(row: sqlite3.Row | None) -> dict[str, Any] | None:
     item = dict(row)
     item["success"] = None if item["success"] is None else bool(item["success"])
     item["raw"] = json.loads(item.pop("raw_json"))
-    item["strategy_type"] = (item.get("raw") or {}).get("winner", {}).get("strategy_type")
+    item["strategy_type"] = item.get("strategy_type") or (item.get("raw") or {}).get("winner", {}).get("strategy_type") or "尾盘突破"
     return item
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def save_market_sync_run(report: dict[str, Any]) -> int:

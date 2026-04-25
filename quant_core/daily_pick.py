@@ -62,6 +62,7 @@ def _pick_from_winner(winner: dict[str, Any], scan: dict[str, Any], selected_at:
         "selected_at": selected_at,
         "code": winner["code"],
         "name": winner["name"],
+        "strategy_type": winner.get("strategy_type", "尾盘突破"),
         "win_rate": float(winner["win_rate"]),
         "selection_price": float(winner["price"]),
         "selection_change": float(winner["change"]),

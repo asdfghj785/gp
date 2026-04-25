@@ -274,6 +274,7 @@ def _daily_pick_rows(df: pd.DataFrame, limit: int) -> list[dict[str, Any]]:
                 "date": str(row["date"]),
                 "code": str(row["纯代码"]),
                 "name": str(row["名称"]),
+                "strategy_type": str(row.get("strategy_type", "尾盘突破")),
                 "win_rate": round(float(row["AI胜率"]), 4),
                 "expected_premium": round(float(row["预期溢价"]), 4),
                 "risk_score": round(float(row["风险评分"]), 4),

@@ -100,7 +100,7 @@
               <tr v-for="row in radar.rows" :key="row.code">
                 <td class="mono">{{ row.code }}</td>
                 <td>{{ row.name }}</td>
-                <td><span class="pill">{{ row.strategy_type || '尾盘突破' }}</span></td>
+                <td><span :class="strategyBadgeClass(row.strategy_type)">{{ row.strategy_type || '尾盘突破' }}</span></td>
                 <td class="num">{{ money(row.price) }}</td>
                 <td :class="['num', row.change >= 0 ? 'up' : 'down']">{{ pct(row.change) }}</td>
                 <td class="num">{{ pct(row.turnover) }}</td>
@@ -198,7 +198,10 @@
             <tr v-for="pick in dailyPicks.rows" :key="pick.id">
               <td>{{ pick.selection_date }}</td>
               <td>{{ pick.target_date }}</td>
-              <td><span class="mono">{{ pick.code }}</span> {{ pick.name }}</td>
+              <td>
+                <span class="mono">{{ pick.code }}</span> {{ pick.name }}
+                <span :class="strategyBadgeClass(pick.strategy_type)">{{ pick.strategy_type || '尾盘突破' }}</span>
+              </td>
               <td class="num score">{{ pct(pick.win_rate) }}</td>
               <td class="num">{{ money(pick.selection_price) }}</td>
               <td class="num">{{ pick.open_price ? money(pick.open_price) : '-' }}</td>
@@ -235,6 +238,8 @@
         <div><span>平均溢价</span><strong :class="Number(backtest.summary.avg_open_premium) >= 0 ? 'up' : 'down'">{{ pct(backtest.summary.avg_open_premium) }}</strong></div>
         <div><span>中位溢价</span><strong :class="Number(backtest.summary.median_open_premium) >= 0 ? 'up' : 'down'">{{ pct(backtest.summary.median_open_premium) }}</strong></div>
         <div><span>修复昨收/量比</span><strong>{{ backtest.summary.repaired_pre_close_count || 0 }} / {{ backtest.summary.repaired_volume_ratio_count || 0 }}</strong></div>
+        <div><span>成交策略分布</span><strong>{{ strategyCountsText(backtest.summary.strategy_counts) }}</strong></div>
+        <div><span>候选策略分布</span><strong>{{ strategyCountsText(backtest.summary.candidate_strategy_counts) }}</strong></div>
       </div>
 
       <div class="table-wrap">
@@ -259,13 +264,58 @@
             </tr>
             <tr v-for="row in backtest.rows" :key="`${row.date}-${row.code}`">
               <td>{{ row.date }}</td>
-              <td><span class="mono">{{ row.code }}</span> {{ row.name }}</td>
+              <td>
+                <span class="mono">{{ row.code }}</span> {{ row.name }}
+                <span :class="strategyBadgeClass(row.strategy_type)">{{ row.strategy_type || '尾盘突破' }}</span>
+              </td>
               <td class="num score">{{ pct(row.win_rate) }}</td>
               <td :class="['num', Number(row.expected_premium) >= 0 ? 'up' : 'down']">{{ pct(row.expected_premium) }}</td>
               <td class="num score">{{ scoreText(row.composite_score) }}</td>
               <td class="num">{{ money(row.close) }}</td>
               <td>{{ row.next_date || '-' }}</td>
               <td class="num">{{ row.next_open ? money(row.next_open) : '-' }}</td>
+              <td :class="['num', Number(row.open_premium) >= 0 ? 'up' : 'down']">
+                {{ row.open_premium === null || row.open_premium === undefined ? '-' : pct(row.open_premium) }}
+              </td>
+              <td>
+                <strong v-if="row.success === null" class="pending">待开盘</strong>
+                <strong v-else :class="row.success ? 'pass' : 'fail'">{{ row.success ? '成功' : '失败' }}</strong>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel-subhead">
+        <div>
+          <h3>双轨候选观察</h3>
+          <p>按交易日分别展示尾盘突破与首阴低吸各自的模型 Top1，用于确认双轨回测口径。</p>
+        </div>
+      </div>
+
+      <div class="table-wrap compact-table">
+        <table>
+          <thead>
+            <tr>
+              <th>预测日</th>
+              <th>股票</th>
+              <th>策略</th>
+              <th class="num">预期溢价</th>
+              <th class="num">综合评分</th>
+              <th class="num">实际开盘</th>
+              <th>结果</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-if="backtest.strategy_rows.length === 0">
+              <td colspan="7" class="empty">暂无双轨候选观察数据</td>
+            </tr>
+            <tr v-for="row in backtest.strategy_rows.slice(0, 40)" :key="`${row.date}-${row.strategy_type}-${row.code}`">
+              <td>{{ row.date }}</td>
+              <td><span class="mono">{{ row.code }}</span> {{ row.name }}</td>
+              <td><span :class="strategyBadgeClass(row.strategy_type)">{{ row.strategy_type || '尾盘突破' }}</span></td>
+              <td :class="['num', Number(row.expected_premium) >= 0 ? 'up' : 'down']">{{ pct(row.expected_premium) }}</td>
+              <td class="num score">{{ scoreText(row.composite_score) }}</td>
               <td :class="['num', Number(row.open_premium) >= 0 ? 'up' : 'down']">
                 {{ row.open_premium === null || row.open_premium === undefined ? '-' : pct(row.open_premium) }}
               </td>
@@ -717,7 +767,7 @@ const loaded = reactive({
 const overview = ref({})
 const radar = reactive({ rows: [], created_at: '', model_status: '', market_gate: null, strategy: '', intraday_snapshot: null })
 const dailyPicks = reactive({ rows: [] })
-const backtest = reactive({ summary: null, rows: [], created_at: '' })
+const backtest = reactive({ summary: null, rows: [], strategy_rows: [], created_at: '' })
 const strategyLab = reactive({ summary: null, variants: [], thresholds: [], daily_picks: [], created_at: '' })
 const failureAnalysis = reactive({ summary: null, reasons: [], optimizations: [], sample_failures: [], created_at: '' })
 const upReason = reactive({ summary: null, factor_lifts: [], model_report: { feature_importance: [] }, llm_summary: {}, up_examples: [], down_examples: [], created_at: '' })
@@ -747,6 +797,14 @@ const busy = reactive({
 const money = (value) => Number(value ?? 0).toFixed(2)
 const pct = (value) => `${Number(value ?? 0).toFixed(2)}%`
 const scoreText = (value) => Number(value ?? 0).toFixed(2)
+const strategyBadgeClass = (strategyType) => [
+  'strategy-badge',
+  strategyType === '首阴低吸' ? 'strategy-badge-dipbuy' : 'strategy-badge-breakout',
+]
+const strategyCountsText = (counts) => {
+  if (!counts || Object.keys(counts).length === 0) return '-'
+  return Object.entries(counts).map(([name, count]) => `${name} ${count}`).join(' / ')
+}
 const amountText = (value) => {
   const amount = Number(value ?? 0)
   if (amount >= 100000000) return `${(amount / 100000000).toFixed(2)} 亿`
@@ -878,6 +936,7 @@ const loadBacktest = async (refresh = false) => {
     const data = await request(`/api/backtest/top-pick-open?months=12${refresh ? '&refresh=true' : ''}`)
     backtest.summary = data.summary
     backtest.rows = data.rows || []
+    backtest.strategy_rows = data.strategy_rows || []
     backtest.created_at = data.created_at
   } catch (error) {
     setMessage(`复盘统计失败：${error.message}`, 'error')
@@ -1414,6 +1473,37 @@ tbody tr:hover {
   white-space: nowrap;
 }
 
+.strategy-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  margin-left: 6px;
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 800;
+  line-height: 1.2;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.strategy-badge-breakout {
+  border-color: #bfdbfe;
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.strategy-badge-dipbuy {
+  border-color: #fed7aa;
+  background: #ffedd5;
+  color: #9a3412;
+}
+
+td > .strategy-badge:first-child {
+  margin-left: 0;
+}
+
 td small {
   display: block;
   margin-top: 4px;
@@ -1484,6 +1574,28 @@ td small {
   display: grid;
   grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
   gap: 14px;
+}
+
+.panel-subhead {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 16px 0 10px;
+}
+
+.panel-subhead h3 {
+  margin: 0 0 4px;
+  font-size: 0.98rem;
+}
+
+.panel-subhead p {
+  margin: 0;
+  color: #66758c;
+  line-height: 1.45;
+}
+
+.compact-table table {
+  min-width: 760px;
 }
 
 .failure-samples {
@@ -1638,6 +1750,20 @@ pre {
 
 .analysis-box ul {
   padding-left: 18px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .strategy-badge-breakout {
+    border-color: #60a5fa;
+    background: #172554;
+    color: #bfdbfe;
+  }
+
+  .strategy-badge-dipbuy {
+    border-color: #fb923c;
+    background: #431407;
+    color: #fed7aa;
+  }
 }
 
 @media (max-width: 980px) {

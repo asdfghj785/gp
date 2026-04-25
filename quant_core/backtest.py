@@ -22,9 +22,14 @@ def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, 
     feature_df = prepared["evaluated"]
     if feature_df.empty:
         return _empty_result("过滤后没有候选股票")
+    strategy_rows = _strategy_pick_rows(feature_df, limit=120)
+    candidate_strategy_counts = feature_df["strategy_type"].fillna("尾盘突破").value_counts().to_dict() if "strategy_type" in feature_df.columns else {}
     feature_df = apply_production_filters(feature_df)
     if feature_df.empty:
-        return _empty_result("生产过滤后没有候选股票")
+        result = _empty_result("生产过滤后没有候选股票")
+        result["strategy_rows"] = strategy_rows
+        result["summary"]["candidate_strategy_counts"] = {str(key): int(value) for key, value in candidate_strategy_counts.items()}
+        return result
 
     feature_df = feature_df.sort_values(["date", "预期溢价", "综合评分"], ascending=[True, False, False])
     idx = feature_df.groupby("date")["预期溢价"].idxmax()
@@ -37,29 +42,12 @@ def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, 
         current_close = float(pick["最新价"])
         next_open = float(pick["next_open"]) if pd.notna(pick.get("next_open")) else None
         premium = float(pick["open_premium"]) if pd.notna(pick.get("open_premium")) else None
-        item = {
-            "date": current_date,
-            "code": code,
-            "name": _display_name(code, pick.get("名称")),
-            "name_source": str(pick.get("name_source", "unknown")),
-            "win_rate": round(float(pick["AI胜率"]), 4),
-            "close": round(current_close, 4),
-            "change": round(float(pick["涨跌幅"]), 4),
-            "turnover": round(float(pick["换手率"]), 4),
-            "expected_premium": round(float(pick.get("预期溢价", 0)), 4),
-            "risk_score": round(float(pick.get("风险评分", 0)), 4),
-            "liquidity_score": round(float(pick.get("流动性评分", 0)), 4),
-            "composite_score": round(float(pick.get("综合评分", pick["AI胜率"])), 4),
-            "next_date": str(pick.get("next_date")) if pd.notna(pick.get("next_date")) else None,
-            "next_open": round(next_open, 4) if next_open is not None else None,
-            "open_premium": round(premium, 4) if premium is not None else None,
-            "success": premium > PROFIT_TARGET_PCT if premium is not None else None,
-        }
-        results.append(item)
+        results.append(_backtest_row(pick, current_close, next_open, premium))
 
     evaluated = [row for row in results if row["success"] is not None]
     wins = [row for row in evaluated if row["success"]]
     premiums = [float(row["open_premium"]) for row in evaluated if row["open_premium"] is not None]
+    strategy_counts = pd.Series([row.get("strategy_type", "尾盘突破") for row in results]).value_counts().to_dict()
     summary = {
         "months": months,
         "start_date": prepared["start_date"],
@@ -70,6 +58,8 @@ def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, 
         "win_count": len(wins),
         "loss_count": len(evaluated) - len(wins),
         "win_rate": round(len(wins) / len(evaluated) * 100, 4) if evaluated else 0.0,
+        "strategy_counts": {str(key): int(value) for key, value in strategy_counts.items()},
+        "candidate_strategy_counts": {str(key): int(value) for key, value in candidate_strategy_counts.items()},
         "avg_open_premium": round(float(pd.Series(premiums).mean()), 4) if premiums else 0.0,
         "median_open_premium": round(float(pd.Series(premiums).median()), 4) if premiums else 0.0,
         "best_open_premium": round(max(premiums), 4) if premiums else 0.0,
@@ -81,7 +71,46 @@ def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, 
         "trading_day_filter": "weekday<5 且全市场有效样本>=1000 且成交额>0。",
         "rank_rule": f"XGBRegressor 直接预测次日开盘预期溢价；综合评分=预期溢价60%+风险20%+流动性10%+收益信号10%，最终排序优先看预期溢价。",
     }
-    return {"created_at": datetime.now().isoformat(timespec="seconds"), "summary": summary, "rows": results[::-1]}
+    return {"created_at": datetime.now().isoformat(timespec="seconds"), "summary": summary, "rows": results[::-1], "strategy_rows": strategy_rows}
+
+
+def _backtest_row(pick: pd.Series, current_close: float, next_open: float | None, premium: float | None) -> dict[str, Any]:
+    code = str(pick["纯代码"])
+    return {
+        "date": str(pick["date"]),
+        "code": code,
+        "name": _display_name(code, pick.get("名称")),
+        "name_source": str(pick.get("name_source", "unknown")),
+        "strategy_type": str(pick.get("strategy_type", "尾盘突破")),
+        "win_rate": round(float(pick["AI胜率"]), 4),
+        "close": round(current_close, 4),
+        "change": round(float(pick["涨跌幅"]), 4),
+        "turnover": round(float(pick["换手率"]), 4),
+        "expected_premium": round(float(pick.get("预期溢价", 0)), 4),
+        "risk_score": round(float(pick.get("风险评分", 0)), 4),
+        "liquidity_score": round(float(pick.get("流动性评分", 0)), 4),
+        "composite_score": round(float(pick.get("综合评分", pick["AI胜率"])), 4),
+        "next_date": str(pick.get("next_date")) if pd.notna(pick.get("next_date")) else None,
+        "next_open": round(next_open, 4) if next_open is not None else None,
+        "open_premium": round(premium, 4) if premium is not None else None,
+        "success": premium > PROFIT_TARGET_PCT if premium is not None else None,
+    }
+
+
+def _strategy_pick_rows(df: pd.DataFrame, limit: int = 120) -> list[dict[str, Any]]:
+    if df.empty or "strategy_type" not in df.columns:
+        return []
+    candidates = df.copy()
+    candidates["strategy_type"] = candidates["strategy_type"].fillna("尾盘突破")
+    candidates = candidates.sort_values(["date", "strategy_type", "预期溢价", "综合评分"], ascending=[True, True, False, False])
+    idx = candidates.groupby(["date", "strategy_type"])["预期溢价"].idxmax()
+    picks = candidates.loc[idx].sort_values(["date", "strategy_type"], ascending=[False, True]).head(limit)
+    rows: list[dict[str, Any]] = []
+    for _, pick in picks.iterrows():
+        next_open = float(pick["next_open"]) if pd.notna(pick.get("next_open")) else None
+        premium = float(pick["open_premium"]) if pd.notna(pick.get("open_premium")) else None
+        rows.append(_backtest_row(pick, float(pick["最新价"]), next_open, premium))
+    return rows
 
 
 def _latest_trade_date() -> str | None:
@@ -283,6 +312,8 @@ def _empty_result(reason: str) -> dict[str, Any]:
             "win_count": 0,
             "loss_count": 0,
             "win_rate": 0.0,
+            "strategy_counts": {},
+            "candidate_strategy_counts": {},
             "avg_open_premium": 0.0,
             "median_open_premium": 0.0,
             "best_open_premium": 0.0,
@@ -291,4 +322,12 @@ def _empty_result(reason: str) -> dict[str, Any]:
             "rule": "无可用数据",
         },
         "rows": [],
+        "strategy_rows": [],
     }
+
+
+if __name__ == "__main__":
+    import json
+
+    result = top_pick_open_backtest(months=12, refresh=True)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
