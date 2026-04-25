@@ -48,6 +48,7 @@ def get_realtime_recommendation() -> None:
     winner = rows[0]
     content = f"""【AI 尾盘策略】
 代码: {winner['code']} | 名称: {winner['name']}
+【命中策略】: {winner.get('strategy_type', '未知')}
 价格: {winner['price']:.2f} | 涨幅: {winner['change']:.2f}%
 换手: {winner['turnover']:.2f}% | 量比: {winner['volume_ratio']:.2f}
 收益信号: {winner['win_rate']:.2f}
@@ -58,7 +59,7 @@ def get_realtime_recommendation() -> None:
 成交额: {gate.get('market_amount_yi', 0):.0f} 亿
 14:30快照: {intraday.get('status')} | 拦截: {intraday.get('trapped_count', 0)}
 
-策略: 目标为次日开盘溢价覆盖1.0%成本缓冲；晴天60%、阴天75%、尾盘拉升超过阈值直接剔除。"""
+策略: 尾盘突破/首阴低吸双轨模型按预期溢价排序；目标为次日开盘溢价覆盖1.0%成本缓冲；晴天60%、阴天75%、尾盘拉升超过阈值直接剔除。"""
     send_wechat_msg(f"尾盘候选: {winner['name']} ({winner['composite_score']:.1f})", content)
 
 

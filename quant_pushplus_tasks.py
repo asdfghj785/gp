@@ -57,10 +57,12 @@ def top_pick() -> dict[str, Any]:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     locked = get_daily_pick(date.today().isoformat())
     if locked:
+        locked_strategy = locked.get("strategy_type") or (locked.get("raw") or {}).get("winner", {}).get("strategy_type", "未知")
         content = f"""14:50 推送标的已锁定
 时间: {now}
 代码: {locked['code']}
 名称: {locked['name']}
+【命中策略】: {locked_strategy}
 锁定价: {locked['selection_price']:.2f}
 收益信号: {locked['win_rate']:.2f}
 状态: {locked['status']}
@@ -107,6 +109,7 @@ def top_pick() -> dict[str, Any]:
 时间: {now}
 代码: {winner['code']}
 名称: {winner['name']}
+【命中策略】: {winner.get('strategy_type', '未知')}
 现价: {winner['price']:.2f}
 涨跌幅: {winner['change']:.2f}%
 换手率: {winner['turnover']:.2f}%
@@ -126,7 +129,7 @@ def top_pick() -> dict[str, Any]:
 尾盘拉升: {winner['trend_features'].get('late_pull_pct', 0):.2f}%
 振幅换手比: {winner['trend_features'].get('amplitude_turnover_ratio', 0):.2f}
 
-过滤规则: 已排除创业板、北交所、科创板、ST/退市；回归模型按预期溢价排序；雷暴或下跌缩量空仓；14:30后尾盘拉升超过阈值、近3日断头铡刀直接剔除；目标为次日开盘溢价覆盖1.0%成本缓冲。
+过滤规则: 已排除创业板、北交所、科创板、ST/退市；尾盘突破/首阴低吸双轨回归模型按预期溢价排序；雷暴或下跌缩量空仓；14:30后尾盘拉升超过阈值、近3日断头铡刀直接剔除；目标为次日开盘溢价覆盖1.0%成本缓冲。
 """
     result = send_pushplus(f"14:50尾盘候选: {winner['name']} {winner['composite_score']:.1f}", content)
     saved = save_pushed_top_pick(winner, scan, force=False)

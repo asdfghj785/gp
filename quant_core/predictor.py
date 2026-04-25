@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .config import LATEST_TOP50_PATH, MIN_COMPOSITE_SCORE, MODEL_PATH, PREMIUM_MODEL_PATH, PROFIT_TARGET_PCT
+from .config import DATA_DIR, DIPBUY_PREMIUM_MODEL_PATH, LATEST_TOP50_PATH, MIN_COMPOSITE_SCORE, MODEL_PATH, PREMIUM_MODEL_PATH, PROFIT_TARGET_PCT
 from .intraday_snapshot import attach_late_pull_trap
 from .market import fetch_market_indices, fetch_sina_snapshot
 from .storage import connect, save_prediction_snapshot, upsert_daily_rows
@@ -42,6 +42,22 @@ FEATURE_COLS = [
     "market_avg_change",
     "market_down_count",
 ]
+DIPBUY_TEMPORAL_FEATURE_COLS = [
+    "近5日最高涨幅",
+    "今日急跌度",
+    "10日均线乖离率",
+    "今日缩量比例",
+]
+DIPBUY_FEATURE_COLS = [*FEATURE_COLS, *DIPBUY_TEMPORAL_FEATURE_COLS]
+DIPBUY_STRATEGY_TYPE = "首阴低吸"
+BREAKOUT_STRATEGY_TYPE = "尾盘突破"
+DIPBUY_FILTERS = {
+    "min_5d_high_gain": 15.0,
+    "max_intraday_flush": -4.0,
+    "bias10_low": -3.0,
+    "bias10_high": 3.0,
+    "max_amount_shrink_pct": 0.0,
+}
 LOW_LIQUIDITY_AMOUNT = 700_000_000_000
 HIGH_LIQUIDITY_AMOUNT = 800_000_000_000
 
@@ -74,6 +90,20 @@ def _load_premium_model():
         return None, f"溢价模型加载失败: {exc}"
 
 
+@lru_cache(maxsize=1)
+def _load_dipbuy_premium_model():
+    if not DIPBUY_PREMIUM_MODEL_PATH.exists():
+        return None, f"找不到低吸溢价模型文件: {DIPBUY_PREMIUM_MODEL_PATH}"
+    try:
+        import xgboost as xgb
+
+        model = xgb.XGBRegressor()
+        model.load_model(str(DIPBUY_PREMIUM_MODEL_PATH))
+        return model, None
+    except Exception as exc:
+        return None, f"低吸溢价模型加载失败: {exc}"
+
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["纯代码"] = out["code"].astype(str).str.extract(r"(\d{6})")[0]
@@ -93,13 +123,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["date"] = out["date"].astype(str)
 
     out = _add_market_context(out)
-    out = _add_temporal_features(out)
-
     out = out[~out["纯代码"].str.startswith(("30", "4", "8", "92"), na=False)].copy()
     out = out[~out["名称"].str.contains("ST|退", case=False, na=False)].copy()
     out = out[(out["最新价"] > 0) & (out["昨收"] > 0)].copy()
     high_limit_board = out["纯代码"].str.startswith(("30", "68"), na=False)
     out = out[((high_limit_board) & (out["涨跌幅"] < 19.5)) | ((~high_limit_board) & (out["涨跌幅"] < 9.5))].copy()
+    if out.empty:
+        return out
+    out = _add_temporal_features(out)
 
     out["实体比例"] = ((out["最新价"] - out["今开"]) / out["昨收"] * 100).replace([np.inf, -np.inf], 0).fillna(0)
     out["上影线比例"] = ((out["最高"] - out[["今开", "最新价"]].max(axis=1)) / out["昨收"] * 100).replace([np.inf, -np.inf], 0).fillna(0)
@@ -108,31 +139,52 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["真实涨幅点数"] = out["涨跌幅"]
     out["turn"] = out["换手率"]
     out["振幅换手比"] = (out["日内振幅"] / out["换手率"].replace(0, np.nan)).replace([np.inf, -np.inf], 0).fillna(0)
-    out["缩量大涨标记"] = ((out["涨跌幅"] > 3) & (pd.to_numeric(out.get("5日量能堆积", 0), errors="coerce").fillna(0) < 1)).astype(float)
+    out["缩量大涨标记"] = ((out["涨跌幅"] > 3) & (_num(out, "5日量能堆积") < 1)).astype(float)
     out["极端下影线标记"] = ((out["下影线比例"] > out["实体比例"].abs() * 2) & (out["涨跌幅"] > 3)).astype(float)
     return out
 
 
 def score_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     scored = df.copy()
-    for col in FEATURE_COLS:
+    for col in DIPBUY_FEATURE_COLS:
         if col not in scored.columns:
             scored[col] = 0.0
         scored[col] = pd.to_numeric(scored[col], errors="coerce").replace([np.inf, -np.inf], 0).fillna(0)
     if scored.empty:
         return scored, "ready"
 
+    scored["strategy_type"] = BREAKOUT_STRATEGY_TYPE
+    scored["预期溢价"] = _fallback_expected_premium(scored)
+    dipbuy_mask = _dipbuy_physical_mask(scored)
     premium_model, premium_error = _load_premium_model()
+    dipbuy_model, dipbuy_error = _load_dipbuy_premium_model()
+    status_parts: list[str] = []
+
     if premium_model is not None:
         try:
-            scored["预期溢价"] = premium_model.predict(scored[FEATURE_COLS].values)
-            model_status = "regressor_ready"
+            breakout_index = scored.index[~dipbuy_mask]
+            if len(breakout_index) > 0:
+                scored.loc[breakout_index, "预期溢价"] = premium_model.predict(scored.loc[breakout_index, FEATURE_COLS].values)
+            status_parts.append("breakout_regressor_ready")
         except Exception as exc:
-            scored["预期溢价"] = _fallback_expected_premium(scored)
-            model_status = f"回归模型失败，已降级规则估算: {exc}"
+            status_parts.append(f"尾盘突破回归模型失败，已降级规则估算: {exc}")
     else:
-        scored["预期溢价"] = _fallback_expected_premium(scored)
-        model_status = premium_error or "premium_model_unavailable"
+        status_parts.append(premium_error or "breakout_model_unavailable")
+
+    if dipbuy_mask.any():
+        scored.loc[dipbuy_mask, "strategy_type"] = DIPBUY_STRATEGY_TYPE
+        if dipbuy_model is not None:
+            try:
+                scored.loc[dipbuy_mask, "预期溢价"] = dipbuy_model.predict(scored.loc[dipbuy_mask, DIPBUY_FEATURE_COLS].values)
+                status_parts.append(f"dipbuy_regressor_ready:{int(dipbuy_mask.sum())}")
+            except Exception as exc:
+                status_parts.append(f"首阴低吸回归模型失败，已降级规则估算: {exc}")
+        else:
+            status_parts.append(dipbuy_error or "dipbuy_model_unavailable")
+    else:
+        status_parts.append("dipbuy_no_physical_match")
+
+    scored["预期溢价"] = pd.to_numeric(scored["预期溢价"], errors="coerce").replace([np.inf, -np.inf], 0).fillna(0)
 
     scored["风险评分"] = _risk_score(scored)
     scored["流动性评分"] = _liquidity_score(scored)
@@ -144,7 +196,17 @@ def score_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
         + scored["流动性评分"] * 0.10
         + scored["AI胜率"] * 0.10
     ).clip(0, 100)
+    model_status = "; ".join(status_parts) if status_parts else "ready"
     return scored, model_status
+
+
+def _dipbuy_physical_mask(df: pd.DataFrame) -> pd.Series:
+    return (
+        (_num(df, "近5日最高涨幅") > DIPBUY_FILTERS["min_5d_high_gain"])
+        & (_num(df, "今日急跌度") < DIPBUY_FILTERS["max_intraday_flush"])
+        & (_num(df, "10日均线乖离率").between(DIPBUY_FILTERS["bias10_low"], DIPBUY_FILTERS["bias10_high"]))
+        & (_num(df, "今日缩量比例") < DIPBUY_FILTERS["max_amount_shrink_pct"])
+    ).fillna(False)
 
 
 def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = None) -> pd.DataFrame:
@@ -218,14 +280,15 @@ def scan_market(
 
     df = apply_production_filters(df, gate)
 
-    df = df.sort_values(["预期溢价", "综合评分"], ascending=[False, False]).head(limit)
+    final_limit = min(max(int(limit), 1), 1)
+    df = df.sort_values(["预期溢价", "综合评分"], ascending=[False, False]).head(final_limit)
     rows = [_row_to_api(row) for _, row in df.iterrows()]
-    snapshot_id = save_prediction_snapshot("xgboost_regressor" if model_status == "regressor_ready" else "rule_fallback", rows) if cache_prediction else None
+    snapshot_id = save_prediction_snapshot("dual_xgboost_regressor" if "regressor_ready" in model_status else "rule_fallback", rows) if cache_prediction else None
     payload = {
         "id": snapshot_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_status": model_status,
-        "strategy": f"生产策略：回归器预测次日开盘预期溢价，按预期溢价排序；剔除创业板/北交所/科创板/ST，叠加大盘分级风控，综合评分>={MIN_COMPOSITE_SCORE:.1f}；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多、近3日断头铡刀直接剔除。",
+        "strategy": f"生产策略：尾盘突破与首阴低吸双轨回归器预测次日开盘预期溢价，按预期溢价排序；剔除创业板/北交所/科创板/ST，叠加大盘分级风控，综合评分>={MIN_COMPOSITE_SCORE:.1f}；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多、近3日断头铡刀直接剔除。",
         "market_gate": gate,
         "intraday_snapshot": intraday_snapshot,
         "rows": rows,
@@ -357,7 +420,7 @@ def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
             history["_current_row"] = False
             combined = pd.concat([history, current], ignore_index=True, sort=False)
 
-    for col in ["最新价", "今开", "volume", "换手率"]:
+    for col in ["最新价", "今开", "最高", "最低", "volume", "amount", "换手率"]:
         if col not in combined.columns:
             combined[col] = 0.0
         combined[col] = pd.to_numeric(combined[col], errors="coerce").fillna(0.0)
@@ -366,13 +429,18 @@ def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     group = combined.groupby("纯代码", sort=False)
     close = combined["最新价"]
     open_price = combined["今开"]
+    high = combined["最高"]
+    low = combined["最低"]
     volume = combined["volume"]
+    amount = combined["amount"]
     turnover = combined["换手率"]
 
     prev3_close = group["最新价"].shift(3)
     prev5_close = group["最新价"].shift(5)
     ma5 = group["最新价"].transform(lambda values: values.rolling(5, min_periods=3).mean())
+    ma10 = group["最新价"].transform(lambda values: values.rolling(10, min_periods=5).mean())
     ma20 = group["最新价"].transform(lambda values: values.rolling(20, min_periods=10).mean())
+    high5 = group["最高"].transform(lambda values: values.rolling(5, min_periods=3).max())
     high60 = group["最新价"].transform(lambda values: values.rolling(60, min_periods=20).max())
     avg_turn3 = group["换手率"].transform(lambda values: values.rolling(3, min_periods=2).mean())
     avg_vol5 = group["volume"].transform(lambda values: values.shift(1).rolling(5, min_periods=3).mean())
@@ -380,12 +448,17 @@ def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     red3 = (close > open_price).astype(float).groupby(combined["纯代码"], sort=False).transform(lambda values: values.rolling(3, min_periods=2).mean() * 100)
     min_vol5 = group["volume"].transform(lambda values: values.rolling(5, min_periods=3).min())
     prev_close = group["最新价"].shift(1)
+    prev_amount = group["amount"].shift(1)
     recent_3d_min_change = group["涨跌幅"].transform(lambda values: values.shift(1).rolling(3, min_periods=1).min())
 
     combined["5日累计涨幅"] = ((close / prev5_close - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
     combined["3日累计涨幅"] = ((close / prev3_close - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
     combined["5日均线乖离率"] = ((close / ma5 - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["10日均线乖离率"] = ((close / ma10 - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
     combined["20日均线乖离率"] = ((close / ma20 - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["近5日最高涨幅"] = ((high5 / prev5_close - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["今日急跌度"] = ((low / prev_close - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["今日缩量比例"] = ((amount / prev_amount - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
     combined["3日平均换手率"] = avg_turn3.replace([np.inf, -np.inf], 0).fillna(turnover)
     combined["5日量能堆积"] = (volume / avg_vol5).replace([np.inf, -np.inf], 0).fillna(0)
     combined["10日量比"] = (volume / avg_vol10).replace([np.inf, -np.inf], 0).fillna(0)
@@ -400,6 +473,7 @@ def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
             combined[col] = 0.0
     if "尾盘诱多标记" not in combined.columns:
         combined["尾盘诱多标记"] = 0.0
+    combined[DIPBUY_TEMPORAL_FEATURE_COLS] = combined[DIPBUY_TEMPORAL_FEATURE_COLS].replace([np.inf, -np.inf], 0).fillna(0)
 
     result = combined[combined["_current_row"]].copy()
     return result.drop(columns=["_current_row", "date_sort"], errors="ignore")
@@ -408,6 +482,103 @@ def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
 def _load_recent_history_for_codes(codes: list[str], current_date: str) -> pd.DataFrame:
     if not codes:
         return pd.DataFrame()
+    unique_codes = tuple(sorted({str(code).zfill(6) for code in codes if str(code).strip()}))
+    if not unique_codes:
+        return pd.DataFrame()
+    history = _load_recent_history_from_parquet(unique_codes, current_date)
+    if not history.empty:
+        return history
+    return _load_recent_history_from_db(list(unique_codes), current_date)
+
+
+@lru_cache(maxsize=4)
+def _load_recent_history_from_parquet(codes: tuple[str, ...], current_date: str) -> pd.DataFrame:
+    if not codes or not DATA_DIR.exists():
+        return pd.DataFrame()
+    start_date = (pd.Timestamp(current_date) - pd.DateOffset(days=140)).strftime("%Y-%m-%d")
+    columns = [
+        "symbol", "code", "name", "date", "open", "high", "low", "close", "pre_close",
+        "change_pct", "真实涨幅点数", "pctChg", "volume", "amount", "turnover", "turn", "volume_ratio", "量比"
+    ]
+    try:
+        raw = pd.read_parquet(DATA_DIR, columns=columns)
+    except Exception:
+        return pd.DataFrame()
+    if raw.empty or "date" not in raw.columns:
+        return pd.DataFrame()
+    raw["纯代码"] = raw.get("code", "").astype(str).str.extract(r"(\d{6})")[0]
+    symbol_code = raw.get("symbol", "").astype(str).str.extract(r"(\d{6})")[0]
+    raw["纯代码"] = raw["纯代码"].where(raw["纯代码"].notna(), symbol_code)
+    raw = raw[raw["纯代码"].isin(codes)].copy()
+    if raw.empty:
+        return pd.DataFrame()
+    raw["_date_sort"] = pd.to_datetime(raw["date"].astype(str), errors="coerce")
+    start_ts = pd.Timestamp(start_date)
+    current_ts = pd.Timestamp(current_date)
+    raw = raw[(raw["_date_sort"] >= start_ts) & (raw["_date_sort"] < current_ts)].copy()
+    if raw.empty:
+        return pd.DataFrame()
+    out = pd.DataFrame(index=raw.index)
+    out["code"] = raw["纯代码"]
+    out["name"] = raw["name"] if "name" in raw.columns else ""
+    out["date"] = raw["_date_sort"].dt.strftime("%Y-%m-%d")
+    out["open"] = _source_num(raw, "open")
+    out["high"] = _source_num(raw, "high")
+    out["low"] = _source_num(raw, "low")
+    out["close"] = _source_num(raw, "close")
+    out["pre_close"] = _source_num(raw, "pre_close")
+    out["change_pct"] = _first_available_num(raw, ["change_pct", "真实涨幅点数", "pctChg"])
+    out["volume"] = _source_num(raw, "volume")
+    out["amount"] = _source_num(raw, "amount")
+    out["turnover"] = _first_available_num(raw, ["turnover", "turn"])
+    out["volume_ratio"] = _first_available_num(raw, ["volume_ratio", "量比"])
+    return _format_history_frame(out)
+
+
+def _read_kline_history_file(code: str, start_date: str, current_date: str) -> pd.DataFrame:
+    path = DATA_DIR / f"{code}_daily.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_parquet(path)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty or "date" not in df.columns:
+        return pd.DataFrame()
+    df = df[(df["date"].astype(str) >= start_date) & (df["date"].astype(str) < current_date)].copy()
+    if df.empty:
+        return pd.DataFrame()
+    out = pd.DataFrame(index=df.index)
+    out["code"] = str(code)
+    out["name"] = df["name"] if "name" in df.columns else ""
+    out["date"] = df["date"].astype(str)
+    out["open"] = _source_num(df, "open")
+    out["high"] = _source_num(df, "high")
+    out["low"] = _source_num(df, "low")
+    out["close"] = _source_num(df, "close")
+    out["pre_close"] = _source_num(df, "pre_close")
+    out["change_pct"] = _first_available_num(df, ["change_pct", "真实涨幅点数", "pctChg"])
+    out["volume"] = _source_num(df, "volume")
+    out["amount"] = _source_num(df, "amount")
+    out["turnover"] = _first_available_num(df, ["turnover", "turn"])
+    out["volume_ratio"] = _first_available_num(df, ["volume_ratio", "量比"])
+    return _format_history_frame(out)
+
+
+def _source_num(df: pd.DataFrame, col: str) -> pd.Series:
+    if col not in df.columns:
+        return pd.Series(0.0, index=df.index)
+    return pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], 0).fillna(0)
+
+
+def _first_available_num(df: pd.DataFrame, cols: list[str]) -> pd.Series:
+    for col in cols:
+        if col in df.columns:
+            return _source_num(df, col)
+    return pd.Series(0.0, index=df.index)
+
+
+def _load_recent_history_from_db(codes: list[str], current_date: str) -> pd.DataFrame:
     start_date = (pd.Timestamp(current_date) - pd.DateOffset(days=140)).strftime("%Y-%m-%d")
     placeholders = ",".join("?" for _ in codes)
     query = f"""
@@ -424,6 +595,10 @@ def _load_recent_history_for_codes(codes: list[str], current_date: str) -> pd.Da
         return pd.DataFrame()
     if history.empty:
         return history
+    return _format_history_frame(history)
+
+
+def _format_history_frame(history: pd.DataFrame) -> pd.DataFrame:
     history["纯代码"] = history["code"].astype(str).str.extract(r"(\d{6})")[0]
     history["名称"] = history["name"].fillna("")
     history["最新价"] = pd.to_numeric(history["close"], errors="coerce").fillna(0)
@@ -436,6 +611,10 @@ def _load_recent_history_for_codes(codes: list[str], current_date: str) -> pd.Da
     history["最低"] = pd.to_numeric(history["low"], errors="coerce").fillna(0)
     history["volume"] = pd.to_numeric(history["volume"], errors="coerce").fillna(0)
     history["amount"] = pd.to_numeric(history["amount"], errors="coerce").fillna(0)
+    numeric_cols = history.select_dtypes(include=[np.number]).columns
+    history[numeric_cols] = history[numeric_cols].replace([np.inf, -np.inf], 0).fillna(0)
+    history["name"] = history["name"].fillna("")
+    history["名称"] = history["名称"].fillna("")
     return history
 
 
@@ -564,6 +743,7 @@ def _row_to_api(row: pd.Series) -> dict[str, Any]:
     return {
         "code": str(row["纯代码"]),
         "name": str(row["名称"]),
+        "strategy_type": str(row.get("strategy_type", BREAKOUT_STRATEGY_TYPE)),
         "price": round(float(row["最新价"]), 4),
         "change": round(float(row["涨跌幅"]), 4),
         "volume_ratio": round(float(row["量比"]), 4),
@@ -583,7 +763,11 @@ def _row_to_api(row: pd.Series) -> dict[str, Any]:
             "return_5d": round(float(row.get("5日累计涨幅", 0)), 4),
             "return_3d": round(float(row.get("3日累计涨幅", 0)), 4),
             "bias_5d": round(float(row.get("5日均线乖离率", 0)), 4),
+            "bias_10d": round(float(row.get("10日均线乖离率", 0)), 4),
             "bias_20d": round(float(row.get("20日均线乖离率", 0)), 4),
+            "max_gain_5d": round(float(row.get("近5日最高涨幅", 0)), 4),
+            "intraday_flush": round(float(row.get("今日急跌度", 0)), 4),
+            "amount_shrink_pct": round(float(row.get("今日缩量比例", 0)), 4),
             "avg_turnover_3d": round(float(row.get("3日平均换手率", 0)), 4),
             "volume_stack_5d": round(float(row.get("5日量能堆积", 0)), 4),
             "volume_ratio_10d": round(float(row.get("10日量比", 0)), 4),

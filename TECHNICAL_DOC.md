@@ -8,6 +8,7 @@
 
 - 只使用 `XGBRegressor` 预测次日开盘预期溢价。
 - 每日候选按 `预期溢价` 优先排序。
+- 实时预测采用双轨模型：`尾盘突破` 与 `强趋势首阴低吸`。
 - 默认生产门槛：`综合评分 >= 69.0`。
 - 过滤创业板、北交所、科创板、ST/退市、高位爆量、尾盘诱多、近 3 日断头铡刀。
 - 14:50 PushPlus 推送成功后自动锁定当日标的，前端不能手动修改。
@@ -68,6 +69,7 @@
 ├── run_push_top_pick.sh                   # 14:50 推送执行脚本
 ├── launch_agents/                         # LaunchAgent 配置
 ├── overnight_premium_xgboost.json         # 当前生产回归模型
+├── dipbuy_premium_xgboost.json            # 强趋势首阴低吸回归模型
 └── TECHNICAL_DOC.md                       # 本文档
 ```
 
@@ -79,6 +81,7 @@
 
 ```text
 /Users/eudis/ths/overnight_premium_xgboost.json
+/Users/eudis/ths/dipbuy_premium_xgboost.json
 ```
 
 训练目标：
@@ -93,7 +96,19 @@
 cd /Users/eudis/ths
 python3 build_smart_overnight_dataset.py
 python3 quant_train_premium_models.py
+python3 quant_train_dipbuy_models.py
 ```
+
+### 4.1.1 强趋势首阴低吸
+
+低吸策略完全独立于尾盘突破模型，只有满足以下物理过滤时才调用低吸模型：
+
+- `近5日最高涨幅 > 15.0`
+- `今日急跌度 < -4.0`
+- `10日均线乖离率` 在 `-3.0` 到 `+3.0` 之间
+- `今日缩量比例 < 0`
+
+低吸模型仍预测 `next_day_premium`。如果 `近3日断头铡刀标记 = 1`，训练目标上限压低到 `-1.0%`，生产预测中也会被直接剔除。
 
 ### 4.2 主要特征
 
@@ -129,6 +144,10 @@ python3 quant_train_premium_models.py
 - 极端下影线标记
 - 近 3 日断头铡刀标记
 - 60 日高位比例
+- 近5日最高涨幅
+- 今日急跌度
+- 10日均线乖离率
+- 今日缩量比例
 
 ### 4.3 防大面惩罚
 
@@ -330,7 +349,8 @@ GET /api/strategy/up-reason-analysis?months=12
 | `QUANT_BASE_DIR` | `/Users/eudis/ths` | 项目根目录 |
 | `QUANT_DATA_DIR` | `data/all_kline` | 日线 Parquet 目录 |
 | `QUANT_SQLITE_PATH` | `data/core_db/quant_workstation.sqlite3` | SQLite 数据库 |
-| `QUANT_PREMIUM_MODEL_PATH` | `overnight_premium_xgboost.json` | XGBRegressor 模型 |
+| `QUANT_PREMIUM_MODEL_PATH` | `overnight_premium_xgboost.json` | 尾盘突破 XGBRegressor 模型 |
+| `QUANT_DIPBUY_PREMIUM_MODEL_PATH` | `dipbuy_premium_xgboost.json` | 首阴低吸 XGBRegressor 模型 |
 | `QUANT_MIN_COMPOSITE_SCORE` | `69.00` | 高置信综合评分门槛 |
 | `QUANT_PROFIT_TARGET_PCT` | `1.00` | 复盘成功阈值 |
 | `QUANT_BREAKOUT_HIGH_TARGET_PCT` | `2.00` | 训练评估冲高阈值 |

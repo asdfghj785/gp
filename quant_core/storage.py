@@ -443,6 +443,7 @@ def _decode_daily_pick(row: sqlite3.Row | None) -> dict[str, Any] | None:
     item = dict(row)
     item["success"] = None if item["success"] is None else bool(item["success"])
     item["raw"] = json.loads(item.pop("raw_json"))
+    item["strategy_type"] = (item.get("raw") or {}).get("winner", {}).get("strategy_type")
     return item
 
 

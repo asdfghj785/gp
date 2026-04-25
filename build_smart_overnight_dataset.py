@@ -29,7 +29,7 @@ def build_smart_dataset():
         if df_k.empty or len(df_k) < 70:
             continue
         df_k = df_k.sort_values('date').copy()
-        for col in ['open', 'high', 'low', 'close', 'volume', 'turn', '量比', '真实涨幅点数']:
+        for col in ['open', 'high', 'low', 'close', 'volume', 'amount', 'turn', '量比', '真实涨幅点数']:
             if col not in df_k.columns:
                 df_k[col] = 0
             df_k[col] = pd.to_numeric(df_k[col], errors='coerce')
@@ -45,8 +45,12 @@ def build_smart_dataset():
         df_k['5日累计涨幅'] = (df_k['close'] / df_k['close'].shift(5) - 1) * 100
         df_k['3日累计涨幅'] = (df_k['close'] / df_k['close'].shift(3) - 1) * 100
         df_k['5日均线乖离率'] = (df_k['close'] / df_k['close'].rolling(5, min_periods=3).mean() - 1) * 100
+        df_k['10日均线乖离率'] = (df_k['close'] / df_k['close'].rolling(10, min_periods=5).mean() - 1) * 100
         df_k['20日均线乖离率'] = (df_k['close'] / df_k['close'].rolling(20, min_periods=10).mean() - 1) * 100
         df_k['3日平均换手率'] = df_k['turn'].rolling(3, min_periods=2).mean()
+        df_k['近5日最高涨幅'] = (df_k['high'].rolling(5, min_periods=3).max() / df_k['close'].shift(5) - 1) * 100
+        df_k['今日急跌度'] = (df_k['low'] / prev_close - 1) * 100
+        df_k['今日缩量比例'] = (df_k['amount'] / df_k['amount'].shift(1) - 1) * 100
 
         # 量化主力行为：爆量、红盘资金参与、地量与缩量下跌。
         avg_vol10 = df_k['volume'].shift(1).rolling(10, min_periods=5).mean()
@@ -68,6 +72,16 @@ def build_smart_dataset():
         df_k['近3日断头铡刀标记'] = (df_k['真实涨幅点数'].shift(1).rolling(3, min_periods=1).min() <= -7).astype(float)
         # 当前历史库没有分钟线，无法真实识别14:30尾盘偷袭；保留字段供后续接入分钟数据。
         df_k['尾盘诱多标记'] = 0.0
+        safe_cols = [
+            '实体比例', '上影线比例', '下影线比例', '日内振幅',
+            '5日累计涨幅', '3日累计涨幅', '5日均线乖离率', '10日均线乖离率',
+            '20日均线乖离率', '3日平均换手率', '近5日最高涨幅', '今日急跌度',
+            '今日缩量比例', '5日量能堆积', '10日量比', '3日红盘比例',
+            '5日地量标记', '缩量下跌标记', '60日高位比例', '高位爆量标记',
+            '振幅换手比', '缩量大涨标记', '极端下影线标记',
+            '近3日断头铡刀标记', '尾盘诱多标记'
+        ]
+        df_k[safe_cols] = df_k[safe_cols].replace([np.inf, -np.inf], 0).fillna(0)
 
         # ================= 核心：精准锁定明天的时间和价格 =================
         df_k['next_date'] = df_k['date'].shift(-1)  # 获取下一行真实的交易日期
@@ -79,7 +93,8 @@ def build_smart_dataset():
         # 过滤：剔除当天涨停的（买不到）和数据残缺的。
         required = [
             'turn', '量比', '真实涨幅点数', '实体比例', '上影线比例', '下影线比例', '日内振幅',
-            '5日累计涨幅', '3日累计涨幅', '5日均线乖离率', '20日均线乖离率', '3日平均换手率',
+            '5日累计涨幅', '3日累计涨幅', '5日均线乖离率', '10日均线乖离率',
+            '20日均线乖离率', '3日平均换手率', '近5日最高涨幅', '今日急跌度', '今日缩量比例',
             '5日量能堆积', '10日量比', '3日红盘比例', '5日地量标记', '缩量下跌标记',
             '振幅换手比', '缩量大涨标记', '极端下影线标记', '近3日断头铡刀标记',
             '60日高位比例', '高位爆量标记', '尾盘诱多标记', 'next_day_premium', 'next_day_high_premium'
@@ -93,7 +108,8 @@ def build_smart_dataset():
         features = valid_rows[[
             'symbol', 'date', 'next_date', 'close', 'next_open', 'next_high', 'turn', '量比', '真实涨幅点数',
             '实体比例', '上影线比例', '下影线比例', '日内振幅',
-            '5日累计涨幅', '3日累计涨幅', '5日均线乖离率', '20日均线乖离率', '3日平均换手率',
+            '5日累计涨幅', '3日累计涨幅', '5日均线乖离率', '10日均线乖离率',
+            '20日均线乖离率', '3日平均换手率', '近5日最高涨幅', '今日急跌度', '今日缩量比例',
             '5日量能堆积', '10日量比', '3日红盘比例', '5日地量标记', '缩量下跌标记',
             '振幅换手比', '缩量大涨标记', '极端下影线标记', '近3日断头铡刀标记',
             '60日高位比例', '高位爆量标记', '尾盘诱多标记', 'next_day_premium', 'next_day_high_premium'

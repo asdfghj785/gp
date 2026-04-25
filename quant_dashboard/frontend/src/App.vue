@@ -83,6 +83,7 @@
               <tr>
                 <th>代码</th>
                 <th>名称</th>
+                <th>策略</th>
                 <th class="num">现价</th>
                 <th class="num">涨跌幅</th>
                 <th class="num">换手</th>
@@ -94,11 +95,12 @@
             </thead>
             <tbody>
               <tr v-if="radar.rows.length === 0">
-                <td colspan="9" class="empty">当前没有达到高置信生产规则的候选股</td>
+                <td colspan="10" class="empty">当前没有达到高置信生产规则的候选股</td>
               </tr>
               <tr v-for="row in radar.rows" :key="row.code">
                 <td class="mono">{{ row.code }}</td>
                 <td>{{ row.name }}</td>
+                <td><span class="pill">{{ row.strategy_type || '尾盘突破' }}</span></td>
                 <td class="num">{{ money(row.price) }}</td>
                 <td :class="['num', row.change >= 0 ? 'up' : 'down']">{{ pct(row.change) }}</td>
                 <td class="num">{{ pct(row.turnover) }}</td>
@@ -1398,6 +1400,20 @@ tbody tr:hover {
 
 .score {
   font-weight: 800;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid #c9d3e1;
+  border-radius: 999px;
+  background: #f8fafc;
+  color: #334155;
+  font-size: 0.78rem;
+  font-weight: 800;
+  white-space: nowrap;
 }
 
 td small {
