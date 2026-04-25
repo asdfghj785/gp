@@ -414,7 +414,12 @@ def clear_daily_picks() -> int:
     return count
 
 
-def update_daily_pick_open(selection_date: str, open_price: float, checked_at: str) -> dict[str, Any] | None:
+def update_daily_pick_open(
+    selection_date: str,
+    open_price: float,
+    checked_at: str,
+    exit_signal: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     init_db()
     with connect() as conn:
         row = conn.execute("SELECT * FROM daily_picks WHERE selection_date = ?", (selection_date,)).fetchone()
@@ -422,14 +427,17 @@ def update_daily_pick_open(selection_date: str, open_price: float, checked_at: s
             return None
         item = dict(row)
         premium = (open_price / float(item["selection_price"]) - 1) * 100 if item["selection_price"] else None
+        raw = json.loads(item.get("raw_json") or "{}")
+        if exit_signal is not None:
+            raw["exit_sentinel"] = exit_signal
         success = 1 if premium is not None and premium > PROFIT_TARGET_PCT else 0
         conn.execute(
             """
             UPDATE daily_picks
-            SET open_price = ?, open_checked_at = ?, open_premium = ?, success = ?, status = 'open_checked'
+            SET open_price = ?, open_checked_at = ?, open_premium = ?, success = ?, status = 'open_checked', raw_json = ?
             WHERE selection_date = ?
             """,
-            (open_price, checked_at, premium, success, selection_date),
+            (open_price, checked_at, premium, success, json.dumps(raw, ensure_ascii=False), selection_date),
         )
     return get_daily_pick(selection_date)
 
@@ -469,7 +477,70 @@ def _decode_daily_pick(row: sqlite3.Row | None) -> dict[str, Any] | None:
     item["success"] = None if item["success"] is None else bool(item["success"])
     item["raw"] = json.loads(item.pop("raw_json"))
     item["strategy_type"] = item.get("strategy_type") or (item.get("raw") or {}).get("winner", {}).get("strategy_type") or "尾盘突破"
+    _attach_pick_display_fields(item)
     return item
+
+
+def _attach_pick_display_fields(item: dict[str, Any]) -> None:
+    raw = item.get("raw") or {}
+    winner = raw.get("winner") if isinstance(raw.get("winner"), dict) else {}
+    sentinel = raw.get("exit_sentinel") if isinstance(raw.get("exit_sentinel"), dict) else {}
+
+    item["expected_premium"] = _optional_float(winner.get("expected_premium"))
+    item["predicted_open_premium"] = item["expected_premium"]
+    item["composite_score"] = _optional_float(winner.get("composite_score"))
+    item["sort_score"] = _optional_float(winner.get("sort_score"))
+    item["score_threshold"] = _optional_float(winner.get("score_threshold"))
+    item["sentiment_bonus"] = _optional_float(winner.get("sentiment_bonus"))
+    item["market_gate_mode"] = winner.get("market_gate_mode") or ""
+
+    actual = _optional_float(item.get("open_premium"))
+    expected = item.get("expected_premium")
+    item["premium_error_abs"] = abs(actual - expected) if actual is not None and expected is not None else None
+    item["exit_action"] = sentinel.get("action") or _exit_action_from_premium(actual)
+    item["exit_instruction"] = sentinel.get("instruction") or _exit_instruction_from_premium(actual)
+    item["exit_level"] = sentinel.get("level") or _exit_level_from_action(item.get("exit_action"))
+    item["exit_pushed_at"] = sentinel.get("pushed_at")
+    item["exit_push_status"] = sentinel.get("push_status")
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _exit_action_from_premium(premium: float | None) -> str | None:
+    if premium is None:
+        return None
+    if premium < 0:
+        return "核按钮"
+    if premium < 3.0:
+        return "落袋为安"
+    return "超预期锁仓"
+
+
+def _exit_instruction_from_premium(premium: float | None) -> str | None:
+    if premium is None:
+        return None
+    if premium < 0:
+        return "逻辑证伪，按跌停价挂单卖出，斩断亏损。"
+    if premium < 3.0:
+        return "符合套利预期，按开盘价挂单止盈。"
+    return "强势高开，勿早盘秒卖，等待盘中冲高或封板。"
+
+
+def _exit_level_from_action(action: str | None) -> str | None:
+    if action == "核按钮":
+        return "danger"
+    if action == "超预期锁仓":
+        return "strong"
+    if action == "落袋为安":
+        return "profit"
+    return None
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

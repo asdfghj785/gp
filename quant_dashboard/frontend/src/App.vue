@@ -218,6 +218,60 @@
       </div>
     </section>
 
+    <section v-show="activeTab === 'radar'" class="panel shadow-panel">
+      <div class="panel-head compact">
+        <div>
+          <h2>影子测试与外推精准度观测</h2>
+          <p>对比昨日 14:50 预期开盘溢价与 09:25 集合竞价实际溢价，监控 14:50 外推算法偏差</p>
+        </div>
+        <span class="model-state">09:26 哨兵闭环</span>
+      </div>
+
+      <div v-if="shadowRows.length === 0" class="empty-state">
+        <strong>暂无影子测试记录</strong>
+        <span>14:50 锁定标的并由 09:26 哨兵回填开盘结果后，这里会自动显示预测与实盘误差。</span>
+      </div>
+
+      <div v-else class="shadow-grid">
+        <article v-for="pick in shadowRows" :key="`shadow-${pick.id}`" class="shadow-card">
+          <header>
+            <div>
+              <strong><span class="mono">{{ pick.code }}</span> {{ pick.name }}</strong>
+              <small>{{ pick.selection_date }} → {{ pick.target_date }}</small>
+            </div>
+            <span :class="exitActionClass(pick)">{{ exitActionText(pick) }}</span>
+          </header>
+
+          <div class="shadow-compare">
+            <div class="shadow-side">
+              <span>14:50 预期</span>
+              <strong :class="Number(expectedPremium(pick)) >= 0 ? 'up' : 'down'">{{ pct(expectedPremium(pick)) }}</strong>
+              <div class="premium-track">
+                <i :class="premiumBarClass(expectedPremium(pick))" :style="premiumBarStyle(expectedPremium(pick))"></i>
+              </div>
+            </div>
+            <div class="shadow-side">
+              <span>09:25 实盘</span>
+              <strong v-if="actualPremium(pick) !== null" :class="Number(actualPremium(pick)) >= 0 ? 'up' : 'down'">
+                {{ pct(actualPremium(pick)) }}
+              </strong>
+              <strong v-else class="pending">待哨兵</strong>
+              <div class="premium-track">
+                <i v-if="actualPremium(pick) !== null" :class="premiumBarClass(actualPremium(pick))" :style="premiumBarStyle(actualPremium(pick))"></i>
+              </div>
+            </div>
+          </div>
+
+          <footer>
+            <span :class="precisionBadgeClass(pick)">{{ precisionBadgeText(pick) }}</span>
+            <span>误差 {{ premiumErrorText(pick) }}</span>
+            <span>综合评分 {{ scoreText(pick.composite_score) }}</span>
+          </footer>
+          <p class="shadow-instruction">{{ pick.exit_instruction || '等待 09:26 哨兵生成操作指令' }}</p>
+        </article>
+      </div>
+    </section>
+
     <section v-show="activeTab === 'strategy'" class="panel backtest-panel">
       <div class="panel-head compact">
         <div>
@@ -812,6 +866,7 @@ const amountText = (value) => {
   return amount.toFixed(0)
 }
 const latestSync = computed(() => overview.value.latest_sync || null)
+const shadowRows = computed(() => dailyPicks.rows.slice(0, 5))
 const syncStatusText = (sync) => {
   if (!sync) return '暂无记录'
   if (sync.status !== 'success') return '同步失败'
@@ -846,6 +901,44 @@ const radarEmptyReason = computed(() => {
     return '当前没有股票同时满足高置信综合评分、正预期溢价、风险过滤和断头铡刀过滤。'
   }
   return '暂无预测数据，点击“实时预测”获取最新候选池。'
+})
+const expectedPremium = (pick) => Number(pick.expected_premium ?? pick.predicted_open_premium ?? 0)
+const actualPremium = (pick) => {
+  if (pick.open_premium === null || pick.open_premium === undefined) return null
+  return Number(pick.open_premium)
+}
+const premiumError = (pick) => {
+  const actual = actualPremium(pick)
+  if (actual === null) return null
+  return Math.abs(actual - expectedPremium(pick))
+}
+const premiumErrorText = (pick) => {
+  const value = premiumError(pick)
+  return value === null ? '-' : pct(value)
+}
+const precisionBadgeText = (pick) => {
+  const value = premiumError(pick)
+  if (value === null) return '等待回填'
+  return value < 1 ? '外推精准' : '偏差过大'
+}
+const precisionBadgeClass = (pick) => [
+  'precision-badge',
+  premiumError(pick) === null ? 'precision-pending' : premiumError(pick) < 1 ? 'precision-good' : 'precision-bad',
+]
+const exitActionText = (pick) => pick.exit_action || (actualPremium(pick) === null ? '待审判' : '落袋为安')
+const exitActionClass = (pick) => [
+  'exit-tag',
+  pick.exit_level === 'danger' || exitActionText(pick) === '核按钮'
+    ? 'exit-danger'
+    : pick.exit_level === 'strong' || exitActionText(pick) === '超预期锁仓'
+      ? 'exit-strong'
+      : actualPremium(pick) === null
+        ? 'exit-pending'
+        : 'exit-profit',
+]
+const premiumBarClass = (value) => ['premium-bar', Number(value) >= 0 ? 'premium-bar-up' : 'premium-bar-down']
+const premiumBarStyle = (value) => ({
+  width: `${Math.min(Math.max(Math.abs(Number(value ?? 0)) * 18, 4), 100)}%`,
 })
 
 const request = async (path, options = {}) => {
@@ -923,7 +1016,7 @@ const scanRadar = async () => {
 
 const loadDailyPicks = async () => {
   try {
-    const data = await request('/api/daily-picks?limit=10')
+    const data = await request('/api/daily-picks?limit=20')
     dailyPicks.rows = data.rows || []
   } catch (error) {
     setMessage(`14:50 推送标的读取失败：${error.message}`, 'error')
@@ -1326,6 +1419,7 @@ label {
 }
 
 .pick-panel,
+.shadow-panel,
 .backtest-panel,
 .strategy-panel {
   margin-top: 16px;
@@ -1498,6 +1592,139 @@ tbody tr:hover {
   border-color: #fed7aa;
   background: #ffedd5;
   color: #9a3412;
+}
+
+.shadow-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.shadow-card {
+  display: grid;
+  gap: 12px;
+  border: 1px solid #e1e7f0;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fbfcfe;
+  min-width: 0;
+}
+
+.shadow-card header,
+.shadow-card footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: flex-start;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.shadow-card header strong {
+  display: block;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.shadow-card small,
+.shadow-side span,
+.shadow-card footer span {
+  color: #66758c;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.shadow-compare {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.shadow-side {
+  display: grid;
+  gap: 7px;
+  border: 1px solid #e5eaf1;
+  border-radius: 6px;
+  padding: 10px;
+  background: #ffffff;
+  min-width: 0;
+}
+
+.shadow-side strong {
+  font-size: 1.05rem;
+}
+
+.premium-track {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  background: #e5eaf1;
+  overflow: hidden;
+}
+
+.premium-bar {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+}
+
+.premium-bar-up {
+  background: #f97316;
+}
+
+.premium-bar-down {
+  background: #22c55e;
+}
+
+.precision-badge,
+.exit-tag {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.precision-good {
+  border-color: #bbf7d0;
+  background: #dcfce7;
+  color: #166534;
+}
+
+.precision-bad,
+.exit-danger {
+  border-color: #fecaca;
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.precision-pending,
+.exit-pending {
+  border-color: #fde68a;
+  background: #fffbeb;
+  color: #92400e;
+}
+
+.exit-profit {
+  border-color: #bbf7d0;
+  background: #dcfce7;
+  color: #166534;
+}
+
+.exit-strong {
+  border-color: #fed7aa;
+  background: #ffedd5;
+  color: #9a3412;
+}
+
+.shadow-instruction {
+  color: #40516b;
+  font-size: 0.86rem;
+  line-height: 1.45;
 }
 
 td > .strategy-badge:first-child {
@@ -1778,6 +2005,28 @@ pre {
     background: #431407;
     color: #fed7aa;
   }
+
+  .precision-good,
+  .exit-profit {
+    border-color: #22c55e;
+    background: #052e16;
+    color: #bbf7d0;
+  }
+
+  .precision-bad,
+  .exit-danger {
+    border-color: #ef4444;
+    background: #450a0a;
+    color: #fecaca;
+  }
+
+  .precision-pending,
+  .exit-pending,
+  .exit-strong {
+    border-color: #fb923c;
+    background: #431407;
+    color: #fed7aa;
+  }
 }
 
 @media (max-width: 980px) {
@@ -1836,6 +2085,10 @@ pre {
   }
 
   .feature-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .shadow-compare {
     grid-template-columns: 1fr;
   }
 

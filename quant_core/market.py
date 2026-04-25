@@ -16,6 +16,7 @@ SINA_HS_A_URL = (
     "&node=hs_a&symbol=&_s_r_a=page"
 )
 SINA_INDEX_URL = "https://hq.sinajs.cn/list=sh000001,sh000852"
+SINA_QUOTE_URL = "https://hq.sinajs.cn/list={symbol}"
 SINA_INDEX_KLINE_URL = (
     "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
     "CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen=30"
@@ -142,6 +143,49 @@ def fetch_market_indices(timeout: int = 5) -> dict[str, dict[str, float | str]]:
     return result
 
 
+def fetch_sina_quote(code: str, timeout: int = 5) -> dict[str, Any]:
+    """Fetch one stock quote from Sina's hq endpoint."""
+    symbol = _sina_symbol(code)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Referer": "https://finance.sina.com.cn/",
+    }
+    response = requests.get(SINA_QUOTE_URL.format(symbol=symbol), headers=headers, timeout=timeout)
+    response.raise_for_status()
+    match = re.search(r'var hq_str_[a-z]{2}\d{6}="([^"]*)"', response.text)
+    if not match:
+        raise RuntimeError(f"新浪行情未返回 {code} 的有效数据")
+    fields = match.group(1).split(",")
+    if len(fields) < 32 or not fields[0]:
+        raise RuntimeError(f"新浪行情返回 {code} 数据不完整")
+
+    open_price = _safe_float(fields[1])
+    pre_close = _safe_float(fields[2])
+    current_price = _safe_float(fields[3])
+    high = _safe_float(fields[4])
+    low = _safe_float(fields[5])
+    volume = _safe_float(fields[8])
+    amount = _safe_float(fields[9])
+    quote_date = fields[30] if len(fields) > 30 else ""
+    quote_time = fields[31] if len(fields) > 31 else ""
+    auction_price = current_price if current_price > 0 else open_price
+    return {
+        "code": str(code).zfill(6),
+        "symbol": symbol,
+        "name": fields[0],
+        "open": open_price,
+        "pre_close": pre_close,
+        "current_price": current_price,
+        "auction_price": auction_price,
+        "high": high,
+        "low": low,
+        "volume": volume,
+        "amount": amount,
+        "date": quote_date,
+        "time": quote_time,
+    }
+
+
 def _attach_index_trends(indices: dict[str, dict[str, float | str]], headers: dict[str, str], timeout: int) -> None:
     for code, item in indices.items():
         try:
@@ -169,6 +213,22 @@ def _fetch_sina_page(page: int, headers: dict[str, str], timeout: int) -> list[d
         return _loads_sina_js(response.text)
     except Exception:
         return []
+
+
+def _sina_symbol(code: str) -> str:
+    clean = str(code).strip().zfill(6)
+    if clean.startswith(("5", "6", "9")):
+        return f"sh{clean}"
+    if clean.startswith(("4", "8")):
+        return f"bj{clean}"
+    return f"sz{clean}"
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _coalesce_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
