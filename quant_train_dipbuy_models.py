@@ -53,7 +53,7 @@ def train() -> dict[str, object]:
     train_guillotine = pd.to_numeric(train_df.get("近3日断头铡刀标记", 0), errors="coerce").fillna(0) >= 0.5
     test_guillotine = pd.to_numeric(test_df.get("近3日断头铡刀标记", 0), errors="coerce").fillna(0) >= 0.5
     y_train_actual = train_df["next_day_premium"].clip(-10, 8)
-    y_train_reg = y_train_actual.where(~train_guillotine, y_train_actual.clip(upper=-1.0))
+    y_train_reg = y_train_actual
     y_test_reg = test_df["next_day_premium"].clip(-8, 8)
 
     regressor = xgb.XGBRegressor(
@@ -92,9 +92,9 @@ def train() -> dict[str, object]:
         "physical_filters": DIPBUY_FILTERS,
         "fee_buffer_pct": FEE_BUFFER_PCT,
         "breakout_high_target_pct": BREAKOUT_HIGH_TARGET_PCT,
-        "target_rule": "predict next_day_premium; if recent 3-day guillotine flag is true, training target is capped at -1.0%",
-        "penalized_train_rows": int(train_guillotine.sum()),
-        "penalized_test_rows": int(test_guillotine.sum()),
+        "target_rule": "predict true next_day_premium; dip-buy keeps guillotine samples unmodified because sharp drops are part of the setup",
+        "guillotine_train_rows_observed": int(train_guillotine.sum()),
+        "guillotine_test_rows_observed": int(test_guillotine.sum()),
         "test_positive_rate_pct": round(float(positive_rule.mean() * 100), 4),
         "mae_premium": round(float(mean_absolute_error(y_test_reg, pred_reg)), 4),
         "top_decile_rows": int(len(top_decile)),

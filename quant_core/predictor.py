@@ -191,11 +191,18 @@ def score_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     scored["流动性评分"] = _liquidity_score(scored)
     scored["AI胜率"] = _regression_signal_score(scored)
     premium_score = (50 + scored["预期溢价"].clip(-5, 5) * 10).clip(0, 100)
+    dipbuy_premium_score = (55 + scored["预期溢价"].clip(-5, 5) * 16).clip(0, 100)
     scored["综合评分"] = (
         premium_score * 0.60
         + scored["风险评分"] * 0.20
         + scored["流动性评分"] * 0.10
         + scored["AI胜率"] * 0.10
+    ).clip(0, 100)
+    is_dipbuy = scored["strategy_type"].eq(DIPBUY_STRATEGY_TYPE)
+    scored.loc[is_dipbuy, "综合评分"] = (
+        dipbuy_premium_score.loc[is_dipbuy] * 0.85
+        + scored.loc[is_dipbuy, "AI胜率"] * 0.10
+        + scored.loc[is_dipbuy, "流动性评分"] * 0.05
     ).clip(0, 100)
     model_status = "; ".join(status_parts) if status_parts else "ready"
     return scored, model_status
@@ -242,7 +249,8 @@ def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = Non
     if "涨跌幅" in filtered.columns:
         filtered = filtered[filtered["涨跌幅"] < 7].copy()
     if "上影线比例" in filtered.columns:
-        filtered = filtered[filtered["上影线比例"] < 2].copy()
+        is_dipbuy = filtered.get("strategy_type", "").eq(DIPBUY_STRATEGY_TYPE) if "strategy_type" in filtered.columns else pd.Series(False, index=filtered.index)
+        filtered = filtered[(is_dipbuy) | (filtered["上影线比例"] < 2)].copy()
     if "预期溢价" in filtered.columns:
         filtered = filtered[filtered["预期溢价"] > 0].copy()
     if {"60日高位比例", "量比", "5日量能堆积"}.issubset(filtered.columns):
@@ -257,7 +265,11 @@ def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = Non
     if "尾盘诱多标记" in filtered.columns:
         filtered = filtered[pd.to_numeric(filtered["尾盘诱多标记"], errors="coerce").fillna(0) < 0.5].copy()
     if "近3日断头铡刀标记" in filtered.columns:
-        filtered = filtered[pd.to_numeric(filtered["近3日断头铡刀标记"], errors="coerce").fillna(0) < 0.5].copy()
+        is_dipbuy = filtered.get("strategy_type", "").eq(DIPBUY_STRATEGY_TYPE) if "strategy_type" in filtered.columns else pd.Series(False, index=filtered.index)
+        filtered = filtered[
+            (is_dipbuy)
+            | (pd.to_numeric(filtered["近3日断头铡刀标记"], errors="coerce").fillna(0) < 0.5)
+        ].copy()
     if "综合评分" in filtered.columns:
         filtered = filtered[pd.to_numeric(filtered["综合评分"], errors="coerce").fillna(0) >= MIN_COMPOSITE_SCORE].copy()
     return filtered
@@ -311,7 +323,7 @@ def scan_market(
         "id": snapshot_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_status": model_status,
-        "strategy": f"生产策略：尾盘突破与首阴低吸双轨回归器预测次日开盘预期溢价，按预期溢价排序；剔除创业板/北交所/科创板/ST，叠加大盘分级风控，综合评分>={MIN_COMPOSITE_SCORE:.1f}；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多、近3日断头铡刀直接剔除。",
+        "strategy": f"生产策略：尾盘突破与首阴低吸双轨回归器预测次日开盘预期溢价，按预期溢价排序；剔除创业板/北交所/科创板/ST，叠加大盘分级风控，综合评分>={MIN_COMPOSITE_SCORE:.1f}；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多直接剔除；近3日断头铡刀和上影线强过滤仅约束尾盘突破，首阴低吸豁免。",
         "market_gate": gate,
         "intraday_snapshot": intraday_snapshot,
         "rows": rows,
