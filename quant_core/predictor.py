@@ -9,7 +9,16 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .config import DATA_DIR, DIPBUY_PREMIUM_MODEL_PATH, LATEST_TOP50_PATH, MIN_COMPOSITE_SCORE, MODEL_PATH, PREMIUM_MODEL_PATH, PROFIT_TARGET_PCT
+from .config import (
+    BREAKOUT_MIN_SCORE,
+    DATA_DIR,
+    DIPBUY_MIN_SCORE,
+    DIPBUY_PREMIUM_MODEL_PATH,
+    LATEST_TOP50_PATH,
+    MODEL_PATH,
+    PREMIUM_MODEL_PATH,
+    PROFIT_TARGET_PCT,
+)
 from .intraday_snapshot import attach_late_pull_trap
 from .market import fetch_market_indices, fetch_sina_snapshot
 from .storage import connect, save_prediction_snapshot, upsert_daily_rows
@@ -77,6 +86,7 @@ DIPBUY_FILTERS = {
 }
 LOW_LIQUIDITY_AMOUNT = 700_000_000_000
 HIGH_LIQUIDITY_AMOUNT = 800_000_000_000
+DIPBUY_SENTIMENT_BONUS = 10.0
 
 
 @lru_cache(maxsize=1)
@@ -267,6 +277,11 @@ def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = Non
     if gate and gate.get("blocked"):
         return df.iloc[0:0].copy()
     filtered = df[~df["纯代码"].str.startswith(("68", "689"), na=False)].copy()
+    if gate is None:
+        filtered = _attach_historical_market_modes(filtered)
+        filtered = filtered[~filtered["market_gate_mode"].isin(["雷暴", "缩量下跌"])].copy()
+    else:
+        filtered["market_gate_mode"] = str(gate.get("mode") or "晴天")
     if "涨跌幅" in filtered.columns:
         filtered = filtered[filtered["涨跌幅"] < 7].copy()
     if "上影线比例" in filtered.columns:
@@ -291,9 +306,69 @@ def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = Non
             (is_dipbuy)
             | (pd.to_numeric(filtered["近3日断头铡刀标记"], errors="coerce").fillna(0) < 0.5)
         ].copy()
-    if "综合评分" in filtered.columns:
-        filtered = filtered[pd.to_numeric(filtered["综合评分"], errors="coerce").fillna(0) >= MIN_COMPOSITE_SCORE].copy()
-    return filtered
+    return apply_strategy_score_gate(filtered, gate)
+
+
+def apply_strategy_score_gate(df: pd.DataFrame, gate: dict[str, Any] | None = None) -> pd.DataFrame:
+    if df.empty or "综合评分" not in df.columns:
+        return df
+    filtered = df.copy()
+    filtered["strategy_type"] = filtered.get("strategy_type", BREAKOUT_STRATEGY_TYPE)
+    filtered["strategy_type"] = filtered["strategy_type"].fillna(BREAKOUT_STRATEGY_TYPE)
+    score = _num(filtered, "综合评分").replace([np.inf, -np.inf], 0).fillna(0)
+    is_dipbuy = filtered["strategy_type"].eq(DIPBUY_STRATEGY_TYPE)
+    is_breakout = filtered["strategy_type"].eq(BREAKOUT_STRATEGY_TYPE) | ~is_dipbuy
+    threshold = pd.Series(BREAKOUT_MIN_SCORE, index=filtered.index, dtype="float64")
+    threshold.loc[is_dipbuy] = DIPBUY_MIN_SCORE
+    qualified = ((is_breakout) & (score >= BREAKOUT_MIN_SCORE)) | ((is_dipbuy) & (score >= DIPBUY_MIN_SCORE))
+    filtered = filtered[qualified].copy()
+    filtered["生产门槛"] = threshold.loc[filtered.index]
+    return apply_strategy_sort_score(filtered, gate)
+
+
+def apply_strategy_sort_score(df: pd.DataFrame, gate: dict[str, Any] | None = None) -> pd.DataFrame:
+    if df.empty:
+        return df
+    scored = df.copy()
+    scored["strategy_type"] = scored.get("strategy_type", BREAKOUT_STRATEGY_TYPE)
+    scored["strategy_type"] = scored["strategy_type"].fillna(BREAKOUT_STRATEGY_TYPE)
+    base_score = _num(scored, "综合评分").replace([np.inf, -np.inf], 0).fillna(0)
+    if gate is not None:
+        mode = str(gate.get("mode") or "晴天")
+        modes = pd.Series(mode, index=scored.index)
+    elif "market_gate_mode" in scored.columns:
+        modes = scored["market_gate_mode"].fillna("晴天").astype(str)
+    else:
+        scored = _attach_historical_market_modes(scored)
+        modes = scored["market_gate_mode"].fillna("晴天").astype(str)
+    is_dipbuy = scored["strategy_type"].eq(DIPBUY_STRATEGY_TYPE)
+    bonus = pd.Series(0.0, index=scored.index)
+    bonus.loc[is_dipbuy & modes.isin(["阴天", "震荡"])] = DIPBUY_SENTIMENT_BONUS
+    scored["情绪补偿分"] = bonus
+    scored["排序评分"] = (base_score + bonus).clip(0, 110)
+    scored["market_gate_mode"] = modes
+    return scored
+
+
+def _attach_historical_market_modes(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    amount = _num(out, "market_amount")
+    down_count = _num(out, "market_down_count")
+    avg_change = _num(out, "market_avg_change")
+    up_rate = _num(out, "market_up_rate")
+    low_liquidity = (amount > 0) & (amount < LOW_LIQUIDITY_AMOUNT)
+    high_liquidity = amount >= HIGH_LIQUIDITY_AMOUNT
+    thunder = (avg_change <= -1.2) | (down_count > 4200)
+    shrink_down = ((avg_change <= -0.5) | (down_count >= 3000)) & low_liquidity
+    cloudy = ((avg_change <= -0.5) | (down_count >= 3000)) & ~high_liquidity
+    choppy = (avg_change <= 0) | (down_count >= 2500) | (up_rate < 50)
+    mode = pd.Series("晴天", index=out.index)
+    mode.loc[choppy] = "震荡"
+    mode.loc[cloudy] = "阴天"
+    mode.loc[shrink_down] = "缩量下跌"
+    mode.loc[thunder] = "雷暴"
+    out["market_gate_mode"] = mode
+    return out
 
 
 def scan_market(
@@ -337,14 +412,14 @@ def scan_market(
     df = apply_production_filters(df, gate)
 
     final_limit = min(max(int(limit), 1), 1)
-    df = df.sort_values(["预期溢价", "综合评分"], ascending=[False, False]).head(final_limit)
+    df = df.sort_values(["排序评分", "预期溢价", "综合评分"], ascending=[False, False, False]).head(final_limit)
     rows = [_row_to_api(row) for _, row in df.iterrows()]
     snapshot_id = save_prediction_snapshot("dual_xgboost_regressor" if "regressor_ready" in model_status else "rule_fallback", rows) if cache_prediction else None
     payload = {
         "id": snapshot_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_status": model_status,
-        "strategy": f"生产策略：尾盘突破与首阴低吸双轨回归器预测次日开盘预期溢价，按预期溢价排序；剔除创业板/北交所/科创板/ST，叠加大盘分级风控，综合评分>={MIN_COMPOSITE_SCORE:.1f}；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多直接剔除；近3日断头铡刀和上影线强过滤仅约束尾盘突破，首阴低吸豁免。",
+        "strategy": f"生产策略：尾盘突破与首阴低吸双轨回归器预测次日开盘预期溢价；突破门槛>={BREAKOUT_MIN_SCORE:.1f}，低吸门槛>={DIPBUY_MIN_SCORE:.1f}；阴天/震荡时首阴低吸仅排序加{DIPBUY_SENTIMENT_BONUS:.0f}分，不改变原始综合评分；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多直接剔除；近3日断头铡刀和上影线强过滤仅约束尾盘突破，首阴低吸豁免。",
         "market_gate": gate,
         "intraday_snapshot": intraday_snapshot,
         "rows": rows,
@@ -409,6 +484,11 @@ def market_risk_gate(df: pd.DataFrame, indices: dict[str, dict[str, float | str]
         blocked = False
         min_ai_win_rate = 75.0
         reasons.append("市场偏弱，仅保留高质量回归溢价信号")
+    elif market_avg_change <= 0 or market_down_count >= 2500 or market_up_rate < 50:
+        mode = "震荡"
+        blocked = False
+        min_ai_win_rate = 65.0
+        reasons.append("市场震荡，首阴低吸排序获得情绪补偿")
     else:
         mode = "晴天"
         blocked = False
@@ -812,6 +892,10 @@ def _row_to_api(row: pd.Series) -> dict[str, Any]:
         "risk_score": round(float(row.get("风险评分", 0)), 4),
         "liquidity_score": round(float(row.get("流动性评分", 0)), 4),
         "composite_score": round(float(row.get("综合评分", row["AI胜率"])), 4),
+        "sort_score": round(float(row.get("排序评分", row.get("综合评分", row["AI胜率"]))), 4),
+        "score_threshold": round(float(row.get("生产门槛", BREAKOUT_MIN_SCORE)), 4),
+        "sentiment_bonus": round(float(row.get("情绪补偿分", 0)), 4),
+        "market_gate_mode": str(row.get("market_gate_mode", "")),
         "tech_features": {
             "body_ratio": round(float(row["实体比例"]), 4),
             "upper_shadow": round(float(row["上影线比例"]), 4),

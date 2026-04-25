@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .config import MIN_COMPOSITE_SCORE
+from .config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE
 from .predictor import PROFIT_TARGET_PCT, apply_production_filters
 from .storage import init_db
 from .strategy_lab import _daily_top, _stats_row, prepare_evaluated_candidates
@@ -66,7 +66,7 @@ def _failure_reason_rows(failures: pd.DataFrame, successes: pd.DataFrame) -> lis
         ("预期溢价偏低", "模型预期溢价<=0，综合分可能被其他项拉高。", lambda df: df["预期溢价"] <= 0),
         ("风险分偏低", "风险评分<55，形态或波动风险没有被充分过滤。", lambda df: df["风险评分"] < 55),
         ("流动性偏弱", "流动性评分<45，盘口承接质量偏弱。", lambda df: df["流动性评分"] < 45),
-        ("综合分偏低", f"综合评分<{MIN_COMPOSITE_SCORE:.1f}，信号强度不足。", lambda df: df["综合评分"] < MIN_COMPOSITE_SCORE),
+        ("综合分偏低", f"综合评分低于策略独立门槛（突破{BREAKOUT_MIN_SCORE:.1f}/低吸{DIPBUY_MIN_SCORE:.1f}），信号强度不足。", lambda df: df["综合评分"] < df["strategy_type"].map({"首阴低吸": DIPBUY_MIN_SCORE}).fillna(BREAKOUT_MIN_SCORE)),
         ("大盘弱势", "市场平均涨跌幅<=-0.5%或下跌家数>=3500，系统性风险高。", lambda df: (df["market_avg_change"] <= -0.5) | (df["market_down_count"] >= 3500)),
         ("趋势过度偏离", "20日均线乖离率绝对值>=18%，位置过高或过低。", lambda df: df["20日均线乖离率"].abs() >= 18),
         ("缺少主力异动", "10日量比<1.2且3日红盘比例<50%，资金参与不足。", lambda df: (df["10日量比"] < 1.2) & (df["3日红盘比例"] < 50)),
@@ -105,7 +105,7 @@ def _optimization_rows(pool: pd.DataFrame, baseline: dict[str, Any]) -> list[dic
         ("过滤低价<3元", lambda df: df[df["最新价"] >= 3].copy()),
         ("要求预期溢价>0", lambda df: df[df["预期溢价"] > 0].copy()),
         ("要求风险分>=55", lambda df: df[df["风险评分"] >= 55].copy()),
-        (f"要求综合分>={MIN_COMPOSITE_SCORE:.1f}", lambda df: df[df["综合评分"] >= MIN_COMPOSITE_SCORE].copy()),
+        (f"要求策略独立门槛：突破>={BREAKOUT_MIN_SCORE:.1f}/低吸>={DIPBUY_MIN_SCORE:.1f}", lambda df: df[df["综合评分"] >= df["strategy_type"].map({"首阴低吸": DIPBUY_MIN_SCORE}).fillna(BREAKOUT_MIN_SCORE)].copy()),
         ("大盘风控空仓", lambda df: df[(df["market_avg_change"] > -0.5) & (df["market_down_count"] < 3500)].copy()),
         (f"要求预期溢价>={PROFIT_TARGET_PCT:.1f}%", lambda df: df[df["预期溢价"] >= PROFIT_TARGET_PCT].copy()),
         ("要求10日量比>=1.2", lambda df: df[df["10日量比"] >= 1.2].copy()),

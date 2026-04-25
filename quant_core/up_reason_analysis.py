@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 from sklearn.metrics import roc_auc_score
 
-from .config import MIN_COMPOSITE_SCORE, OLLAMA_API, OLLAMA_MODEL
+from .config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE, OLLAMA_API, OLLAMA_MODEL
 from .strategy_lab import prepare_evaluated_candidates
 
 
@@ -56,6 +56,8 @@ def analyze_next_day_up_reasons(months: int = 12, refresh: bool = False) -> dict
 
     df = _add_market_context(df)
     df = df[np.isfinite(df["open_premium"])].copy()
+    if "strategy_type" not in df.columns:
+        df["strategy_type"] = "尾盘突破"
     df["next_day_up"] = df["open_premium"] > 0
     up = df[df["next_day_up"]].copy()
     down = df[~df["next_day_up"]].copy()
@@ -137,7 +139,7 @@ def _factor_lift_rows(df: pd.DataFrame, baseline_up_rate: float) -> list[dict[st
         ("市场红盘率 <40%", "市场", lambda x: x["market_up_rate"] < 40, "市场环境偏弱。"),
         ("下跌家数 >=3500", "市场", lambda x: x["market_down_count"] >= 3500, "系统性风险高，适合作为空仓门控。"),
         ("模型预期溢价 >0", "模型", lambda x: x["预期溢价"] > 0, "结构化模型认为次日有正溢价。"),
-        (f"综合评分 >={MIN_COMPOSITE_SCORE:.1f}", "模型", lambda x: x["综合评分"] >= MIN_COMPOSITE_SCORE, "综合信号强度较高。"),
+        (f"综合评分达到策略门槛", "模型", lambda x: x["综合评分"] >= x["strategy_type"].map({"首阴低吸": DIPBUY_MIN_SCORE}).fillna(BREAKOUT_MIN_SCORE), "综合信号强度达到对应策略门槛。"),
     ]
     rows = []
     total = len(df)

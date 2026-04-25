@@ -6,7 +6,7 @@ from typing import Any
 
 import pandas as pd
 
-from quant_core.config import MIN_COMPOSITE_SCORE, PROFIT_TARGET_PCT
+from quant_core.config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE, PROFIT_TARGET_PCT
 from quant_core.daily_pick import list_daily_pick_results
 from quant_core.predictor import apply_production_filters
 from quant_core.storage import clear_daily_picks, save_daily_pick, update_daily_pick_open
@@ -27,8 +27,8 @@ def rebuild_historical_picks(months: int = 12) -> dict[str, Any]:
     trading_dates = sorted(evaluated["date"].dropna().astype(str).unique().tolist())
     production_pool = apply_production_filters(evaluated)
     if not production_pool.empty:
-        production_pool = production_pool.sort_values(["date", "预期溢价", "综合评分"], ascending=[True, False, False])
-        top_index = production_pool.groupby("date")["预期溢价"].idxmax()
+        production_pool = production_pool.sort_values(["date", "排序评分", "预期溢价", "综合评分"], ascending=[True, False, False, False])
+        top_index = production_pool.groupby("date")["排序评分"].idxmax()
         daily_top = production_pool.loc[top_index].set_index("date", drop=False).sort_index()
     else:
         daily_top = pd.DataFrame()
@@ -45,7 +45,11 @@ def rebuild_historical_picks(months: int = 12) -> dict[str, Any]:
     for index, selection_date in enumerate(trading_dates, start=1):
         if daily_top.empty or selection_date not in daily_top.index:
             skipped += 1
-            print(f"进度 {index}/{total} 天 {selection_date}：无综合评分 >= {MIN_COMPOSITE_SCORE:.2f} 的生产级标的，空仓。", flush=True)
+            print(
+                f"进度 {index}/{total} 天 {selection_date}：无生产级标的"
+                f"（突破>={BREAKOUT_MIN_SCORE:.2f}，低吸>={DIPBUY_MIN_SCORE:.2f}），空仓。",
+                flush=True,
+            )
             continue
 
         pick_row = daily_top.loc[selection_date]
@@ -54,9 +58,10 @@ def rebuild_historical_picks(months: int = 12) -> dict[str, Any]:
         code = str(pick_row["纯代码"])
         score = float(pick_row.get("综合评分") or 0)
         strategy_type = str(pick_row.get("strategy_type") or "尾盘突破")
-        if score < MIN_COMPOSITE_SCORE:
+        threshold = float(pick_row.get("生产门槛") or (DIPBUY_MIN_SCORE if strategy_type == "首阴低吸" else BREAKOUT_MIN_SCORE))
+        if score < threshold:
             skipped += 1
-            print(f"进度 {index}/{total} 天 {selection_date}：{code} 综合评分 {score:.2f} < {MIN_COMPOSITE_SCORE:.2f}，跳过。", flush=True)
+            print(f"进度 {index}/{total} 天 {selection_date}：{code} 综合评分 {score:.2f} < {threshold:.2f}，跳过。", flush=True)
             continue
 
         pick = _pick_from_candidate_row(pick_row, prepared)
@@ -72,7 +77,7 @@ def rebuild_historical_picks(months: int = 12) -> dict[str, Any]:
         premium_text = "-" if pd.isna(premium) else f"{float(premium):.2f}%"
         print(
             f"进度 {index}/{total} 天 {selection_date}：锁定 {code} {pick_row.get('名称', '')} "
-            f"[{strategy_type}] 评分 {score:.2f}，次日开盘溢价 {premium_text}。",
+            f"[{strategy_type}] 评分 {score:.2f}，排序 {float(pick_row.get('排序评分') or score):.2f}，次日开盘溢价 {premium_text}。",
             flush=True,
         )
 
@@ -102,6 +107,10 @@ def _pick_from_candidate_row(row: pd.Series, prepared: dict[str, Any]) -> dict[s
         "risk_score": float(row.get("风险评分") or 0),
         "liquidity_score": float(row.get("流动性评分") or 0),
         "composite_score": float(row.get("综合评分") or 0),
+        "sort_score": float(row.get("排序评分", row.get("综合评分") or 0) or 0),
+        "score_threshold": float(row.get("生产门槛") or 0),
+        "sentiment_bonus": float(row.get("情绪补偿分") or 0),
+        "market_gate_mode": str(row.get("market_gate_mode") or ""),
     }
     return {
         "selection_date": selection_date,

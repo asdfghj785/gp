@@ -8,7 +8,7 @@ from typing import Any
 
 import pandas as pd
 
-from .config import MIN_COMPOSITE_SCORE
+from .config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE
 from .market import fetch_sina_snapshot
 from .predictor import PROFIT_TARGET_PCT, apply_production_filters, build_features, score_candidates
 from .storage import connect, init_db
@@ -31,8 +31,8 @@ def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, 
         result["summary"]["candidate_strategy_counts"] = {str(key): int(value) for key, value in candidate_strategy_counts.items()}
         return result
 
-    feature_df = feature_df.sort_values(["date", "预期溢价", "综合评分"], ascending=[True, False, False])
-    idx = feature_df.groupby("date")["预期溢价"].idxmax()
+    feature_df = feature_df.sort_values(["date", "排序评分", "预期溢价", "综合评分"], ascending=[True, False, False, False])
+    idx = feature_df.groupby("date")["排序评分"].idxmax()
     picks = feature_df.loc[idx].sort_values("date").copy()
 
     results: list[dict[str, Any]] = []
@@ -67,9 +67,9 @@ def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, 
         "model_status": prepared["model_status"],
         "repaired_pre_close_count": prepared["repaired_pre_close_count"],
         "repaired_volume_ratio_count": prepared["repaired_volume_ratio_count"],
-        "rule": f"生产策略复盘：排除周末、节假日、非完整交易日、创业板、北交所、科创板、ST/退市；大盘风控采用晴天/阴天/雷暴分级，综合评分>={MIN_COMPOSITE_SCORE:.1f}，雷暴或大盘下跌且缩量时空仓；过滤涨幅>=7%、上影>=2%、预期溢价<=0、高位爆量、尾盘诱多、近3日断头铡刀。停盘前最后一个交易日按回归模型预期溢价选第一名，停盘后第一个交易日开盘卖出；扣除滑点费率后的有效成功阈值为开盘溢价>{PROFIT_TARGET_PCT:.2f}%。",
+        "rule": f"生产策略复盘：排除周末、节假日、非完整交易日、创业板、北交所、科创板、ST/退市；大盘风控采用晴天/震荡/阴天/雷暴分级，尾盘突破综合评分>={BREAKOUT_MIN_SCORE:.1f}，首阴低吸综合评分>={DIPBUY_MIN_SCORE:.1f}；阴天/震荡时首阴低吸排序补偿10分；雷暴或大盘下跌且缩量时空仓；过滤涨幅>=7%、上影>=2%、预期溢价<=0、高位爆量、尾盘诱多、近3日断头铡刀。停盘前最后一个交易日按排序评分选第一名，停盘后第一个交易日开盘卖出；扣除滑点费率后的有效成功阈值为开盘溢价>{PROFIT_TARGET_PCT:.2f}%。",
         "trading_day_filter": "weekday<5 且全市场有效样本>=1000 且成交额>0。",
-        "rank_rule": f"XGBRegressor 直接预测次日开盘预期溢价；综合评分=预期溢价60%+风险20%+流动性10%+收益信号10%，最终排序优先看预期溢价。",
+        "rank_rule": f"XGBRegressor 直接预测次日开盘预期溢价；突破与低吸使用独立准入门槛，最终按排序评分选择 Top1；排序评分=原始综合评分+阴天/震荡低吸情绪补偿分，原始综合评分仍独立展示。",
     }
     return {"created_at": datetime.now().isoformat(timespec="seconds"), "summary": summary, "rows": results[::-1], "strategy_rows": strategy_rows}
 
@@ -90,6 +90,10 @@ def _backtest_row(pick: pd.Series, current_close: float, next_open: float | None
         "risk_score": round(float(pick.get("风险评分", 0)), 4),
         "liquidity_score": round(float(pick.get("流动性评分", 0)), 4),
         "composite_score": round(float(pick.get("综合评分", pick["AI胜率"])), 4),
+        "sort_score": round(float(pick.get("排序评分", pick.get("综合评分", pick["AI胜率"]))), 4),
+        "score_threshold": round(float(pick.get("生产门槛", BREAKOUT_MIN_SCORE)), 4),
+        "sentiment_bonus": round(float(pick.get("情绪补偿分", 0)), 4),
+        "market_gate_mode": str(pick.get("market_gate_mode", "")),
         "next_date": str(pick.get("next_date")) if pd.notna(pick.get("next_date")) else None,
         "next_open": round(next_open, 4) if next_open is not None else None,
         "open_premium": round(premium, 4) if premium is not None else None,
@@ -112,7 +116,8 @@ def _strategy_pick_rows(df: pd.DataFrame, months: int = 2) -> list[dict[str, Any
     for _, group in candidates.groupby(["date", "strategy_type"], sort=False):
         qualified = group[group.index.isin(qualified_indices)]
         source = qualified if not qualified.empty else group
-        pick = source.sort_values(["预期溢价", "综合评分"], ascending=[False, False]).iloc[0].copy()
+        sort_cols = ["排序评分", "预期溢价", "综合评分"] if "排序评分" in source.columns else ["预期溢价", "综合评分"]
+        pick = source.sort_values(sort_cols, ascending=[False] * len(sort_cols)).iloc[0].copy()
         pick["production_qualified"] = bool(pick.name in qualified_indices)
         picks.append(pick)
     if not picks:

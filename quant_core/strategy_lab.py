@@ -15,7 +15,7 @@ from .backtest import (
     _valid_trading_dates,
 )
 from .cache_utils import read_dataframe_cache, write_dataframe_cache
-from .config import MIN_COMPOSITE_SCORE
+from .config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE
 from .predictor import PROFIT_TARGET_PCT, apply_production_filters, build_features, score_candidates
 from .storage import init_db
 
@@ -193,7 +193,7 @@ def _strategy_variants() -> list[dict[str, Any]]:
         },
         {
             "name": "生产风险过滤",
-            "description": f"剔除科创板，叠加成交额豁免、回归预期溢价排序、综合评分>={MIN_COMPOSITE_SCORE:.1f}和雷暴空仓。",
+            "description": f"剔除科创板，叠加成交额豁免、策略独立门槛：突破>={BREAKOUT_MIN_SCORE:.1f}、低吸>={DIPBUY_MIN_SCORE:.1f}，并在阴天/震荡给低吸排序补偿。",
             "filter": lambda df: apply_production_filters(df),
         },
         {
@@ -234,7 +234,9 @@ def _threshold_stats(df: pd.DataFrame, threshold: int) -> dict[str, Any]:
 def _daily_top(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    idx = df.sort_values(["date", "预期溢价", "综合评分"], ascending=[True, False, False]).groupby("date")["预期溢价"].idxmax()
+    sort_cols = ["date", "排序评分", "预期溢价", "综合评分"] if "排序评分" in df.columns else ["date", "预期溢价", "综合评分"]
+    idx_col = "排序评分" if "排序评分" in df.columns else "预期溢价"
+    idx = df.sort_values(sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1)).groupby("date")[idx_col].idxmax()
     return df.loc[idx].sort_values("date").copy()
 
 

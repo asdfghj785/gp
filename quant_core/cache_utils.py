@@ -7,11 +7,11 @@ from typing import Any
 
 import pandas as pd
 
-from .config import BASE_DIR, DIPBUY_PREMIUM_MODEL_PATH, MIN_COMPOSITE_SCORE, PREMIUM_MODEL_PATH
+from .config import BASE_DIR, BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE, DIPBUY_PREMIUM_MODEL_PATH, PREMIUM_MODEL_PATH
 from .storage import database_overview
 
 
-CACHE_VERSION = "strategy-cache-v6-dipbuy-production-observation"
+CACHE_VERSION = "strategy-cache-v7-strategy-thresholds"
 CACHE_DIR = BASE_DIR / "data" / "strategy_cache"
 
 
@@ -22,7 +22,8 @@ def strategy_cache_signature(months: int) -> dict[str, Any]:
         "months": int(months),
         "max_date": overview.get("max_date"),
         "rows_count": overview.get("rows_count"),
-        "min_composite_score": MIN_COMPOSITE_SCORE,
+        "breakout_min_score": BREAKOUT_MIN_SCORE,
+        "dipbuy_min_score": DIPBUY_MIN_SCORE,
         "premium_model_mtime": _mtime(PREMIUM_MODEL_PATH),
         "dipbuy_model_mtime": _mtime(DIPBUY_PREMIUM_MODEL_PATH),
     }
