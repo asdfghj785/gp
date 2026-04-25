@@ -289,7 +289,7 @@
       <div class="panel-subhead">
         <div>
           <h3>双轨候选观察</h3>
-          <p>按交易日分别展示尾盘突破与首阴低吸各自的模型 Top1，用于确认双轨回测口径。</p>
+          <p>近两个月按交易日分别展示尾盘突破与首阴低吸各自的模型 Top1，共 {{ backtest.strategy_rows.length }} 条。</p>
         </div>
       </div>
 
@@ -310,7 +310,7 @@
             <tr v-if="backtest.strategy_rows.length === 0">
               <td colspan="7" class="empty">暂无双轨候选观察数据</td>
             </tr>
-            <tr v-for="row in backtest.strategy_rows.slice(0, 40)" :key="`${row.date}-${row.strategy_type}-${row.code}`">
+            <tr v-for="row in backtest.strategy_rows" :key="`${row.date}-${row.strategy_type}-${row.code}`">
               <td>{{ row.date }}</td>
               <td><span class="mono">{{ row.code }}</span> {{ row.name }}</td>
               <td><span :class="strategyBadgeClass(row.strategy_type)">{{ row.strategy_type || '尾盘突破' }}</span></td>
@@ -1596,6 +1596,20 @@ td small {
 
 .compact-table table {
   min-width: 760px;
+}
+
+.compact-table {
+  max-height: 420px;
+  border: 1px solid #e5eaf1;
+  border-radius: 6px;
+  overflow: auto;
+}
+
+.compact-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  box-shadow: 0 1px 0 #e5eaf1;
 }
 
 .failure-samples {

@@ -22,7 +22,7 @@ def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, 
     feature_df = prepared["evaluated"]
     if feature_df.empty:
         return _empty_result("过滤后没有候选股票")
-    strategy_rows = _strategy_pick_rows(feature_df, limit=120)
+    strategy_rows = _strategy_pick_rows(feature_df, months=min(2, months))
     candidate_strategy_counts = feature_df["strategy_type"].fillna("尾盘突破").value_counts().to_dict() if "strategy_type" in feature_df.columns else {}
     feature_df = apply_production_filters(feature_df)
     if feature_df.empty:
@@ -97,14 +97,19 @@ def _backtest_row(pick: pd.Series, current_close: float, next_open: float | None
     }
 
 
-def _strategy_pick_rows(df: pd.DataFrame, limit: int = 120) -> list[dict[str, Any]]:
+def _strategy_pick_rows(df: pd.DataFrame, months: int = 2) -> list[dict[str, Any]]:
     if df.empty or "strategy_type" not in df.columns:
         return []
     candidates = df.copy()
     candidates["strategy_type"] = candidates["strategy_type"].fillna("尾盘突破")
+    candidates["_date_sort"] = pd.to_datetime(candidates["date"], errors="coerce")
+    latest_date = candidates["_date_sort"].max()
+    if pd.notna(latest_date):
+        start_date = latest_date - pd.DateOffset(months=max(1, int(months)))
+        candidates = candidates[candidates["_date_sort"] >= start_date].copy()
     candidates = candidates.sort_values(["date", "strategy_type", "预期溢价", "综合评分"], ascending=[True, True, False, False])
     idx = candidates.groupby(["date", "strategy_type"])["预期溢价"].idxmax()
-    picks = candidates.loc[idx].sort_values(["date", "strategy_type"], ascending=[False, True]).head(limit)
+    picks = candidates.loc[idx].sort_values(["date", "strategy_type"], ascending=[False, True])
     rows: list[dict[str, Any]] = []
     for _, pick in picks.iterrows():
         next_open = float(pick["next_open"]) if pd.notna(pick.get("next_open")) else None
