@@ -155,6 +155,7 @@ def score_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
 
     scored["strategy_type"] = BREAKOUT_STRATEGY_TYPE
     scored["预期溢价"] = _fallback_expected_premium(scored)
+    _log_dipbuy_diagnostics(scored)
     dipbuy_mask = _dipbuy_physical_mask(scored)
     premium_model, premium_error = _load_premium_model()
     dipbuy_model, dipbuy_error = _load_dipbuy_premium_model()
@@ -207,6 +208,28 @@ def _dipbuy_physical_mask(df: pd.DataFrame) -> pd.Series:
         & (_num(df, "10日均线乖离率").between(DIPBUY_FILTERS["bias10_low"], DIPBUY_FILTERS["bias10_high"]))
         & (_num(df, "今日缩量比例") < DIPBUY_FILTERS["max_amount_shrink_pct"])
     ).fillna(False)
+
+
+def _log_dipbuy_diagnostics(df: pd.DataFrame) -> None:
+    if df.empty:
+        print("📊 [双轨诊断] 候选池为空，无法计算首阴低吸分流。")
+        return
+    probe_cols = ["纯代码", "名称", *DIPBUY_TEMPORAL_FEATURE_COLS]
+    available_cols = [col for col in probe_cols if col in df.columns]
+    sample = df[available_cols].sample(n=min(5, len(df)), random_state=42)
+    print("🔎 [双轨诊断] 低吸特征探针:")
+    print(sample.to_string(index=False))
+    dipbuy_pool = df[
+        (_num(df, "近5日最高涨幅") > 15.0)
+        & (_num(df, "今日急跌度") < -4.0)
+        & (_num(df, "10日均线乖离率").between(-3.0, 3.0))
+        & (_num(df, "今日缩量比例") < 0)
+    ]
+    print(f"📊 [双轨诊断] 全市场满足低吸物理条件的股票数量: {len(dipbuy_pool)} 只")
+    if not dipbuy_pool.empty:
+        show_cols = [col for col in probe_cols if col in dipbuy_pool.columns]
+        print("📊 [双轨诊断] 低吸候选样例:")
+        print(dipbuy_pool[show_cols].head(10).to_string(index=False))
 
 
 def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = None) -> pd.DataFrame:
