@@ -47,12 +47,29 @@ DIPBUY_TEMPORAL_FEATURE_COLS = [
     "今日急跌度",
     "10日均线乖离率",
     "今日缩量比例",
+    "均线趋势斜率",
+    "光脚大阴线惩罚度",
 ]
-DIPBUY_FEATURE_COLS = [*FEATURE_COLS, *DIPBUY_TEMPORAL_FEATURE_COLS]
+DIPBUY_FEATURE_COLS = [
+    "turn",
+    "量比",
+    "真实涨幅点数",
+    "实体比例",
+    "上影线比例",
+    "下影线比例",
+    "日内振幅",
+    "近5日最高涨幅",
+    "今日急跌度",
+    "10日均线乖离率",
+    "今日缩量比例",
+    "均线趋势斜率",
+    "光脚大阴线惩罚度",
+]
 DIPBUY_STRATEGY_TYPE = "首阴低吸"
 BREAKOUT_STRATEGY_TYPE = "尾盘突破"
 DIPBUY_FILTERS = {
     "min_5d_high_gain": 15.0,
+    "min_intraday_flush": -9.5,
     "max_intraday_flush": -4.0,
     "bias10_low": -3.0,
     "bias10_high": 3.0,
@@ -105,6 +122,8 @@ def _load_dipbuy_premium_model():
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "code" not in df.columns:
+        return pd.DataFrame()
     out = df.copy()
     out["纯代码"] = out["code"].astype(str).str.extract(r"(\d{6})")[0]
     out["名称"] = out["name"].fillna("")
@@ -123,7 +142,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["date"] = out["date"].astype(str)
 
     out = _add_market_context(out)
-    out = out[~out["纯代码"].str.startswith(("30", "4", "8", "92"), na=False)].copy()
+    out = out[~out["纯代码"].str.startswith(("30", "68", "4", "8", "92"), na=False)].copy()
     out = out[~out["名称"].str.contains("ST|退", case=False, na=False)].copy()
     out = out[(out["最新价"] > 0) & (out["昨收"] > 0)].copy()
     high_limit_board = out["纯代码"].str.startswith(("30", "68"), na=False)
@@ -146,7 +165,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def score_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     scored = df.copy()
-    for col in DIPBUY_FEATURE_COLS:
+    for col in dict.fromkeys([*FEATURE_COLS, *DIPBUY_FEATURE_COLS]):
         if col not in scored.columns:
             scored[col] = 0.0
         scored[col] = pd.to_numeric(scored[col], errors="coerce").replace([np.inf, -np.inf], 0).fillna(0)
@@ -211,6 +230,7 @@ def score_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
 def _dipbuy_physical_mask(df: pd.DataFrame) -> pd.Series:
     return (
         (_num(df, "近5日最高涨幅") > DIPBUY_FILTERS["min_5d_high_gain"])
+        & (_num(df, "今日急跌度") > DIPBUY_FILTERS["min_intraday_flush"])
         & (_num(df, "今日急跌度") < DIPBUY_FILTERS["max_intraday_flush"])
         & (_num(df, "10日均线乖离率").between(DIPBUY_FILTERS["bias10_low"], DIPBUY_FILTERS["bias10_high"]))
         & (_num(df, "今日缩量比例") < DIPBUY_FILTERS["max_amount_shrink_pct"])
@@ -228,6 +248,7 @@ def _log_dipbuy_diagnostics(df: pd.DataFrame) -> None:
     print(sample.to_string(index=False))
     dipbuy_pool = df[
         (_num(df, "近5日最高涨幅") > 15.0)
+        & (_num(df, "今日急跌度") > -9.5)
         & (_num(df, "今日急跌度") < -4.0)
         & (_num(df, "10日均线乖离率").between(-3.0, 3.0))
         & (_num(df, "今日缩量比例") < 0)
@@ -475,6 +496,7 @@ def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     ma5 = group["最新价"].transform(lambda values: values.rolling(5, min_periods=3).mean())
     ma10 = group["最新价"].transform(lambda values: values.rolling(10, min_periods=5).mean())
     ma20 = group["最新价"].transform(lambda values: values.rolling(20, min_periods=10).mean())
+    ma10_prev = ma10.groupby(combined["纯代码"], sort=False).shift(1)
     high5 = group["最高"].transform(lambda values: values.rolling(5, min_periods=3).max())
     high60 = group["最新价"].transform(lambda values: values.rolling(60, min_periods=20).max())
     avg_turn3 = group["换手率"].transform(lambda values: values.rolling(3, min_periods=2).mean())
@@ -494,6 +516,8 @@ def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     combined["近5日最高涨幅"] = ((high5 / prev5_close - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
     combined["今日急跌度"] = ((low / prev_close - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
     combined["今日缩量比例"] = ((amount / prev_amount - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["均线趋势斜率"] = ((ma10 / ma10_prev - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["光脚大阴线惩罚度"] = ((close - low) / (high - low + 1e-5)).replace([np.inf, -np.inf], 0).fillna(0)
     combined["3日平均换手率"] = avg_turn3.replace([np.inf, -np.inf], 0).fillna(turnover)
     combined["5日量能堆积"] = (volume / avg_vol5).replace([np.inf, -np.inf], 0).fillna(0)
     combined["10日量比"] = (volume / avg_vol10).replace([np.inf, -np.inf], 0).fillna(0)
@@ -803,6 +827,8 @@ def _row_to_api(row: pd.Series) -> dict[str, Any]:
             "max_gain_5d": round(float(row.get("近5日最高涨幅", 0)), 4),
             "intraday_flush": round(float(row.get("今日急跌度", 0)), 4),
             "amount_shrink_pct": round(float(row.get("今日缩量比例", 0)), 4),
+            "ma_trend_slope": round(float(row.get("均线趋势斜率", 0)), 4),
+            "bald_bear_ratio": round(float(row.get("光脚大阴线惩罚度", 0)), 4),
             "avg_turnover_3d": round(float(row.get("3日平均换手率", 0)), 4),
             "volume_stack_5d": round(float(row.get("5日量能堆积", 0)), 4),
             "volume_ratio_10d": round(float(row.get("10日量比", 0)), 4),

@@ -17,6 +17,7 @@ DATASET_PATH = BASE_DIR / "data" / "ml_dataset" / "smart_overnight_data.parquet"
 FEE_BUFFER_PCT = PROFIT_TARGET_PCT
 DIPBUY_FILTERS = {
     "min_5d_high_gain": 15.0,
+    "min_intraday_flush": -9.5,
     "max_intraday_flush": -4.0,
     "bias10_low": -3.0,
     "bias10_high": 3.0,
@@ -36,6 +37,7 @@ def train() -> dict[str, object]:
     df = df[df["next_day_premium"].between(-15, 15)].copy()
     dipbuy_mask = (
         (df["近5日最高涨幅"] > DIPBUY_FILTERS["min_5d_high_gain"])
+        & (df["今日急跌度"] > DIPBUY_FILTERS["min_intraday_flush"])
         & (df["今日急跌度"] < DIPBUY_FILTERS["max_intraday_flush"])
         & (df["10日均线乖离率"].between(DIPBUY_FILTERS["bias10_low"], DIPBUY_FILTERS["bias10_high"]))
         & (df["今日缩量比例"] < DIPBUY_FILTERS["max_amount_shrink_pct"])
