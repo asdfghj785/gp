@@ -1,0 +1,608 @@
+from __future__ import annotations
+
+import json
+import threading
+from datetime import datetime
+from functools import lru_cache
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from .config import LATEST_TOP50_PATH, MIN_COMPOSITE_SCORE, MODEL_PATH, PREMIUM_MODEL_PATH, PROFIT_TARGET_PCT
+from .intraday_snapshot import attach_late_pull_trap
+from .market import fetch_market_indices, fetch_sina_snapshot
+from .storage import connect, save_prediction_snapshot, upsert_daily_rows
+
+
+FEATURE_COLS = [
+    "turn",
+    "量比",
+    "真实涨幅点数",
+    "实体比例",
+    "上影线比例",
+    "下影线比例",
+    "日内振幅",
+    "5日累计涨幅",
+    "3日累计涨幅",
+    "5日均线乖离率",
+    "20日均线乖离率",
+    "3日平均换手率",
+    "5日量能堆积",
+    "10日量比",
+    "3日红盘比例",
+    "5日地量标记",
+    "缩量下跌标记",
+    "振幅换手比",
+    "缩量大涨标记",
+    "极端下影线标记",
+    "近3日断头铡刀标记",
+    "60日高位比例",
+    "market_up_rate",
+    "market_avg_change",
+    "market_down_count",
+]
+LOW_LIQUIDITY_AMOUNT = 700_000_000_000
+HIGH_LIQUIDITY_AMOUNT = 800_000_000_000
+
+
+@lru_cache(maxsize=1)
+def _load_model():
+    if not MODEL_PATH.exists():
+        return None, f"找不到模型文件: {MODEL_PATH}"
+    try:
+        import xgboost as xgb
+
+        model = xgb.XGBClassifier()
+        model.load_model(str(MODEL_PATH))
+        return model, None
+    except Exception as exc:
+        return None, f"模型加载失败: {exc}"
+
+
+@lru_cache(maxsize=1)
+def _load_premium_model():
+    if not PREMIUM_MODEL_PATH.exists():
+        return None, f"找不到溢价模型文件: {PREMIUM_MODEL_PATH}"
+    try:
+        import xgboost as xgb
+
+        model = xgb.XGBRegressor()
+        model.load_model(str(PREMIUM_MODEL_PATH))
+        return model, None
+    except Exception as exc:
+        return None, f"溢价模型加载失败: {exc}"
+
+
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["纯代码"] = out["code"].astype(str).str.extract(r"(\d{6})")[0]
+    out["名称"] = out["name"].fillna("")
+    out["最新价"] = pd.to_numeric(out["close"], errors="coerce").fillna(0)
+    out["涨跌幅"] = pd.to_numeric(out["change_pct"], errors="coerce").fillna(0)
+    out["换手率"] = pd.to_numeric(out["turnover"], errors="coerce").fillna(0)
+    if "volume_ratio" not in out.columns:
+        out["volume_ratio"] = 0.0
+    out["量比"] = pd.to_numeric(out["volume_ratio"], errors="coerce").fillna(0)
+    out["昨收"] = pd.to_numeric(out["pre_close"], errors="coerce").fillna(0)
+    out["今开"] = pd.to_numeric(out["open"], errors="coerce").fillna(0)
+    out["最高"] = pd.to_numeric(out["high"], errors="coerce").fillna(0)
+    out["最低"] = pd.to_numeric(out["low"], errors="coerce").fillna(0)
+    out["volume"] = pd.to_numeric(out.get("volume", 0), errors="coerce").fillna(0)
+    out["amount"] = pd.to_numeric(out.get("amount", 0), errors="coerce").fillna(0)
+    out["date"] = out["date"].astype(str)
+
+    out = _add_market_context(out)
+    out = _add_temporal_features(out)
+
+    out = out[~out["纯代码"].str.startswith(("30", "4", "8", "92"), na=False)].copy()
+    out = out[~out["名称"].str.contains("ST|退", case=False, na=False)].copy()
+    out = out[(out["最新价"] > 0) & (out["昨收"] > 0)].copy()
+    high_limit_board = out["纯代码"].str.startswith(("30", "68"), na=False)
+    out = out[((high_limit_board) & (out["涨跌幅"] < 19.5)) | ((~high_limit_board) & (out["涨跌幅"] < 9.5))].copy()
+
+    out["实体比例"] = ((out["最新价"] - out["今开"]) / out["昨收"] * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    out["上影线比例"] = ((out["最高"] - out[["今开", "最新价"]].max(axis=1)) / out["昨收"] * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    out["下影线比例"] = ((out[["今开", "最新价"]].min(axis=1) - out["最低"]) / out["昨收"] * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    out["日内振幅"] = ((out["最高"] - out["最低"]) / out["昨收"] * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    out["真实涨幅点数"] = out["涨跌幅"]
+    out["turn"] = out["换手率"]
+    out["振幅换手比"] = (out["日内振幅"] / out["换手率"].replace(0, np.nan)).replace([np.inf, -np.inf], 0).fillna(0)
+    out["缩量大涨标记"] = ((out["涨跌幅"] > 3) & (pd.to_numeric(out.get("5日量能堆积", 0), errors="coerce").fillna(0) < 1)).astype(float)
+    out["极端下影线标记"] = ((out["下影线比例"] > out["实体比例"].abs() * 2) & (out["涨跌幅"] > 3)).astype(float)
+    return out
+
+
+def score_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    scored = df.copy()
+    for col in FEATURE_COLS:
+        if col not in scored.columns:
+            scored[col] = 0.0
+        scored[col] = pd.to_numeric(scored[col], errors="coerce").replace([np.inf, -np.inf], 0).fillna(0)
+    if scored.empty:
+        return scored, "ready"
+
+    premium_model, premium_error = _load_premium_model()
+    if premium_model is not None:
+        try:
+            scored["预期溢价"] = premium_model.predict(scored[FEATURE_COLS].values)
+            model_status = "regressor_ready"
+        except Exception as exc:
+            scored["预期溢价"] = _fallback_expected_premium(scored)
+            model_status = f"回归模型失败，已降级规则估算: {exc}"
+    else:
+        scored["预期溢价"] = _fallback_expected_premium(scored)
+        model_status = premium_error or "premium_model_unavailable"
+
+    scored["风险评分"] = _risk_score(scored)
+    scored["流动性评分"] = _liquidity_score(scored)
+    scored["AI胜率"] = _regression_signal_score(scored)
+    premium_score = (50 + scored["预期溢价"].clip(-5, 5) * 10).clip(0, 100)
+    scored["综合评分"] = (
+        premium_score * 0.60
+        + scored["风险评分"] * 0.20
+        + scored["流动性评分"] * 0.10
+        + scored["AI胜率"] * 0.10
+    ).clip(0, 100)
+    return scored, model_status
+
+
+def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = None) -> pd.DataFrame:
+    """Default live strategy filters selected from the current strategy lab."""
+    if df.empty:
+        return df
+    if gate and gate.get("blocked"):
+        return df.iloc[0:0].copy()
+    filtered = df[~df["纯代码"].str.startswith(("68", "689"), na=False)].copy()
+    if "涨跌幅" in filtered.columns:
+        filtered = filtered[filtered["涨跌幅"] < 7].copy()
+    if "上影线比例" in filtered.columns:
+        filtered = filtered[filtered["上影线比例"] < 2].copy()
+    if "预期溢价" in filtered.columns:
+        filtered = filtered[filtered["预期溢价"] > 0].copy()
+    if {"60日高位比例", "量比", "5日量能堆积"}.issubset(filtered.columns):
+        high_volume_trap = (
+            (pd.to_numeric(filtered["60日高位比例"], errors="coerce").fillna(0) >= 97)
+            & (
+                (pd.to_numeric(filtered["量比"], errors="coerce").fillna(0) > 3)
+                | (pd.to_numeric(filtered["5日量能堆积"], errors="coerce").fillna(0) > 3)
+            )
+        )
+        filtered = filtered[~high_volume_trap].copy()
+    if "尾盘诱多标记" in filtered.columns:
+        filtered = filtered[pd.to_numeric(filtered["尾盘诱多标记"], errors="coerce").fillna(0) < 0.5].copy()
+    if "近3日断头铡刀标记" in filtered.columns:
+        filtered = filtered[pd.to_numeric(filtered["近3日断头铡刀标记"], errors="coerce").fillna(0) < 0.5].copy()
+    if "综合评分" in filtered.columns:
+        filtered = filtered[pd.to_numeric(filtered["综合评分"], errors="coerce").fillna(0) >= MIN_COMPOSITE_SCORE].copy()
+    return filtered
+
+
+def scan_market(
+    limit: int = 50,
+    persist_snapshot: bool = True,
+    cache_prediction: bool = True,
+    async_persist: bool = False,
+) -> dict[str, Any]:
+    snapshot = fetch_sina_snapshot()
+    if snapshot.empty:
+        raise RuntimeError("实时行情源返回空数据")
+    _repair_snapshot_volume_ratio(snapshot)
+    market_indices = fetch_market_indices()
+
+    if persist_snapshot and async_persist:
+        threading.Thread(target=_persist_snapshot, args=(snapshot,), daemon=True).start()
+    elif persist_snapshot:
+        upsert_daily_rows(snapshot, source="sina_snapshot")
+
+    df = build_features(snapshot)
+    if df.empty:
+        return {"created_at": datetime.now().isoformat(timespec="seconds"), "model_status": "ready", "rows": []}
+    df, intraday_snapshot = attach_late_pull_trap(df)
+
+    df, model_status = score_candidates(df)
+    gate = market_risk_gate(df, market_indices)
+    if gate["blocked"]:
+        payload = {
+            "id": None,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "model_status": f"{model_status}; 大盘风控触发，强制空仓",
+            "strategy": "大盘风控：雷暴模式强制空仓；大盘下跌且市场缩量时空仓；高成交额或指数站上20日均线时允许AI按动态阈值选股。",
+            "market_gate": gate,
+            "intraday_snapshot": intraday_snapshot,
+            "rows": [],
+        }
+        if cache_prediction:
+            LATEST_TOP50_PATH.write_text(json.dumps([], ensure_ascii=False, indent=2), encoding="utf-8")
+        return payload
+
+    df = apply_production_filters(df, gate)
+
+    df = df.sort_values(["预期溢价", "综合评分"], ascending=[False, False]).head(limit)
+    rows = [_row_to_api(row) for _, row in df.iterrows()]
+    snapshot_id = save_prediction_snapshot("xgboost_regressor" if model_status == "regressor_ready" else "rule_fallback", rows) if cache_prediction else None
+    payload = {
+        "id": snapshot_id,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "model_status": model_status,
+        "strategy": f"生产策略：回归器预测次日开盘预期溢价，按预期溢价排序；剔除创业板/北交所/科创板/ST，叠加大盘分级风控，综合评分>={MIN_COMPOSITE_SCORE:.1f}；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多、近3日断头铡刀直接剔除。",
+        "market_gate": gate,
+        "intraday_snapshot": intraday_snapshot,
+        "rows": rows,
+    }
+    if cache_prediction:
+        LATEST_TOP50_PATH.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def market_risk_gate(df: pd.DataFrame, indices: dict[str, dict[str, float | str]] | None = None) -> dict[str, Any]:
+    if df.empty:
+        return {
+            "blocked": True,
+            "reasons": ["候选池为空"],
+            "market_up_rate": 0.0,
+            "market_down_count": 0,
+            "market_avg_change": 0.0,
+            "market_amount": 0.0,
+            "mode": "雷暴",
+            "min_ai_win_rate": None,
+            "indices": indices or {},
+        }
+    market_up_rate = float(pd.to_numeric(df.get("market_up_rate", 0), errors="coerce").dropna().iloc[0]) if "market_up_rate" in df.columns else 0.0
+    market_down_count = int(pd.to_numeric(df.get("market_down_count", 0), errors="coerce").dropna().iloc[0]) if "market_down_count" in df.columns else 0
+    market_avg_change = float(pd.to_numeric(df.get("market_avg_change", 0), errors="coerce").dropna().iloc[0]) if "market_avg_change" in df.columns else 0.0
+    market_amount = float(pd.to_numeric(df.get("market_amount", 0), errors="coerce").dropna().iloc[0]) if "market_amount" in df.columns else 0.0
+    reasons: list[str] = []
+    safe_indices = indices or {}
+    index_changes: list[float] = []
+    index_above_ma20 = False
+    for code, label in (("sh000001", "上证指数"), ("sh000852", "中证1000")):
+        change = safe_indices.get(code, {}).get("change_pct")
+        if isinstance(change, (int, float)):
+            index_changes.append(float(change))
+        if safe_indices.get(code, {}).get("above_ma20") is True:
+            index_above_ma20 = True
+
+    worst_index_change = min(index_changes) if index_changes else market_avg_change
+    high_liquidity = market_amount >= HIGH_LIQUIDITY_AMOUNT
+    low_liquidity = 0 < market_amount < LOW_LIQUIDITY_AMOUNT
+    index_down = worst_index_change <= -0.5
+    broad_down = market_down_count >= 3000
+    thunder = worst_index_change <= -1.2 or market_down_count > 4200
+    shrink_down = (index_down or market_avg_change <= -0.5) and low_liquidity
+    trend_exempt = index_above_ma20 and not thunder
+
+    if thunder:
+        mode = "雷暴"
+        blocked = True
+        min_ai_win_rate: float | None = None
+        if worst_index_change <= -1.2:
+            reasons.append(f"指数最大跌幅 {worst_index_change:.2f}% <= -1.20%")
+        if market_down_count > 4200:
+            reasons.append(f"全市场下跌家数 {market_down_count} > 4200")
+    elif shrink_down and not trend_exempt:
+        mode = "缩量下跌"
+        blocked = True
+        min_ai_win_rate = None
+        reasons.append(f"大盘下跌且总成交额 {market_amount / 100000000:.0f} 亿 < 7000 亿")
+    elif (index_down or broad_down or market_avg_change <= -0.5) and not high_liquidity and not trend_exempt:
+        mode = "阴天"
+        blocked = False
+        min_ai_win_rate = 75.0
+        reasons.append("市场偏弱，仅保留高质量回归溢价信号")
+    else:
+        mode = "晴天"
+        blocked = False
+        min_ai_win_rate = 60.0
+        if high_liquidity and (index_down or market_avg_change <= -0.5):
+            reasons.append(f"总成交额 {market_amount / 100000000:.0f} 亿 >= 8000 亿，流动性豁免")
+        if trend_exempt and (index_down or market_avg_change <= -0.5):
+            reasons.append("指数仍在20日均线之上，趋势豁免")
+
+    return {
+        "blocked": blocked,
+        "reasons": reasons,
+        "mode": mode,
+        "min_ai_win_rate": min_ai_win_rate,
+        "market_up_rate": round(market_up_rate, 4),
+        "market_down_count": market_down_count,
+        "market_avg_change": round(market_avg_change, 4),
+        "market_amount": round(market_amount, 2),
+        "market_amount_yi": round(market_amount / 100000000, 2),
+        "worst_index_change": round(float(worst_index_change), 4),
+        "high_liquidity": high_liquidity,
+        "low_liquidity": low_liquidity,
+        "index_above_ma20": index_above_ma20,
+        "indices": safe_indices,
+    }
+
+
+def _dynamic_win_rate_thresholds(df: pd.DataFrame) -> pd.Series:
+    amount = _num(df, "market_amount")
+    down_count = _num(df, "market_down_count")
+    avg_change = _num(df, "market_avg_change")
+    thunder = (avg_change <= -1.2) | (down_count > 4200)
+    shrink_down = ((avg_change <= -0.5) | (down_count >= 3000)) & (amount > 0) & (amount < LOW_LIQUIDITY_AMOUNT)
+    cloudy = ((avg_change <= -0.5) | (down_count >= 3000)) & ~(amount >= HIGH_LIQUIDITY_AMOUNT)
+    thresholds = pd.Series(60.0, index=df.index)
+    thresholds.loc[cloudy] = 75.0
+    thresholds.loc[thunder | shrink_down] = np.inf
+    return thresholds
+
+
+def _add_market_context(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    daily = (
+        out.groupby("date", dropna=False)
+        .agg(
+            market_up_rate=("涨跌幅", lambda values: float((pd.to_numeric(values, errors="coerce") > 0).mean() * 100)),
+            market_down_count=("涨跌幅", lambda values: int((pd.to_numeric(values, errors="coerce") < 0).sum())),
+            market_avg_change=("涨跌幅", "mean"),
+            market_amount=("amount", "sum"),
+        )
+        .reset_index()
+    )
+    return out.merge(daily, on="date", how="left")
+
+
+def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    current = df.copy()
+    current["_current_row"] = True
+    combined = current
+    if current["date"].nunique() == 1:
+        history = _load_recent_history_for_codes(current["纯代码"].dropna().astype(str).unique().tolist(), str(current["date"].iloc[0]))
+        if not history.empty:
+            history["_current_row"] = False
+            combined = pd.concat([history, current], ignore_index=True, sort=False)
+
+    for col in ["最新价", "今开", "volume", "换手率"]:
+        if col not in combined.columns:
+            combined[col] = 0.0
+        combined[col] = pd.to_numeric(combined[col], errors="coerce").fillna(0.0)
+    combined["date_sort"] = pd.to_datetime(combined["date"], errors="coerce")
+    combined = combined.sort_values(["纯代码", "date_sort", "_current_row"]).copy()
+    group = combined.groupby("纯代码", sort=False)
+    close = combined["最新价"]
+    open_price = combined["今开"]
+    volume = combined["volume"]
+    turnover = combined["换手率"]
+
+    prev3_close = group["最新价"].shift(3)
+    prev5_close = group["最新价"].shift(5)
+    ma5 = group["最新价"].transform(lambda values: values.rolling(5, min_periods=3).mean())
+    ma20 = group["最新价"].transform(lambda values: values.rolling(20, min_periods=10).mean())
+    high60 = group["最新价"].transform(lambda values: values.rolling(60, min_periods=20).max())
+    avg_turn3 = group["换手率"].transform(lambda values: values.rolling(3, min_periods=2).mean())
+    avg_vol5 = group["volume"].transform(lambda values: values.shift(1).rolling(5, min_periods=3).mean())
+    avg_vol10 = group["volume"].transform(lambda values: values.shift(1).rolling(10, min_periods=5).mean())
+    red3 = (close > open_price).astype(float).groupby(combined["纯代码"], sort=False).transform(lambda values: values.rolling(3, min_periods=2).mean() * 100)
+    min_vol5 = group["volume"].transform(lambda values: values.rolling(5, min_periods=3).min())
+    prev_close = group["最新价"].shift(1)
+    recent_3d_min_change = group["涨跌幅"].transform(lambda values: values.shift(1).rolling(3, min_periods=1).min())
+
+    combined["5日累计涨幅"] = ((close / prev5_close - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["3日累计涨幅"] = ((close / prev3_close - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["5日均线乖离率"] = ((close / ma5 - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["20日均线乖离率"] = ((close / ma20 - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["3日平均换手率"] = avg_turn3.replace([np.inf, -np.inf], 0).fillna(turnover)
+    combined["5日量能堆积"] = (volume / avg_vol5).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["10日量比"] = (volume / avg_vol10).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["3日红盘比例"] = red3.replace([np.inf, -np.inf], 0).fillna(0)
+    combined["5日地量标记"] = ((volume > 0) & (volume <= min_vol5)).astype(float)
+    combined["缩量下跌标记"] = ((close < prev_close) & (volume < avg_vol5)).astype(float)
+    combined["近3日断头铡刀标记"] = (recent_3d_min_change <= -7).astype(float)
+    combined["60日高位比例"] = ((close / high60) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["高位爆量标记"] = ((combined["60日高位比例"] >= 97) & ((combined["量比"] > 3) | (combined["5日量能堆积"] > 3))).astype(float)
+    for col in ["振幅换手比", "缩量大涨标记", "极端下影线标记"]:
+        if col not in combined.columns:
+            combined[col] = 0.0
+    if "尾盘诱多标记" not in combined.columns:
+        combined["尾盘诱多标记"] = 0.0
+
+    result = combined[combined["_current_row"]].copy()
+    return result.drop(columns=["_current_row", "date_sort"], errors="ignore")
+
+
+def _load_recent_history_for_codes(codes: list[str], current_date: str) -> pd.DataFrame:
+    if not codes:
+        return pd.DataFrame()
+    start_date = (pd.Timestamp(current_date) - pd.DateOffset(days=140)).strftime("%Y-%m-%d")
+    placeholders = ",".join("?" for _ in codes)
+    query = f"""
+        SELECT code, name, date, open, high, low, close, pre_close, change_pct,
+               volume, amount, turnover, volume_ratio
+        FROM stock_daily
+        WHERE code IN ({placeholders}) AND date >= ? AND date < ?
+        ORDER BY code ASC, date ASC
+    """
+    try:
+        with connect() as conn:
+            history = pd.read_sql_query(query, conn, params=[*codes, start_date, current_date])
+    except Exception:
+        return pd.DataFrame()
+    if history.empty:
+        return history
+    history["纯代码"] = history["code"].astype(str).str.extract(r"(\d{6})")[0]
+    history["名称"] = history["name"].fillna("")
+    history["最新价"] = pd.to_numeric(history["close"], errors="coerce").fillna(0)
+    history["涨跌幅"] = pd.to_numeric(history["change_pct"], errors="coerce").fillna(0)
+    history["换手率"] = pd.to_numeric(history["turnover"], errors="coerce").fillna(0)
+    history["量比"] = pd.to_numeric(history["volume_ratio"], errors="coerce").fillna(0)
+    history["昨收"] = pd.to_numeric(history["pre_close"], errors="coerce").fillna(0)
+    history["今开"] = pd.to_numeric(history["open"], errors="coerce").fillna(0)
+    history["最高"] = pd.to_numeric(history["high"], errors="coerce").fillna(0)
+    history["最低"] = pd.to_numeric(history["low"], errors="coerce").fillna(0)
+    history["volume"] = pd.to_numeric(history["volume"], errors="coerce").fillna(0)
+    history["amount"] = pd.to_numeric(history["amount"], errors="coerce").fillna(0)
+    return history
+
+
+def _persist_snapshot(snapshot: pd.DataFrame) -> None:
+    try:
+        upsert_daily_rows(snapshot, source="sina_snapshot")
+    except Exception as exc:
+        print(f"[radar] 快照后台入库失败: {exc}")
+
+
+def _fallback_score(df: pd.DataFrame) -> pd.Series:
+    momentum = df["涨跌幅"].clip(-5, 9.5) * 4
+    liquidity = np.log1p(df["换手率"].clip(0, 30)) * 12
+    shape = (df["实体比例"] - df["上影线比例"] * 0.7 + df["下影线比例"] * 0.35).clip(-12, 12)
+    trend = (
+        _num(df, "5日累计涨幅").clip(-12, 18) * 0.55
+        + _num(df, "3日累计涨幅").clip(-8, 12) * 0.45
+        - _num(df, "5日均线乖离率").clip(-15, 25).abs() * 0.22
+        - _num(df, "20日均线乖离率").clip(-20, 30).abs() * 0.18
+    )
+    volume_signal = (_num(df, "5日量能堆积").clip(0, 4) - 1).clip(-1, 3) * 4 + _num(df, "3日红盘比例").clip(0, 100) * 0.06
+    fake_pull_penalty = (
+        (_num(df, "振幅换手比") - 3).clip(lower=0) * 1.8
+        + _num(df, "缩量大涨标记") * 6
+        + _num(df, "极端下影线标记") * 4
+    )
+    score = 45 + momentum + liquidity + shape + trend + volume_signal - fake_pull_penalty
+    return pd.Series(score.clip(0, 99), index=df.index)
+
+
+def _fallback_expected_premium(df: pd.DataFrame) -> pd.Series:
+    momentum = df["涨跌幅"].clip(-5, 9.5) * 0.06
+    liquidity = np.log1p(df["换手率"].clip(0, 30)) * 0.08
+    trend = _num(df, "3日累计涨幅").clip(-8, 12) * 0.018 + _num(df, "5日累计涨幅").clip(-12, 18) * 0.01
+    volume_signal = (_num(df, "5日量能堆积").clip(0, 4) - 1).clip(-1, 3) * 0.08
+    shadow_penalty = df["上影线比例"].clip(0, 12) * 0.05
+    amplitude_penalty = (df["日内振幅"].clip(0, 20) - 6).clip(lower=0) * 0.03
+    fake_pull_penalty = (_num(df, "振幅换手比") - 3).clip(lower=0) * 0.05 + _num(df, "缩量大涨标记") * 0.18 + _num(df, "极端下影线标记") * 0.12
+    market_penalty = (-0.5 - _num(df, "market_avg_change")).clip(lower=0) * 0.5
+    expected = -0.25 + momentum + liquidity + trend + volume_signal - shadow_penalty - amplitude_penalty - fake_pull_penalty - market_penalty
+    return pd.Series(expected.clip(-8, 8), index=df.index)
+
+
+def _regression_signal_score(df: pd.DataFrame) -> pd.Series:
+    premium_signal = (50 + _num(df, "预期溢价").clip(-5, 5) * 12).clip(0, 100)
+    risk_adjust = (_num(df, "风险评分") - 50).clip(-50, 50) * 0.18
+    liquidity_adjust = (_num(df, "流动性评分") - 50).clip(-50, 50) * 0.08
+    return (premium_signal + risk_adjust + liquidity_adjust).clip(0, 99)
+
+
+def _risk_score(df: pd.DataFrame) -> pd.Series:
+    score = pd.Series(88.0, index=df.index)
+    score -= (df["日内振幅"].clip(0, 25) * 1.3)
+    score -= (df["上影线比例"].clip(0, 15) * 1.5)
+    score -= ((df["涨跌幅"] - 7).clip(lower=0) * 3.0)
+    score -= ((df["换手率"] - 18).clip(lower=0) * 0.9)
+    score -= (3 - df["最新价"]).clip(lower=0) * 8.0
+    score -= (-0.5 - _num(df, "market_avg_change")).clip(lower=0) * 20.0
+    score -= (_num(df, "5日均线乖离率").abs() - 10).clip(lower=0) * 1.4
+    score -= (_num(df, "20日均线乖离率").abs() - 18).clip(lower=0) * 1.2
+    score -= ((_num(df, "60日高位比例") - 97).clip(lower=0) * (_num(df, "5日量能堆积") > 3).astype(float) * 12)
+    score -= (_num(df, "振幅换手比") - 3).clip(lower=0) * 4.0
+    score -= _num(df, "缩量大涨标记") * 10.0
+    score -= _num(df, "极端下影线标记") * 8.0
+    score -= _num(df, "近3日断头铡刀标记") * 18.0
+    return score.clip(0, 100)
+
+
+def _num(df: pd.DataFrame, col: str) -> pd.Series:
+    if col not in df.columns:
+        return pd.Series(0.0, index=df.index)
+    return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+
+def _liquidity_score(df: pd.DataFrame) -> pd.Series:
+    amount = pd.to_numeric(df.get("amount", 0), errors="coerce").fillna(0)
+    amount_score = (np.log10(amount.clip(lower=1)) - 6).clip(0, 3) / 3 * 70
+    turn = df["换手率"].clip(0, 20)
+    turn_score = (100 - (turn - 6).abs() * 8).clip(0, 100) * 0.30
+    return pd.Series((amount_score + turn_score).clip(0, 100), index=df.index)
+
+
+def _repair_snapshot_volume_ratio(snapshot: pd.DataFrame) -> int:
+    if snapshot.empty or "volume" not in snapshot.columns:
+        return 0
+    if "volume_ratio" not in snapshot.columns:
+        snapshot["volume_ratio"] = 0.0
+    snapshot["volume_ratio"] = pd.to_numeric(snapshot["volume_ratio"], errors="coerce").fillna(0.0)
+    missing = snapshot["volume_ratio"] <= 0
+    if not missing.any():
+        return 0
+    codes = snapshot.loc[missing, "code"].dropna().astype(str).tolist()
+    if not codes:
+        return 0
+    placeholders = ",".join("?" for _ in codes)
+    query = f"""
+        SELECT code, date, volume
+        FROM stock_daily
+        WHERE code IN ({placeholders})
+        ORDER BY code, date DESC
+    """
+    try:
+        with connect() as conn:
+            history = pd.read_sql_query(query, conn, params=codes)
+    except Exception:
+        return 0
+    if history.empty:
+        return 0
+    avg_volume = (
+        history.assign(volume=pd.to_numeric(history["volume"], errors="coerce"))
+        .dropna(subset=["volume"])
+        .groupby("code")["volume"]
+        .apply(lambda values: values.head(5).mean())
+    )
+    current_volume = pd.to_numeric(snapshot.loc[missing, "volume"], errors="coerce")
+    repaired = snapshot.loc[missing, "code"].map(avg_volume)
+    valid = repaired.notna() & (repaired > 0) & current_volume.notna() & (current_volume > 0)
+    if not valid.any():
+        return 0
+    target_index = repaired[valid].index
+    snapshot.loc[target_index, "volume_ratio"] = current_volume.loc[target_index] / repaired.loc[target_index]
+    return int(valid.sum())
+
+
+def _row_to_api(row: pd.Series) -> dict[str, Any]:
+    return {
+        "code": str(row["纯代码"]),
+        "name": str(row["名称"]),
+        "price": round(float(row["最新价"]), 4),
+        "change": round(float(row["涨跌幅"]), 4),
+        "volume_ratio": round(float(row["量比"]), 4),
+        "turnover": round(float(row["换手率"]), 4),
+        "win_rate": round(float(row["AI胜率"]), 4),
+        "expected_premium": round(float(row.get("预期溢价", 0)), 4),
+        "risk_score": round(float(row.get("风险评分", 0)), 4),
+        "liquidity_score": round(float(row.get("流动性评分", 0)), 4),
+        "composite_score": round(float(row.get("综合评分", row["AI胜率"])), 4),
+        "tech_features": {
+            "body_ratio": round(float(row["实体比例"]), 4),
+            "upper_shadow": round(float(row["上影线比例"]), 4),
+            "lower_shadow": round(float(row["下影线比例"]), 4),
+            "amplitude": round(float(row["日内振幅"]), 4),
+        },
+        "trend_features": {
+            "return_5d": round(float(row.get("5日累计涨幅", 0)), 4),
+            "return_3d": round(float(row.get("3日累计涨幅", 0)), 4),
+            "bias_5d": round(float(row.get("5日均线乖离率", 0)), 4),
+            "bias_20d": round(float(row.get("20日均线乖离率", 0)), 4),
+            "avg_turnover_3d": round(float(row.get("3日平均换手率", 0)), 4),
+            "volume_stack_5d": round(float(row.get("5日量能堆积", 0)), 4),
+            "volume_ratio_10d": round(float(row.get("10日量比", 0)), 4),
+            "red_ratio_3d": round(float(row.get("3日红盘比例", 0)), 4),
+            "high_position_60d": round(float(row.get("60日高位比例", 0)), 4),
+            "amplitude_turnover_ratio": round(float(row.get("振幅换手比", 0)), 4),
+            "late_pull_pct": round(float(row.get("尾盘拉升幅度", 0)), 4),
+            "is_5d_low_volume": bool(float(row.get("5日地量标记", 0)) >= 0.5),
+            "is_shrink_down": bool(float(row.get("缩量下跌标记", 0)) >= 0.5),
+            "is_low_volume_rally": bool(float(row.get("缩量大涨标记", 0)) >= 0.5),
+            "is_extreme_lower_shadow": bool(float(row.get("极端下影线标记", 0)) >= 0.5),
+            "is_recent_guillotine": bool(float(row.get("近3日断头铡刀标记", 0)) >= 0.5),
+            "is_high_volume_trap": bool(float(row.get("高位爆量标记", 0)) >= 0.5),
+            "is_late_pull_trap": bool(float(row.get("尾盘诱多标记", 0)) >= 0.5),
+        },
+        "market_context": {
+            "up_rate": round(float(row.get("market_up_rate", 0)), 4),
+            "down_count": int(float(row.get("market_down_count", 0) or 0)),
+            "avg_change": round(float(row.get("market_avg_change", 0)), 4),
+            "amount_yi": round(float(row.get("market_amount", 0) or 0) / 100000000, 4),
+        },
+    }

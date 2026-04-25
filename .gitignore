@@ -1,0 +1,48 @@
+# macOS / editors
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Node / Vite
+quant_dashboard/frontend/node_modules/
+quant_dashboard/frontend/dist/
+
+# Local market data, database and runtime cache
+data/
+*.sqlite
+*.sqlite3
+*.db
+latest_top_50.json
+
+# Logs
+*.log
+*_log.txt
+*_err.log
+*_out.log
+cron_log.txt
+recorder_log.txt
+sniper_log.txt
+datasync.log
+out.log
+err.log
+
+# Generated model backups and legacy classifier
+*.bak_*
+overnight_xgboost.json
+overnight_xgboost.json.bak_*
+overnight_premium_xgboost.json.bak_*
+!overnight_premium_xgboost.json
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
