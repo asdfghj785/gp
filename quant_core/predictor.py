@@ -90,6 +90,8 @@ DIPBUY_FILTERS = {
 LOW_LIQUIDITY_AMOUNT = 700_000_000_000
 HIGH_LIQUIDITY_AMOUNT = 800_000_000_000
 DIPBUY_SENTIMENT_BONUS = 10.0
+LIVE_VOLUME_EXTRAPOLATION_FACTOR = 1.05
+LIVE_NEAR_LIMIT_CHANGE_PCT = 8.5
 
 
 @lru_cache(maxsize=1)
@@ -173,6 +175,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["振幅换手比"] = (out["日内振幅"] / out["换手率"].replace(0, np.nan)).replace([np.inf, -np.inf], 0).fillna(0)
     out["缩量大涨标记"] = ((out["涨跌幅"] > 3) & (_num(out, "5日量能堆积") < 1)).astype(float)
     out["极端下影线标记"] = ((out["下影线比例"] > out["实体比例"].abs() * 2) & (out["涨跌幅"] > 3)).astype(float)
+    if "准涨停未封板标记" not in out.columns:
+        out["准涨停未封板标记"] = 0.0
     return out
 
 
@@ -291,6 +295,8 @@ def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = Non
         filtered["market_gate_mode"] = str(gate.get("mode") or "晴天")
     if "涨跌幅" in filtered.columns:
         filtered = filtered[filtered["涨跌幅"] < 7].copy()
+    if "准涨停未封板标记" in filtered.columns:
+        filtered = filtered[pd.to_numeric(filtered["准涨停未封板标记"], errors="coerce").fillna(0) < 0.5].copy()
     if "上影线比例" in filtered.columns:
         is_dipbuy = filtered.get("strategy_type", "").eq(DIPBUY_STRATEGY_TYPE) if "strategy_type" in filtered.columns else pd.Series(False, index=filtered.index)
         filtered = filtered[(is_dipbuy) | (filtered["上影线比例"] < 2)].copy()
@@ -384,16 +390,17 @@ def scan_market(
     cache_prediction: bool = True,
     async_persist: bool = False,
 ) -> dict[str, Any]:
-    snapshot = fetch_sina_snapshot()
-    if snapshot.empty:
+    raw_snapshot = fetch_sina_snapshot()
+    if raw_snapshot.empty:
         raise RuntimeError("实时行情源返回空数据")
+    snapshot = _prepare_live_inference_snapshot(raw_snapshot)
     _repair_snapshot_volume_ratio(snapshot)
     market_indices = fetch_market_indices()
 
     if persist_snapshot and async_persist:
-        threading.Thread(target=_persist_snapshot, args=(snapshot,), daemon=True).start()
+        threading.Thread(target=_persist_snapshot, args=(raw_snapshot,), daemon=True).start()
     elif persist_snapshot:
-        upsert_daily_rows(snapshot, source="sina_snapshot")
+        upsert_daily_rows(raw_snapshot, source="sina_snapshot")
 
     df = build_features(snapshot)
     if df.empty:
@@ -419,6 +426,19 @@ def scan_market(
     df = apply_production_filters(df, gate)
 
     final_limit = min(max(int(limit), 1), 1)
+    if df.empty:
+        payload = {
+            "id": None,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "model_status": f"{model_status}; 生产过滤后无合格标的",
+            "strategy": f"生产策略：实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；准涨停未封板、高位爆量、尾盘诱多直接剔除；当前没有股票满足双轨准入门槛。",
+            "market_gate": gate,
+            "intraday_snapshot": intraday_snapshot,
+            "rows": [],
+        }
+        if cache_prediction:
+            LATEST_TOP50_PATH.write_text(json.dumps([], ensure_ascii=False, indent=2), encoding="utf-8")
+        return payload
     df = df.sort_values(["排序评分", "预期溢价", "综合评分"], ascending=[False, False, False]).head(final_limit)
     rows = [_row_to_api(row) for _, row in df.iterrows()]
     snapshot_id = save_prediction_snapshot("dual_xgboost_regressor" if "regressor_ready" in model_status else "rule_fallback", rows) if cache_prediction else None
@@ -426,7 +446,7 @@ def scan_market(
         "id": snapshot_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_status": model_status,
-        "strategy": f"生产策略：尾盘突破与首阴低吸双轨回归器预测次日开盘预期溢价；突破门槛>={BREAKOUT_MIN_SCORE:.1f}，低吸门槛>={DIPBUY_MIN_SCORE:.1f}；阴天/震荡时首阴低吸仅排序加{DIPBUY_SENTIMENT_BONUS:.0f}分，不改变原始综合评分；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多直接剔除；近3日断头铡刀和上影线强过滤仅约束尾盘突破，首阴低吸豁免。",
+        "strategy": f"生产策略：尾盘突破与首阴低吸双轨回归器预测次日开盘预期溢价；实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；突破门槛>={BREAKOUT_MIN_SCORE:.1f}，低吸门槛>={DIPBUY_MIN_SCORE:.1f}；阴天/震荡时首阴低吸仅排序加{DIPBUY_SENTIMENT_BONUS:.0f}分，不改变原始综合评分；雷暴或大盘下跌且缩量时空仓；准涨停未封板、高位爆量、尾盘诱多直接剔除；近3日断头铡刀和上影线强过滤仅约束尾盘突破，首阴低吸豁免。",
         "market_gate": gate,
         "intraday_snapshot": intraday_snapshot,
         "rows": rows,
@@ -521,6 +541,55 @@ def market_risk_gate(df: pd.DataFrame, indices: dict[str, dict[str, float | str]
         "index_above_ma20": index_above_ma20,
         "indices": safe_indices,
     }
+
+
+def _prepare_live_inference_snapshot(snapshot: pd.DataFrame) -> pd.DataFrame:
+    """Normalize the 14:50 snapshot into a 15:00-compatible inference proxy."""
+    out = snapshot.copy()
+    if out.empty:
+        return out
+
+    current_price = _first_existing_num(out, ["current_price", "now", "price", "trade", "close"])
+    if "close" not in out.columns:
+        out["close"] = 0.0
+    valid_price = current_price.notna() & (current_price > 0)
+    out.loc[valid_price, "close"] = current_price.loc[valid_price]
+    for col in ["open", "high", "low", "pre_close", "close"]:
+        if col not in out.columns:
+            out[col] = 0.0
+        out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], 0).fillna(0.0)
+    out["high"] = out[["high", "open", "close"]].max(axis=1)
+    positive_low = out["low"] > 0
+    out.loc[~positive_low, "low"] = out.loc[~positive_low, ["open", "close"]].min(axis=1)
+    out["low"] = out[["low", "open", "close"]].min(axis=1)
+    original_change = _num(out, "change_pct")
+    out["change_pct"] = ((out["close"] / out["pre_close"].replace(0, np.nan) - 1) * 100).replace([np.inf, -np.inf], 0).fillna(original_change)
+
+    for col in ["volume", "amount", "turnover", "volume_ratio"]:
+        if col not in out.columns:
+            continue
+        out[col] = (
+            pd.to_numeric(out[col], errors="coerce")
+            .replace([np.inf, -np.inf], 0)
+            .fillna(0.0)
+            * LIVE_VOLUME_EXTRAPOLATION_FACTOR
+        )
+    change = pd.to_numeric(out["change_pct"], errors="coerce").replace([np.inf, -np.inf], 0).fillna(0.0).round(4)
+    main_board_near_limit = change >= LIVE_NEAR_LIMIT_CHANGE_PCT
+    main_board_sealed = change >= 9.5
+    out["准涨停未封板标记"] = (main_board_near_limit & ~main_board_sealed).astype(float)
+    out["live_proxy_factor"] = LIVE_VOLUME_EXTRAPOLATION_FACTOR
+    return out
+
+
+def _first_existing_num(df: pd.DataFrame, cols: list[str]) -> pd.Series:
+    result = pd.Series(np.nan, index=df.index, dtype="float64")
+    for col in cols:
+        if col not in df.columns:
+            continue
+        values = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        result = result.where(result.notna(), values)
+    return result
 
 
 def _dynamic_win_rate_thresholds(df: pd.DataFrame) -> pd.Series:
@@ -938,6 +1007,8 @@ def _row_to_api(row: pd.Series) -> dict[str, Any]:
             "is_recent_guillotine": bool(float(row.get("近3日断头铡刀标记", 0)) >= 0.5),
             "is_high_volume_trap": bool(float(row.get("高位爆量标记", 0)) >= 0.5),
             "is_late_pull_trap": bool(float(row.get("尾盘诱多标记", 0)) >= 0.5),
+            "is_near_limit_unsealed": bool(float(row.get("准涨停未封板标记", 0)) >= 0.5),
+            "live_proxy_factor": round(float(row.get("live_proxy_factor", 1.0)), 4),
         },
         "market_context": {
             "up_rate": round(float(row.get("market_up_rate", 0)), 4),
