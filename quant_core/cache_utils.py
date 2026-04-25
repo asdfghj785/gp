@@ -11,7 +11,7 @@ from .config import BASE_DIR, BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE, DIPBUY_PREMI
 from .storage import database_overview
 
 
-CACHE_VERSION = "strategy-cache-v7-strategy-thresholds"
+CACHE_VERSION = "strategy-cache-v8-dipbuy-first-dip-filter"
 CACHE_DIR = BASE_DIR / "data" / "strategy_cache"
 
 

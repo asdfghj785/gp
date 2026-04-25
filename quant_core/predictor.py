@@ -58,6 +58,7 @@ DIPBUY_TEMPORAL_FEATURE_COLS = [
     "今日缩量比例",
     "均线趋势斜率",
     "光脚大阴线惩罚度",
+    "昨日实体涨跌幅",
 ]
 DIPBUY_FEATURE_COLS = [
     "turn",
@@ -79,10 +80,12 @@ BREAKOUT_STRATEGY_TYPE = "尾盘突破"
 DIPBUY_FILTERS = {
     "min_5d_high_gain": 15.0,
     "min_intraday_flush": -9.5,
-    "max_intraday_flush": -4.0,
-    "bias10_low": -3.0,
+    "max_intraday_flush": -4.5,
+    "bias10_low": -1.5,
     "bias10_high": 3.0,
     "max_amount_shrink_pct": 0.0,
+    "min_3d_return": 0.0,
+    "min_prev_body_change": -2.0,
 }
 LOW_LIQUIDITY_AMOUNT = 700_000_000_000
 HIGH_LIQUIDITY_AMOUNT = 800_000_000_000
@@ -244,6 +247,8 @@ def _dipbuy_physical_mask(df: pd.DataFrame) -> pd.Series:
         & (_num(df, "今日急跌度") < DIPBUY_FILTERS["max_intraday_flush"])
         & (_num(df, "10日均线乖离率").between(DIPBUY_FILTERS["bias10_low"], DIPBUY_FILTERS["bias10_high"]))
         & (_num(df, "今日缩量比例") < DIPBUY_FILTERS["max_amount_shrink_pct"])
+        & (_num(df, "3日累计涨幅") > DIPBUY_FILTERS["min_3d_return"])
+        & (_num(df, "昨日实体涨跌幅") > DIPBUY_FILTERS["min_prev_body_change"])
     ).fillna(False)
 
 
@@ -251,17 +256,19 @@ def _log_dipbuy_diagnostics(df: pd.DataFrame) -> None:
     if df.empty:
         print("📊 [双轨诊断] 候选池为空，无法计算首阴低吸分流。")
         return
-    probe_cols = ["纯代码", "名称", *DIPBUY_TEMPORAL_FEATURE_COLS]
+    probe_cols = ["纯代码", "名称", "3日累计涨幅", *DIPBUY_TEMPORAL_FEATURE_COLS]
     available_cols = [col for col in probe_cols if col in df.columns]
     sample = df[available_cols].sample(n=min(5, len(df)), random_state=42)
     print("🔎 [双轨诊断] 低吸特征探针:")
     print(sample.to_string(index=False))
     dipbuy_pool = df[
-        (_num(df, "近5日最高涨幅") > 15.0)
-        & (_num(df, "今日急跌度") > -9.5)
-        & (_num(df, "今日急跌度") < -4.0)
-        & (_num(df, "10日均线乖离率").between(-3.0, 3.0))
-        & (_num(df, "今日缩量比例") < 0)
+        (_num(df, "近5日最高涨幅") > DIPBUY_FILTERS["min_5d_high_gain"])
+        & (_num(df, "今日急跌度") > DIPBUY_FILTERS["min_intraday_flush"])
+        & (_num(df, "今日急跌度") < DIPBUY_FILTERS["max_intraday_flush"])
+        & (_num(df, "10日均线乖离率").between(DIPBUY_FILTERS["bias10_low"], DIPBUY_FILTERS["bias10_high"]))
+        & (_num(df, "今日缩量比例") < DIPBUY_FILTERS["max_amount_shrink_pct"])
+        & (_num(df, "3日累计涨幅") > DIPBUY_FILTERS["min_3d_return"])
+        & (_num(df, "昨日实体涨跌幅") > DIPBUY_FILTERS["min_prev_body_change"])
     ]
     print(f"📊 [双轨诊断] 全市场满足低吸物理条件的股票数量: {len(dipbuy_pool)} 只")
     if not dipbuy_pool.empty:
@@ -570,6 +577,7 @@ def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     volume = combined["volume"]
     amount = combined["amount"]
     turnover = combined["换手率"]
+    pre_close = combined["昨收"]
 
     prev3_close = group["最新价"].shift(3)
     prev5_close = group["最新价"].shift(5)
@@ -598,6 +606,8 @@ def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     combined["今日缩量比例"] = ((amount / prev_amount - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
     combined["均线趋势斜率"] = ((ma10 / ma10_prev - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
     combined["光脚大阴线惩罚度"] = ((close - low) / (high - low + 1e-5)).replace([np.inf, -np.inf], 0).fillna(0)
+    daily_body_change = ((close - open_price) / pre_close.replace(0, np.nan) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["昨日实体涨跌幅"] = daily_body_change.groupby(combined["纯代码"], sort=False).shift(1).replace([np.inf, -np.inf], 0).fillna(0)
     combined["3日平均换手率"] = avg_turn3.replace([np.inf, -np.inf], 0).fillna(turnover)
     combined["5日量能堆积"] = (volume / avg_vol5).replace([np.inf, -np.inf], 0).fillna(0)
     combined["10日量比"] = (volume / avg_vol10).replace([np.inf, -np.inf], 0).fillna(0)
@@ -913,6 +923,7 @@ def _row_to_api(row: pd.Series) -> dict[str, Any]:
             "amount_shrink_pct": round(float(row.get("今日缩量比例", 0)), 4),
             "ma_trend_slope": round(float(row.get("均线趋势斜率", 0)), 4),
             "bald_bear_ratio": round(float(row.get("光脚大阴线惩罚度", 0)), 4),
+            "prev_body_change": round(float(row.get("昨日实体涨跌幅", 0)), 4),
             "avg_turnover_3d": round(float(row.get("3日平均换手率", 0)), 4),
             "volume_stack_5d": round(float(row.get("5日量能堆积", 0)), 4),
             "volume_ratio_10d": round(float(row.get("10日量比", 0)), 4),
