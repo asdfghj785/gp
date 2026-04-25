@@ -107,14 +107,24 @@ def _strategy_pick_rows(df: pd.DataFrame, months: int = 2) -> list[dict[str, Any
     if pd.notna(latest_date):
         start_date = latest_date - pd.DateOffset(months=max(1, int(months)))
         candidates = candidates[candidates["_date_sort"] >= start_date].copy()
-    candidates = candidates.sort_values(["date", "strategy_type", "预期溢价", "综合评分"], ascending=[True, True, False, False])
-    idx = candidates.groupby(["date", "strategy_type"])["预期溢价"].idxmax()
-    picks = candidates.loc[idx].sort_values(["date", "strategy_type"], ascending=[False, True])
+    qualified_indices = set(apply_production_filters(candidates).index)
+    picks = []
+    for _, group in candidates.groupby(["date", "strategy_type"], sort=False):
+        qualified = group[group.index.isin(qualified_indices)]
+        source = qualified if not qualified.empty else group
+        pick = source.sort_values(["预期溢价", "综合评分"], ascending=[False, False]).iloc[0].copy()
+        pick["production_qualified"] = bool(pick.name in qualified_indices)
+        picks.append(pick)
+    if not picks:
+        return []
+    picks_df = pd.DataFrame(picks).sort_values(["date", "strategy_type"], ascending=[False, True])
     rows: list[dict[str, Any]] = []
-    for _, pick in picks.iterrows():
+    for _, pick in picks_df.iterrows():
         next_open = float(pick["next_open"]) if pd.notna(pick.get("next_open")) else None
         premium = float(pick["open_premium"]) if pd.notna(pick.get("open_premium")) else None
-        rows.append(_backtest_row(pick, float(pick["最新价"]), next_open, premium))
+        row = _backtest_row(pick, float(pick["最新价"]), next_open, premium)
+        row["production_qualified"] = bool(pick.get("production_qualified", False))
+        rows.append(row)
     return rows
 
 

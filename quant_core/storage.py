@@ -404,6 +404,16 @@ def save_daily_pick(pick: dict[str, Any]) -> int:
         return int(cursor.lastrowid or 0) if cursor.rowcount else 0
 
 
+def clear_daily_picks() -> int:
+    init_db()
+    with connect() as conn:
+        row = conn.execute("SELECT COUNT(*) AS count FROM daily_picks").fetchone()
+        count = int(row["count"] or 0) if row else 0
+        conn.execute("DELETE FROM daily_picks")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'daily_picks'")
+    return count
+
+
 def update_daily_pick_open(selection_date: str, open_price: float, checked_at: str) -> dict[str, Any] | None:
     init_db()
     with connect() as conn:

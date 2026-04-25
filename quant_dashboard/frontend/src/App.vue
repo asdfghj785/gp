@@ -289,7 +289,7 @@
       <div class="panel-subhead">
         <div>
           <h3>双轨候选观察</h3>
-          <p>近两个月按交易日分别展示尾盘突破与首阴低吸各自的模型 Top1，共 {{ backtest.strategy_rows.length }} 条。</p>
+          <p>近两个月按交易日分别展示双轨 Top1；有生产合格标的时优先展示生产合格 Top1，共 {{ backtest.strategy_rows.length }} 条。</p>
         </div>
       </div>
 
