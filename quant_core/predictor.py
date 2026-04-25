@@ -84,7 +84,7 @@ DIPBUY_FILTERS = {
     "bias10_low": -1.5,
     "bias10_high": 3.0,
     "max_amount_shrink_pct": 0.0,
-    "min_3d_return": 0.0,
+    "min_3d_return": -3.0,
     "min_prev_body_change": -2.0,
 }
 LOW_LIQUIDITY_AMOUNT = 700_000_000_000
