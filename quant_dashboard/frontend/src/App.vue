@@ -222,7 +222,7 @@
           <p>{{ backtest.summary?.rule || '每日选预期溢价最高股票，次日开盘卖出统计胜率' }}</p>
           <p v-if="backtest.summary?.rank_rule">{{ backtest.summary.rank_rule }}</p>
         </div>
-        <button type="button" :disabled="busy.backtest" @click="loadBacktest">
+        <button type="button" :disabled="busy.backtest" @click="loadBacktest(true)">
           {{ busy.backtest ? '统计中' : '刷新复盘' }}
         </button>
       </div>
@@ -285,7 +285,7 @@
           <h2>策略实验室</h2>
           <p>{{ strategyLab.summary?.note || '同一批历史候选池对比不同过滤规则、阈值和综合评分表现' }}</p>
         </div>
-        <button type="button" :disabled="busy.strategyLab" @click="loadStrategyLab">
+        <button type="button" :disabled="busy.strategyLab" @click="loadStrategyLab(true)">
           {{ busy.strategyLab ? '实验中' : '刷新实验' }}
         </button>
       </div>
@@ -370,7 +370,7 @@
           <h2>失败归因分析</h2>
           <p>{{ failureAnalysis.summary?.optimization_note || '用 12 个月生产策略历史样本，分析失败股票的共同特征和可优化规则' }}</p>
         </div>
-        <button type="button" :disabled="busy.failureAnalysis" @click="loadFailureAnalysis">
+        <button type="button" :disabled="busy.failureAnalysis" @click="loadFailureAnalysis(true)">
           {{ busy.failureAnalysis ? '分析中' : '刷新归因' }}
         </button>
       </div>
@@ -481,7 +481,7 @@
           <h2>次日上涨原因分析</h2>
           <p>{{ upReason.summary?.method || '统计次日开盘上涨股票，并用技术因子模型和本地大模型解释上涨原因' }}</p>
         </div>
-        <button type="button" :disabled="busy.upReason" @click="loadUpReason">
+        <button type="button" :disabled="busy.upReason" @click="loadUpReason(true)">
           {{ busy.upReason ? '分析中' : '运行上涨归因' }}
         </button>
       </div>
@@ -808,9 +808,7 @@ const setActiveTab = async (tabId) => {
   activeTab.value = tabId
   if (tabId === 'strategy' && !loaded.strategy) {
     loaded.strategy = true
-    await loadBacktest()
-    await loadStrategyLab()
-    await loadFailureAnalysis()
+    await Promise.all([loadBacktest(), loadStrategyLab(), loadFailureAnalysis()])
   }
   if (tabId === 'data' && !loaded.data) {
     loaded.data = true
@@ -874,10 +872,10 @@ const loadDailyPicks = async () => {
   }
 }
 
-const loadBacktest = async () => {
+const loadBacktest = async (refresh = false) => {
   busy.backtest = true
   try {
-    const data = await request('/api/backtest/top-pick-open?months=12')
+    const data = await request(`/api/backtest/top-pick-open?months=12${refresh ? '&refresh=true' : ''}`)
     backtest.summary = data.summary
     backtest.rows = data.rows || []
     backtest.created_at = data.created_at
@@ -888,10 +886,10 @@ const loadBacktest = async () => {
   }
 }
 
-const loadStrategyLab = async () => {
+const loadStrategyLab = async (refresh = false) => {
   busy.strategyLab = true
   try {
-    const data = await request('/api/strategy/lab?months=12')
+    const data = await request(`/api/strategy/lab?months=12${refresh ? '&refresh=true' : ''}`)
     strategyLab.summary = data.summary
     strategyLab.variants = data.variants || []
     strategyLab.thresholds = data.thresholds || []
@@ -904,10 +902,10 @@ const loadStrategyLab = async () => {
   }
 }
 
-const loadFailureAnalysis = async () => {
+const loadFailureAnalysis = async (refresh = false) => {
   busy.failureAnalysis = true
   try {
-    const data = await request('/api/strategy/failure-analysis?months=12')
+    const data = await request(`/api/strategy/failure-analysis?months=12${refresh ? '&refresh=true' : ''}`)
     failureAnalysis.summary = data.summary
     failureAnalysis.reasons = data.reasons || []
     failureAnalysis.optimizations = data.optimizations || []
@@ -920,10 +918,10 @@ const loadFailureAnalysis = async () => {
   }
 }
 
-const loadUpReason = async () => {
+const loadUpReason = async (refresh = false) => {
   busy.upReason = true
   try {
-    const data = await request('/api/strategy/up-reason-analysis?months=12')
+    const data = await request(`/api/strategy/up-reason-analysis?months=12${refresh ? '&refresh=true' : ''}`)
     upReason.summary = data.summary
     upReason.factor_lifts = data.factor_lifts || []
     upReason.model_report = data.model_report || { feature_importance: [] }

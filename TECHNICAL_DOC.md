@@ -334,13 +334,20 @@ POST /api/data/market-sync/run
 ### 策略复盘
 
 ```text
-GET /api/backtest/top-pick-open?months=12
-GET /api/strategy/lab?months=12
-GET /api/strategy/failure-analysis?months=12
-GET /api/strategy/up-reason-analysis?months=12
+GET /api/backtest/top-pick-open?months=12&refresh=false
+GET /api/strategy/lab?months=12&refresh=false
+GET /api/strategy/failure-analysis?months=12&refresh=false
+GET /api/strategy/up-reason-analysis?months=12&refresh=false
 ```
 
 前端策略卡片默认使用 12 个月数据。
+
+说明：
+
+- 默认 `refresh=false`，后端优先读取 `data/strategy_cache/` 中的结果缓存。
+- 点击前端“刷新”按钮时会传 `refresh=true`，强制重新计算并覆盖缓存。
+- 缓存签名包含数据库最大日期、K 线总行数、模型文件修改时间、月份数和 `QUANT_MIN_COMPOSITE_SCORE`，盘后同步新数据或重训模型后会自动失效。
+- 复盘、策略实验、失败归因共享同一份“已评分历史候选池”缓存，避免每个卡片重复构建历史特征。
 
 ## 9. 环境变量
 

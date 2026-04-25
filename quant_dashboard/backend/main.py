@@ -20,6 +20,7 @@ if str(BASE_DIR) not in sys.path:
 
 from quant_core.config import OLLAMA_API, OLLAMA_MODEL
 from quant_core.backtest import top_pick_open_backtest
+from quant_core.cache_utils import read_json_cache, write_json_cache
 from quant_core.daily_pick import list_daily_pick_results, update_pending_open_results
 from quant_core.failure_analysis import analyze_prediction_failures
 from quant_core.market_sync import latest_sync, run_market_close_sync, sync_history
@@ -191,33 +192,53 @@ def daily_picks(limit: int = Query(default=10, ge=1, le=50)) -> dict[str, Any]:
 
 
 @app.get("/api/backtest/top-pick-open")
-def top_pick_backtest(months: int = Query(default=2, ge=1, le=12)) -> dict[str, Any]:
+def top_pick_backtest(months: int = Query(default=2, ge=1, le=12), refresh: bool = Query(default=False)) -> dict[str, Any]:
     try:
-        return top_pick_open_backtest(months=months)
+        return _cached_strategy_response(
+            "top_pick_backtest",
+            months,
+            refresh,
+            lambda: top_pick_open_backtest(months=months, refresh=refresh),
+        )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/strategy/lab")
-def strategy_lab(months: int = Query(default=2, ge=1, le=12)) -> dict[str, Any]:
+def strategy_lab(months: int = Query(default=2, ge=1, le=12), refresh: bool = Query(default=False)) -> dict[str, Any]:
     try:
-        return run_strategy_lab(months=months)
+        return _cached_strategy_response(
+            "strategy_lab",
+            months,
+            refresh,
+            lambda: run_strategy_lab(months=months, refresh=refresh),
+        )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/strategy/failure-analysis")
-def failure_analysis(months: int = Query(default=12, ge=2, le=24)) -> dict[str, Any]:
+def failure_analysis(months: int = Query(default=12, ge=2, le=24), refresh: bool = Query(default=False)) -> dict[str, Any]:
     try:
-        return analyze_prediction_failures(months=months)
+        return _cached_strategy_response(
+            "failure_analysis",
+            months,
+            refresh,
+            lambda: analyze_prediction_failures(months=months, refresh=refresh),
+        )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/strategy/up-reason-analysis")
-def up_reason_analysis(months: int = Query(default=12, ge=2, le=24)) -> dict[str, Any]:
+def up_reason_analysis(months: int = Query(default=12, ge=2, le=24), refresh: bool = Query(default=False)) -> dict[str, Any]:
     try:
-        return analyze_next_day_up_reasons(months=months)
+        return _cached_strategy_response(
+            "up_reason_analysis",
+            months,
+            refresh,
+            lambda: analyze_next_day_up_reasons(months=months, refresh=refresh),
+        )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -337,6 +358,17 @@ def _normalize_analysis(value: Any) -> dict[str, Any]:
         "logic": str(value.get("logic", "模型未给出逻辑"))[:500],
         "evidence": normalized_evidence,
     }
+
+
+def _cached_strategy_response(namespace: str, months: int, refresh: bool, factory) -> dict[str, Any]:
+    if not refresh:
+        cached = read_json_cache(namespace, months)
+        if cached is not None:
+            return cached
+    payload = factory()
+    payload["cache"] = {"hit": False, "namespace": namespace}
+    write_json_cache(namespace, months, payload)
+    return payload
 
 
 def _daily_pick_scheduler_loop() -> None:

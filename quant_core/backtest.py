@@ -14,57 +14,29 @@ from .predictor import PROFIT_TARGET_PCT, apply_production_filters, build_featur
 from .storage import connect, init_db
 
 
-def top_pick_open_backtest(months: int = 2) -> dict[str, Any]:
+def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, Any]:
     init_db()
-    latest_date = _latest_trade_date()
-    if latest_date is None:
-        return _empty_result("数据库没有可复盘的日线数据")
+    from .strategy_lab import prepare_evaluated_candidates
 
-    start_date = (pd.Timestamp(latest_date) - pd.DateOffset(months=months)).strftime("%Y-%m-%d")
-    load_start_date = (pd.Timestamp(start_date) - pd.DateOffset(days=90)).strftime("%Y-%m-%d")
-    df = _load_daily_rows(load_start_date)
-    if df.empty:
-        return _empty_result("近两个月没有可复盘的日线数据")
-    df = _fill_missing_names(df)
-    repaired_pre_close_count = _repair_missing_pre_close(df)
-    repaired_volume_ratio_count = _repair_missing_volume_ratio(df)
-    period_df = df[df["date"] >= start_date].copy()
-    trading_dates = _valid_trading_dates(period_df)
-    if not trading_dates:
-        return _empty_result("近两个月没有有效交易日数据")
-
-    latest_date = trading_dates[-1]
-    all_trading_dates = _valid_trading_dates(df)
-    df = df[df["date"].isin(all_trading_dates)].copy()
-    feature_df = build_features(df)
-    feature_df = feature_df[feature_df["date"].isin(trading_dates)].copy()
+    prepared = prepare_evaluated_candidates(months, refresh=refresh)
+    feature_df = prepared["evaluated"]
     if feature_df.empty:
         return _empty_result("过滤后没有候选股票")
-
-    feature_df, model_status = score_candidates(feature_df)
     feature_df = apply_production_filters(feature_df)
+    if feature_df.empty:
+        return _empty_result("生产过滤后没有候选股票")
 
     feature_df = feature_df.sort_values(["date", "预期溢价", "综合评分"], ascending=[True, False, False])
     idx = feature_df.groupby("date")["预期溢价"].idxmax()
     picks = feature_df.loc[idx].sort_values("date").copy()
-    next_trade_date = {
-        trading_dates[index]: trading_dates[index + 1]
-        for index in range(len(trading_dates) - 1)
-    }
-
-    all_rows = df.sort_values(["code", "date"])
-    by_code = {
-        code: group.reset_index(drop=True)
-        for code, group in all_rows.groupby("code", sort=False)
-    }
 
     results: list[dict[str, Any]] = []
     for _, pick in picks.iterrows():
         code = str(pick["纯代码"])
         current_date = str(pick["date"])
         current_close = float(pick["最新价"])
-        target_next_date = next_trade_date.get(current_date)
-        next_row = _row_for_code_on_date(by_code.get(code), target_next_date)
+        next_open = float(pick["next_open"]) if pd.notna(pick.get("next_open")) else None
+        premium = float(pick["open_premium"]) if pd.notna(pick.get("open_premium")) else None
         item = {
             "date": current_date,
             "code": code,
@@ -78,22 +50,11 @@ def top_pick_open_backtest(months: int = 2) -> dict[str, Any]:
             "risk_score": round(float(pick.get("风险评分", 0)), 4),
             "liquidity_score": round(float(pick.get("流动性评分", 0)), 4),
             "composite_score": round(float(pick.get("综合评分", pick["AI胜率"])), 4),
-            "next_date": None,
-            "next_open": None,
-            "open_premium": None,
-            "success": None,
+            "next_date": str(pick.get("next_date")) if pd.notna(pick.get("next_date")) else None,
+            "next_open": round(next_open, 4) if next_open is not None else None,
+            "open_premium": round(premium, 4) if premium is not None else None,
+            "success": premium > PROFIT_TARGET_PCT if premium is not None else None,
         }
-        if next_row is not None and current_close > 0:
-            next_open = float(next_row["open"])
-            premium = (next_open / current_close - 1) * 100
-            item.update(
-                {
-                    "next_date": str(next_row["date"]),
-                    "next_open": round(next_open, 4),
-                    "open_premium": round(premium, 4),
-                    "success": premium > PROFIT_TARGET_PCT,
-                }
-            )
         results.append(item)
 
     evaluated = [row for row in results if row["success"] is not None]
@@ -101,8 +62,8 @@ def top_pick_open_backtest(months: int = 2) -> dict[str, Any]:
     premiums = [float(row["open_premium"]) for row in evaluated if row["open_premium"] is not None]
     summary = {
         "months": months,
-        "start_date": start_date,
-        "end_date": latest_date,
+        "start_date": prepared["start_date"],
+        "end_date": prepared["end_date"],
         "total_days": len(results),
         "evaluated_days": len(evaluated),
         "pending_days": len(results) - len(evaluated),
@@ -113,9 +74,9 @@ def top_pick_open_backtest(months: int = 2) -> dict[str, Any]:
         "median_open_premium": round(float(pd.Series(premiums).median()), 4) if premiums else 0.0,
         "best_open_premium": round(max(premiums), 4) if premiums else 0.0,
         "worst_open_premium": round(min(premiums), 4) if premiums else 0.0,
-        "model_status": model_status,
-        "repaired_pre_close_count": repaired_pre_close_count,
-        "repaired_volume_ratio_count": repaired_volume_ratio_count,
+        "model_status": prepared["model_status"],
+        "repaired_pre_close_count": prepared["repaired_pre_close_count"],
+        "repaired_volume_ratio_count": prepared["repaired_volume_ratio_count"],
         "rule": f"生产策略复盘：排除周末、节假日、非完整交易日、创业板、北交所、科创板、ST/退市；大盘风控采用晴天/阴天/雷暴分级，综合评分>={MIN_COMPOSITE_SCORE:.1f}，雷暴或大盘下跌且缩量时空仓；过滤涨幅>=7%、上影>=2%、预期溢价<=0、高位爆量、尾盘诱多、近3日断头铡刀。停盘前最后一个交易日按回归模型预期溢价选第一名，停盘后第一个交易日开盘卖出；扣除滑点费率后的有效成功阈值为开盘溢价>{PROFIT_TARGET_PCT:.2f}%。",
         "trading_day_filter": "weekday<5 且全市场有效样本>=1000 且成交额>0。",
         "rank_rule": f"XGBRegressor 直接预测次日开盘预期溢价；综合评分=预期溢价60%+风险20%+流动性10%+收益信号10%，最终排序优先看预期溢价。",

@@ -14,14 +14,15 @@ from .backtest import (
     _repair_missing_volume_ratio,
     _valid_trading_dates,
 )
+from .cache_utils import read_dataframe_cache, write_dataframe_cache
 from .config import MIN_COMPOSITE_SCORE
 from .predictor import PROFIT_TARGET_PCT, apply_production_filters, build_features, score_candidates
 from .storage import init_db
 
 
-def run_strategy_lab(months: int = 2) -> dict[str, Any]:
+def run_strategy_lab(months: int = 2, refresh: bool = False) -> dict[str, Any]:
     init_db()
-    prepared = prepare_evaluated_candidates(months)
+    prepared = prepare_evaluated_candidates(months, refresh=refresh)
     if prepared["evaluated"].empty:
         return _empty_lab("有效交易日不足，无法实验")
 
@@ -68,7 +69,21 @@ def run_strategy_lab(months: int = 2) -> dict[str, Any]:
     }
 
 
-def prepare_evaluated_candidates(months: int) -> dict[str, Any]:
+def prepare_evaluated_candidates(months: int, refresh: bool = False) -> dict[str, Any]:
+    if not refresh:
+        cached = read_dataframe_cache("evaluated_candidates", months)
+        if cached is not None:
+            evaluated, extra = cached
+            return {
+                "evaluated": evaluated,
+                "start_date": extra.get("start_date"),
+                "end_date": extra.get("end_date"),
+                "model_status": extra.get("model_status", "cache_ready"),
+                "repaired_pre_close_count": int(extra.get("repaired_pre_close_count", 0)),
+                "repaired_volume_ratio_count": int(extra.get("repaired_volume_ratio_count", 0)),
+                "cache": {"hit": True, "namespace": "evaluated_candidates"},
+            }
+
     latest_date = _latest_trade_date()
     if latest_date is None:
         return {
@@ -104,14 +119,29 @@ def prepare_evaluated_candidates(months: int) -> dict[str, Any]:
     candidates, model_status = score_candidates(candidates)
     candidates = _attach_next_open(candidates, raw, trading_dates)
     evaluated = candidates[np.isfinite(candidates["open_premium"])].copy()
-    return {
+    result = {
         "evaluated": evaluated,
         "start_date": start_date,
         "end_date": trading_dates[-1],
         "model_status": model_status,
         "repaired_pre_close_count": repaired_pre_close,
         "repaired_volume_ratio_count": repaired_volume_ratio,
+        "cache": {"hit": False, "namespace": "evaluated_candidates"},
     }
+    if not evaluated.empty:
+        write_dataframe_cache(
+            "evaluated_candidates",
+            months,
+            evaluated,
+            {
+                "start_date": result["start_date"],
+                "end_date": result["end_date"],
+                "model_status": result["model_status"],
+                "repaired_pre_close_count": result["repaired_pre_close_count"],
+                "repaired_volume_ratio_count": result["repaired_volume_ratio_count"],
+            },
+        )
+    return result
 
 
 def _attach_next_open(candidates: pd.DataFrame, raw: pd.DataFrame, trading_dates: list[str]) -> pd.DataFrame:

@@ -48,8 +48,8 @@ REASON_FEATURES = [
 ]
 
 
-def analyze_next_day_up_reasons(months: int = 12) -> dict[str, Any]:
-    prepared = prepare_evaluated_candidates(months)
+def analyze_next_day_up_reasons(months: int = 12, refresh: bool = False) -> dict[str, Any]:
+    prepared = prepare_evaluated_candidates(months, refresh=refresh)
     df = prepared["evaluated"]
     if df.empty:
         return _empty_result(months, prepared["model_status"])

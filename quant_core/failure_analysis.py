@@ -12,9 +12,9 @@ from .storage import init_db
 from .strategy_lab import _daily_top, _stats_row, prepare_evaluated_candidates
 
 
-def analyze_prediction_failures(months: int = 12) -> dict[str, Any]:
+def analyze_prediction_failures(months: int = 12, refresh: bool = False) -> dict[str, Any]:
     init_db()
-    prepared = prepare_evaluated_candidates(months)
+    prepared = prepare_evaluated_candidates(months, refresh=refresh)
     evaluated = prepared["evaluated"]
     if evaluated.empty:
         return _empty_result(months, prepared["model_status"])
