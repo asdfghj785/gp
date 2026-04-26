@@ -95,7 +95,14 @@ def init_db() -> None:
                 open_price REAL,
                 open_checked_at TEXT,
                 open_premium REAL,
+                t3_max_gain_pct REAL DEFAULT NULL,
                 success INTEGER,
+                is_closed INTEGER NOT NULL DEFAULT 0,
+                close_date TEXT,
+                close_price REAL,
+                close_return_pct REAL,
+                close_reason TEXT,
+                close_checked_at TEXT,
                 raw_json TEXT NOT NULL
             );
 
@@ -122,6 +129,13 @@ def init_db() -> None:
             """
         )
         _ensure_column(conn, "daily_picks", "strategy_type", "TEXT NOT NULL DEFAULT '尾盘突破'")
+        _ensure_column(conn, "daily_picks", "t3_max_gain_pct", "REAL DEFAULT NULL")
+        _ensure_column(conn, "daily_picks", "is_closed", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "daily_picks", "close_date", "TEXT")
+        _ensure_column(conn, "daily_picks", "close_price", "REAL")
+        _ensure_column(conn, "daily_picks", "close_return_pct", "REAL")
+        _ensure_column(conn, "daily_picks", "close_reason", "TEXT")
+        _ensure_column(conn, "daily_picks", "close_checked_at", "TEXT")
         conn.execute(
             """
             UPDATE daily_picks
@@ -369,21 +383,22 @@ def latest_prediction_snapshot() -> dict[str, Any] | None:
         return None
     item = dict(row)
     item["rows"] = json.loads(item.pop("rows_json"))
-    item["model_status"] = "ready" if item["strategy"] in {"xgboost_intraday", "xgboost_regressor"} else item["strategy"]
+    item["model_status"] = "ready" if item["strategy"] in {"xgboost_intraday", "xgboost_regressor", "triple_xgboost_regressor", "quad_xgboost_regressor"} else item["strategy"]
     return item
 
 
 def save_daily_pick(pick: dict[str, Any]) -> int:
     init_db()
     strategy_type = pick.get("strategy_type") or (pick.get("raw") or {}).get("winner", {}).get("strategy_type") or "尾盘突破"
+    t3_max_gain_pct = pick.get("t3_max_gain_pct")
     with connect() as conn:
         cursor = conn.execute(
             """
             INSERT INTO daily_picks (
                 selection_date, target_date, selected_at, code, name, strategy_type, win_rate,
-                selection_price, selection_change, model_status, status, raw_json
+                selection_price, selection_change, model_status, status, t3_max_gain_pct, raw_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(selection_date) DO NOTHING
             """,
             (
@@ -398,6 +413,7 @@ def save_daily_pick(pick: dict[str, Any]) -> int:
                 pick.get("selection_change"),
                 pick.get("model_status"),
                 pick.get("status", "pending_open"),
+                t3_max_gain_pct,
                 json.dumps(pick.get("raw", pick), ensure_ascii=False),
             ),
         )
@@ -419,6 +435,7 @@ def update_daily_pick_open(
     open_price: float,
     checked_at: str,
     exit_signal: dict[str, Any] | None = None,
+    close_position: bool = False,
 ) -> dict[str, Any] | None:
     init_db()
     with connect() as conn:
@@ -431,15 +448,149 @@ def update_daily_pick_open(
         if exit_signal is not None:
             raw["exit_sentinel"] = exit_signal
         success = 1 if premium is not None and premium > PROFIT_TARGET_PCT else 0
+        if close_position:
+            conn.execute(
+                """
+                UPDATE daily_picks
+                SET open_price = ?, open_checked_at = ?, open_premium = ?, success = ?,
+                    status = 'open_checked', is_closed = 1, close_date = ?,
+                    close_price = ?, close_return_pct = ?, close_reason = ?,
+                    close_checked_at = ?, raw_json = ?
+                WHERE selection_date = ?
+                """,
+                (
+                    open_price,
+                    checked_at,
+                    premium,
+                    success,
+                    checked_at[:10],
+                    open_price,
+                    premium,
+                    (exit_signal or {}).get("action") if exit_signal else "开盘闭环",
+                    checked_at,
+                    json.dumps(raw, ensure_ascii=False),
+                    selection_date,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE daily_picks
+                SET open_price = ?, open_checked_at = ?, open_premium = ?, success = ?, status = 'open_checked', raw_json = ?
+                WHERE selection_date = ?
+                """,
+                (open_price, checked_at, premium, success, json.dumps(raw, ensure_ascii=False), selection_date),
+            )
+    return get_daily_pick(selection_date)
+
+
+def update_daily_pick_t3_gain(selection_date: str, t3_max_gain_pct: float, checked_at: str | None = None) -> dict[str, Any] | None:
+    init_db()
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM daily_picks WHERE selection_date = ?", (selection_date,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        raw = json.loads(item.get("raw_json") or "{}")
+        raw["t3_result"] = {
+            "t3_max_gain_pct": float(t3_max_gain_pct),
+            "checked_at": checked_at or datetime.now().isoformat(timespec="seconds"),
+        }
+        success = 1 if float(t3_max_gain_pct) > 0 else 0
         conn.execute(
             """
             UPDATE daily_picks
-            SET open_price = ?, open_checked_at = ?, open_premium = ?, success = ?, status = 'open_checked', raw_json = ?
+            SET t3_max_gain_pct = ?, success = ?, status = 't3_checked', raw_json = ?
             WHERE selection_date = ?
             """,
-            (open_price, checked_at, premium, success, json.dumps(raw, ensure_ascii=False), selection_date),
+            (float(t3_max_gain_pct), success, json.dumps(raw, ensure_ascii=False), selection_date),
         )
     return get_daily_pick(selection_date)
+
+
+def mark_daily_pick_closed(
+    selection_date: str,
+    close_price: float,
+    close_return_pct: float,
+    close_reason: str,
+    checked_at: str | None = None,
+    close_signal: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    init_db()
+    timestamp = checked_at or datetime.now().isoformat(timespec="seconds")
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM daily_picks WHERE selection_date = ?", (selection_date,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        raw = json.loads(item.get("raw_json") or "{}")
+        if close_signal is not None:
+            raw["close_signal"] = close_signal
+        conn.execute(
+            """
+            UPDATE daily_picks
+            SET is_closed = 1, status = 'closed', success = ?,
+                close_date = ?, close_price = ?,
+                close_return_pct = ?, close_reason = ?, close_checked_at = ?,
+                raw_json = ?
+            WHERE selection_date = ?
+            """,
+            (
+                1 if float(close_return_pct) > 0 else 0,
+                timestamp[:10],
+                float(close_price),
+                float(close_return_pct),
+                close_reason,
+                timestamp,
+                json.dumps(raw, ensure_ascii=False),
+                selection_date,
+            ),
+        )
+    return get_daily_pick(selection_date)
+
+
+def open_position_picks(today: str | None = None) -> list[dict[str, Any]]:
+    init_db()
+    current = today or datetime.now().date().isoformat()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM daily_picks
+            WHERE COALESCE(is_closed, 0) = 0
+              AND selection_date < ?
+              AND (
+                    (
+                        strategy_type = '尾盘突破'
+                        AND status = 'pending_open'
+                        AND target_date <= ?
+                    )
+                    OR (
+                        strategy_type IN ('中线超跌反转', '右侧主升浪')
+                        AND target_date >= ?
+                    )
+                  )
+            ORDER BY selection_date ASC
+            """,
+            (current, current, current),
+        ).fetchall()
+    return [_decode_daily_pick(row) for row in rows if row]
+
+
+def stock_daily_row(code: str, trade_date: str) -> dict[str, Any] | None:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT code, name, date, open, high, low, close, pre_close, change_pct,
+                   volume, amount, turnover, volume_ratio
+            FROM stock_daily
+            WHERE code = ? AND date = ?
+            LIMIT 1
+            """,
+            (str(code).zfill(6), trade_date),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def get_daily_pick(selection_date: str) -> dict[str, Any] | None:
@@ -475,6 +626,7 @@ def _decode_daily_pick(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return None
     item = dict(row)
     item["success"] = None if item["success"] is None else bool(item["success"])
+    item["is_closed"] = bool(item.get("is_closed") or 0)
     item["raw"] = json.loads(item.pop("raw_json"))
     item["strategy_type"] = item.get("strategy_type") or (item.get("raw") or {}).get("winner", {}).get("strategy_type") or "尾盘突破"
     _attach_pick_display_fields(item)
@@ -485,9 +637,11 @@ def _attach_pick_display_fields(item: dict[str, Any]) -> None:
     raw = item.get("raw") or {}
     winner = raw.get("winner") if isinstance(raw.get("winner"), dict) else {}
     sentinel = raw.get("exit_sentinel") if isinstance(raw.get("exit_sentinel"), dict) else {}
+    close_signal = raw.get("close_signal") if isinstance(raw.get("close_signal"), dict) else {}
 
     item["expected_premium"] = _optional_float(winner.get("expected_premium"))
     item["predicted_open_premium"] = item["expected_premium"]
+    item["expected_t3_max_gain_pct"] = _optional_float(winner.get("expected_t3_max_gain_pct"))
     item["composite_score"] = _optional_float(winner.get("composite_score"))
     item["sort_score"] = _optional_float(winner.get("sort_score"))
     item["score_threshold"] = _optional_float(winner.get("score_threshold"))
@@ -502,6 +656,9 @@ def _attach_pick_display_fields(item: dict[str, Any]) -> None:
     item["exit_level"] = sentinel.get("level") or _exit_level_from_action(item.get("exit_action"))
     item["exit_pushed_at"] = sentinel.get("pushed_at")
     item["exit_push_status"] = sentinel.get("push_status")
+    item["close_action"] = close_signal.get("action") or item.get("close_reason")
+    item["close_instruction"] = close_signal.get("instruction") or ""
+    item["close_push_status"] = close_signal.get("push_status")
 
 
 def _optional_float(value: Any) -> float | None:

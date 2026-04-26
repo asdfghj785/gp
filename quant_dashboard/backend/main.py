@@ -188,7 +188,10 @@ def radar_scan(limit: int = Query(default=10, ge=1, le=50)) -> dict[str, Any]:
 
 @app.get("/api/daily-picks")
 def daily_picks(limit: int = Query(default=10, ge=1, le=50)) -> dict[str, Any]:
-    return list_daily_pick_results(limit=limit)
+    result = list_daily_pick_results(limit=limit)
+    for row in result.get("rows", []):
+        row.setdefault("t3_max_gain_pct", None)
+    return result
 
 
 @app.get("/api/backtest/top-pick-open")

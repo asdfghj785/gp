@@ -9,7 +9,7 @@ import pandas as pd
 from .config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE
 from .predictor import PROFIT_TARGET_PCT, apply_production_filters
 from .daily_pick import list_daily_pick_results
-from .storage import init_db
+from .storage import connect, init_db
 from .strategy_lab import _daily_top, _stats_row, prepare_evaluated_candidates
 
 
@@ -130,6 +130,59 @@ def diagnose_dipbuy_failures(months: int = 12, refresh: bool = False) -> dict[st
     }
 
 
+def diagnose_reversal_quality(months: int = 12, refresh: bool = False) -> dict[str, Any]:
+    prepared = prepare_evaluated_candidates(months, refresh=refresh)
+    evaluated = prepared["evaluated"].copy()
+    pick_rows = list_daily_pick_results(limit=10000).get("rows", [])
+    picks = pd.DataFrame(pick_rows)
+    if evaluated.empty or picks.empty:
+        return {"count": 0, "quality_count": 0, "feature_stats": [], "samples": [], "diagnosis": ["没有可诊断的反转样本"]}
+
+    picks["code"] = picks["code"].astype(str).str.zfill(6)
+    reversal = picks[picks["strategy_type"].eq("中线超跌反转") & picks["t3_max_gain_pct"].notna()].copy()
+    if reversal.empty:
+        return {"count": 0, "quality_count": 0, "feature_stats": [], "samples": [], "diagnosis": ["daily_picks 中没有中线超跌反转记录"]}
+
+    reversal["t3_max_gain_pct"] = pd.to_numeric(reversal["t3_max_gain_pct"], errors="coerce")
+    low_quality = reversal[reversal["t3_max_gain_pct"] < 2.0].copy()
+    failures = reversal[reversal["t3_max_gain_pct"] <= 0].copy()
+
+    evaluated["纯代码"] = evaluated["纯代码"].astype(str).str.zfill(6)
+    joined = low_quality.merge(
+        evaluated,
+        left_on=["selection_date", "code"],
+        right_on=["date", "纯代码"],
+        how="left",
+        suffixes=("_pick", ""),
+    )
+    if not joined.empty:
+        joined = _attach_reversal_pressure_features(joined)
+
+    feature_cols = [
+        "换手率",
+        "volume_ratio_to_10d",
+        "20日均线乖离率",
+        "ma30_bias",
+        "ma20_slope",
+        "ma30_slope",
+        "market_avg_change",
+        "market_down_count",
+        "market_amount",
+        "t3_max_gain_pct_pick",
+    ]
+    stats = _feature_stats(joined, feature_cols)
+    samples = _reversal_quality_samples(joined)
+    return {
+        "count": int(len(reversal)),
+        "failure_count": int(len(failures)),
+        "quality_count": int(len(low_quality)),
+        "matched_count": int(joined["纯代码"].notna().sum()) if "纯代码" in joined.columns else 0,
+        "feature_stats": stats,
+        "samples": samples,
+        "diagnosis": _reversal_quality_diagnosis(joined, stats),
+    }
+
+
 def _failure_reason_rows(failures: pd.DataFrame, successes: pd.DataFrame) -> list[dict[str, Any]]:
     definitions = [
         ("涨幅过高", "当日涨幅>=7%，次日容易低开消化获利盘。", lambda df: df["涨跌幅"] >= 7),
@@ -168,6 +221,196 @@ def _failure_reason_rows(failures: pd.DataFrame, successes: pd.DataFrame) -> lis
         )
     rows.sort(key=lambda row: (row["lift_vs_success"], row["failure_count"]), reverse=True)
     return rows
+
+
+def _attach_reversal_pressure_features(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    keys = [(str(row["code"]).zfill(6), str(row["selection_date"])) for _, row in out.iterrows()]
+    feature_map = _load_ma_pressure_features(keys)
+    for col in ["ma30_bias", "ma20_slope", "ma30_slope"]:
+        out[col] = [feature_map.get((code, day), {}).get(col, np.nan) for code, day in keys]
+    return out
+
+
+def _load_ma_pressure_features(keys: list[tuple[str, str]]) -> dict[tuple[str, str], dict[str, float]]:
+    if not keys:
+        return {}
+    codes = sorted({code for code, _ in keys})
+    min_date = (pd.to_datetime(min(day for _, day in keys)) - pd.DateOffset(days=90)).strftime("%Y-%m-%d")
+    max_date = max(day for _, day in keys)
+    placeholders = ",".join("?" for _ in codes)
+    try:
+        with connect() as conn:
+            raw = pd.read_sql_query(
+                f"""
+                SELECT code, date, close
+                FROM stock_daily
+                WHERE code IN ({placeholders}) AND date >= ? AND date <= ?
+                ORDER BY code ASC, date ASC
+                """,
+                conn,
+                params=[*codes, min_date, max_date],
+            )
+    except Exception:
+        return {}
+    if raw.empty:
+        return {}
+    raw["code"] = raw["code"].astype(str).str.zfill(6)
+    raw["date"] = raw["date"].astype(str)
+    raw["close"] = pd.to_numeric(raw["close"], errors="coerce")
+    result: dict[tuple[str, str], dict[str, float]] = {}
+    for code, group in raw.dropna(subset=["close"]).groupby("code", sort=False):
+        g = group.sort_values("date").copy()
+        ma20 = g["close"].rolling(20, min_periods=20).mean()
+        ma30 = g["close"].rolling(30, min_periods=30).mean()
+        g["ma30_bias"] = (g["close"] / ma30 - 1) * 100
+        g["ma20_slope"] = (ma20 / ma20.shift(1) - 1) * 100
+        g["ma30_slope"] = (ma30 / ma30.shift(1) - 1) * 100
+        for _, row in g.iterrows():
+            key = (str(code), str(row["date"]))
+            if key in keys:
+                result[key] = {
+                    "ma30_bias": _safe_float(row.get("ma30_bias")),
+                    "ma20_slope": _safe_float(row.get("ma20_slope")),
+                    "ma30_slope": _safe_float(row.get("ma30_slope")),
+                }
+    return result
+
+
+def _feature_stats(df: pd.DataFrame, feature_cols: list[str]) -> list[dict[str, Any]]:
+    rows = []
+    for col in feature_cols:
+        values = pd.to_numeric(df.get(col), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        if values.empty:
+            continue
+        rows.append(
+            {
+                "feature": col,
+                "mean": round(float(values.mean()), 4),
+                "median": round(float(values.median()), 4),
+                "p25": round(float(values.quantile(0.25)), 4),
+                "p75": round(float(values.quantile(0.75)), 4),
+                "min": round(float(values.min()), 4),
+                "max": round(float(values.max()), 4),
+            }
+        )
+    return rows
+
+
+def _reversal_quality_samples(joined: pd.DataFrame) -> list[dict[str, Any]]:
+    if joined.empty:
+        return []
+    sample_cols = [
+        "selection_date",
+        "code",
+        "name",
+        "t3_max_gain_pct_pick",
+        "换手率",
+        "volume_ratio_to_10d",
+        "20日均线乖离率",
+        "ma30_bias",
+        "ma20_slope",
+        "ma30_slope",
+        "market_avg_change",
+        "market_down_count",
+    ]
+    available = [col for col in sample_cols if col in joined.columns]
+    rows = []
+    for _, row in joined.sort_values("t3_max_gain_pct_pick")[available].iterrows():
+        item: dict[str, Any] = {}
+        for col in available:
+            value = row[col]
+            if isinstance(value, (int, float, np.floating)) and pd.notna(value):
+                item[col] = round(float(value), 4)
+            else:
+                item[col] = "" if pd.isna(value) else value
+        rows.append(item)
+    return rows
+
+
+def _reversal_quality_diagnosis(joined: pd.DataFrame, stats: list[dict[str, Any]]) -> list[str]:
+    if joined.empty:
+        return ["没有匹配到劣质反转特征快照。"]
+    notes = []
+    turnover = pd.to_numeric(joined.get("换手率"), errors="coerce")
+    if turnover.notna().any():
+        low2 = float((turnover < 2).mean() * 100)
+        low3 = float((turnover < 3).mean() * 100)
+        notes.append(f"劣质反转中换手率<2%的占 {low2:.2f}%，换手率<3%的占 {low3:.2f}%。")
+    volume_ratio = pd.to_numeric(joined.get("volume_ratio_to_10d"), errors="coerce")
+    if volume_ratio.notna().any():
+        hot_volume = float((volume_ratio >= 3).mean() * 100)
+        notes.append(f"劣质反转中10日量比>=3的占 {hot_volume:.2f}%，问题不是没量，而是放量后缺少持续溢价。")
+    ma20_bias = pd.to_numeric(joined.get("20日均线乖离率"), errors="coerce")
+    ma30_bias = pd.to_numeric(joined.get("ma30_bias"), errors="coerce")
+    if ma20_bias.notna().any() or ma30_bias.notna().any():
+        near_ma20 = float(ma20_bias.between(-1.0, 2.0).mean() * 100) if ma20_bias.notna().any() else 0.0
+        near_ma30 = float(ma30_bias.between(-1.0, 2.0).mean() * 100) if ma30_bias.notna().any() else 0.0
+        notes.append(f"收盘价贴近上方均线压力的比例：20日线[-1%,2%]占 {near_ma20:.2f}%，30日线[-1%,2%]占 {near_ma30:.2f}%。")
+        high_ma20 = float((ma20_bias >= 8).mean() * 100) if ma20_bias.notna().any() else 0.0
+        high_ma30 = float((ma30_bias >= 6).mean() * 100) if ma30_bias.notna().any() else 0.0
+        notes.append(f"一阳穿线后位置偏离过高：20日乖离>=8%占 {high_ma20:.2f}%，30日乖离>=6%占 {high_ma30:.2f}%，更像短线急拉后的弱反抽。")
+    ma20_slope = pd.to_numeric(joined.get("ma20_slope"), errors="coerce")
+    ma30_slope = pd.to_numeric(joined.get("ma30_slope"), errors="coerce")
+    if ma20_slope.notna().any() or ma30_slope.notna().any():
+        down20 = float((ma20_slope < 0).mean() * 100) if ma20_slope.notna().any() else 0.0
+        down30 = float((ma30_slope < 0).mean() * 100) if ma30_slope.notna().any() else 0.0
+        notes.append(f"均线仍向下的比例：20日线斜率<0占 {down20:.2f}%，30日线斜率<0占 {down30:.2f}%。")
+    market = pd.to_numeric(joined.get("market_avg_change"), errors="coerce")
+    down_count = pd.to_numeric(joined.get("market_down_count"), errors="coerce")
+    if market.notna().any():
+        weak_market = ((market <= -0.5) | (down_count >= 3500)).mean() * 100
+        notes.append(f"买入日处于大盘弱势或下跌家数过多的比例为 {weak_market:.2f}%。")
+    if not notes:
+        notes.append("劣质反转没有显著单因子，需要继续做组合过滤或重新训练反转模型。")
+    return notes
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        if value is None or pd.isna(value):
+            return float("nan")
+        return float(value)
+    except Exception:
+        return float("nan")
+
+
+def format_reversal_quality_markdown(report: dict[str, Any]) -> str:
+    lines = [
+        "# 雷达 3 号弱反抽尸检",
+        "",
+        f"- 反转出手数：{report.get('count', 0)}",
+        f"- T+3 失败数（<=0）：{report.get('failure_count', 0)}",
+        f"- 劣质反转数（<2%）：{report.get('quality_count', 0)}",
+        f"- 匹配特征快照：{report.get('matched_count', 0)}",
+        "",
+        "## 关键特征统计",
+        "",
+        "| 特征 | 均值 | 中位数 | P25 | P75 | 最小 | 最大 |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in report.get("feature_stats", []):
+        lines.append(
+            f"| {row['feature']} | {row['mean']:.2f} | {row['median']:.2f} | "
+            f"{row['p25']:.2f} | {row['p75']:.2f} | {row['min']:.2f} | {row['max']:.2f} |"
+        )
+    lines.extend(["", "## 共性元凶", ""])
+    lines.extend([f"- {note}" for note in report.get("diagnosis", [])])
+    lines.extend(["", "## 劣质样本", "", "| 日期 | 代码 | 名称 | T+3涨幅 | 换手 | 10日量比 | 20日乖离 | 30日乖离 | 大盘均涨 | 下跌家数 |", "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|"])
+    for row in report.get("samples", []):
+        lines.append(
+            f"| {row.get('selection_date', '')} | {row.get('code', '')} | {row.get('name', '')} | "
+            f"{float(row.get('t3_max_gain_pct_pick') or 0):.2f}% | "
+            f"{float(row.get('换手率') or 0):.2f}% | "
+            f"{float(row.get('volume_ratio_to_10d') or 0):.2f} | "
+            f"{float(row.get('20日均线乖离率') or 0):.2f}% | "
+            f"{float(row.get('ma30_bias') or 0):.2f}% | "
+            f"{float(row.get('market_avg_change') or 0):.2f}% | "
+            f"{int(float(row.get('market_down_count') or 0))} |"
+        )
+    return "\n".join(lines)
 
 
 def _strategy_group_rows(picks: pd.DataFrame) -> list[dict[str, Any]]:

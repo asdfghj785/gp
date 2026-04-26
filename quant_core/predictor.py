@@ -15,9 +15,13 @@ from .config import (
     DIPBUY_MIN_SCORE,
     DIPBUY_PREMIUM_MODEL_PATH,
     LATEST_TOP50_PATH,
+    MAIN_WAVE_MIN_SCORE,
+    MAIN_WAVE_MODEL_PATH,
     MODEL_PATH,
     PREMIUM_MODEL_PATH,
     PROFIT_TARGET_PCT,
+    REVERSAL_MIN_SCORE,
+    REVERSAL_MODEL_PATH,
 )
 from .intraday_snapshot import attach_late_pull_trap
 from .market import fetch_market_indices, fetch_sina_snapshot
@@ -77,6 +81,56 @@ DIPBUY_FEATURE_COLS = [
 ]
 DIPBUY_STRATEGY_TYPE = "首阴低吸"
 BREAKOUT_STRATEGY_TYPE = "尾盘突破"
+REVERSAL_STRATEGY_TYPE = "中线超跌反转"
+MAIN_WAVE_STRATEGY_TYPE = "右侧主升浪"
+SWING_STRATEGY_TYPES = {REVERSAL_STRATEGY_TYPE, MAIN_WAVE_STRATEGY_TYPE}
+REVERSAL_FEATURE_COLS = [
+    "body_pct",
+    "upper_shadow_pct",
+    "lower_shadow_pct",
+    "amplitude_pct",
+    "change_pct",
+    "return_5d",
+    "return_10d",
+    "return_20d",
+    "return_60d",
+    "ma5_bias",
+    "ma10_bias",
+    "ma20_bias",
+    "ma60_bias_prev",
+    "drawdown_60d",
+    "low_position_60d",
+    "min_volume_5d_ratio_to_60d",
+    "volume_ratio_to_10d",
+    "volume_ratio_to_60d",
+    "ma_convergence_pct",
+    "amount_ratio_to_10d",
+    "turnover",
+]
+MAIN_WAVE_FEATURE_COLS = [
+    "body_pct",
+    "upper_shadow_pct",
+    "lower_shadow_pct",
+    "amplitude_pct",
+    "change_pct",
+    "return_5d",
+    "return_10d",
+    "return_20d",
+    "return_60d",
+    "ma5_bias",
+    "ma10_bias",
+    "ma20_bias",
+    "ma60_bias",
+    "ma20_ma60_spread",
+    "pullback_from_60d_high",
+    "contraction_amplitude_5d",
+    "prev_volume_ratio_to_5d",
+    "breakout_strength",
+    "volume_burst_ratio",
+    "volume_ratio_to_20d",
+    "amount_ratio_to_20d",
+    "turnover",
+]
 DIPBUY_FILTERS = {
     "min_5d_high_gain": 15.0,
     "min_intraday_flush": -9.5,
@@ -136,6 +190,34 @@ def _load_dipbuy_premium_model():
         return None, f"低吸溢价模型加载失败: {exc}"
 
 
+@lru_cache(maxsize=1)
+def _load_reversal_model():
+    if not REVERSAL_MODEL_PATH.exists():
+        return None, f"找不到中线反转模型文件: {REVERSAL_MODEL_PATH}"
+    try:
+        import xgboost as xgb
+
+        model = xgb.XGBRegressor()
+        model.load_model(str(REVERSAL_MODEL_PATH))
+        return model, None
+    except Exception as exc:
+        return None, f"中线反转模型加载失败: {exc}"
+
+
+@lru_cache(maxsize=1)
+def _load_main_wave_model():
+    if not MAIN_WAVE_MODEL_PATH.exists():
+        return None, f"找不到右侧主升浪模型文件: {MAIN_WAVE_MODEL_PATH}"
+    try:
+        import xgboost as xgb
+
+        model = xgb.XGBRegressor()
+        model.load_model(str(MAIN_WAVE_MODEL_PATH))
+        return model, None
+    except Exception as exc:
+        return None, f"右侧主升浪模型加载失败: {exc}"
+
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "code" not in df.columns:
         return pd.DataFrame()
@@ -182,7 +264,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def score_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     scored = df.copy()
-    for col in dict.fromkeys([*FEATURE_COLS, *DIPBUY_FEATURE_COLS]):
+    for col in dict.fromkeys([*FEATURE_COLS, *DIPBUY_FEATURE_COLS, *REVERSAL_FEATURE_COLS, *MAIN_WAVE_FEATURE_COLS]):
         if col not in scored.columns:
             scored[col] = 0.0
         scored[col] = pd.to_numeric(scored[col], errors="coerce").replace([np.inf, -np.inf], 0).fillna(0)
@@ -191,15 +273,19 @@ def score_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
 
     scored["strategy_type"] = BREAKOUT_STRATEGY_TYPE
     scored["预期溢价"] = _fallback_expected_premium(scored)
+    reversal_mask = _reversal_physical_mask(scored)
+    main_wave_mask = _main_wave_physical_mask(scored)
     _log_dipbuy_diagnostics(scored)
-    dipbuy_mask = _dipbuy_physical_mask(scored)
+    dipbuy_mask = _dipbuy_physical_mask(scored) & ~reversal_mask & ~main_wave_mask
     premium_model, premium_error = _load_premium_model()
     dipbuy_model, dipbuy_error = _load_dipbuy_premium_model()
+    reversal_model, reversal_error = _load_reversal_model()
+    main_wave_model, main_wave_error = _load_main_wave_model()
     status_parts: list[str] = []
 
     if premium_model is not None:
         try:
-            breakout_index = scored.index[~dipbuy_mask]
+            breakout_index = scored.index[~dipbuy_mask & ~reversal_mask & ~main_wave_mask]
             if len(breakout_index) > 0:
                 scored.loc[breakout_index, "预期溢价"] = premium_model.predict(scored.loc[breakout_index, FEATURE_COLS].values)
             status_parts.append("breakout_regressor_ready")
@@ -221,6 +307,42 @@ def score_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     else:
         status_parts.append("dipbuy_no_physical_match")
 
+    if reversal_mask.any():
+        scored.loc[reversal_mask, "strategy_type"] = REVERSAL_STRATEGY_TYPE
+        if reversal_model is not None:
+            try:
+                scored.loc[reversal_mask, "预期溢价"] = reversal_model.predict(scored.loc[reversal_mask, REVERSAL_FEATURE_COLS].values)
+                status_parts.append(f"reversal_t3_regressor_ready:{int(reversal_mask.sum())}")
+            except Exception as exc:
+                status_parts.append(f"中线超跌反转模型失败，已降级规则估算: {exc}")
+        else:
+            status_parts.append(reversal_error or "reversal_model_unavailable")
+    else:
+        status_parts.append("reversal_no_physical_match")
+
+    if main_wave_mask.any():
+        main_wave_index = scored.index[main_wave_mask]
+        if main_wave_model is not None:
+            try:
+                main_wave_pred = pd.Series(
+                    main_wave_model.predict(scored.loc[main_wave_index, MAIN_WAVE_FEATURE_COLS].values),
+                    index=main_wave_index,
+                )
+                current_strategy = scored.loc[main_wave_index, "strategy_type"].fillna(BREAKOUT_STRATEGY_TYPE)
+                current_pred = pd.to_numeric(scored.loc[main_wave_index, "预期溢价"], errors="coerce").fillna(-999)
+                update_index = main_wave_index[(~current_strategy.eq(REVERSAL_STRATEGY_TYPE)) | (main_wave_pred >= current_pred)]
+                scored.loc[update_index, "strategy_type"] = MAIN_WAVE_STRATEGY_TYPE
+                scored.loc[update_index, "预期溢价"] = main_wave_pred.loc[update_index]
+                status_parts.append(f"main_wave_t3_regressor_ready:{int(main_wave_mask.sum())}; selected:{len(update_index)}")
+            except Exception as exc:
+                status_parts.append(f"右侧主升浪模型失败，已降级规则估算: {exc}")
+        else:
+            non_reversal_index = main_wave_index[~scored.loc[main_wave_index, "strategy_type"].eq(REVERSAL_STRATEGY_TYPE)]
+            scored.loc[non_reversal_index, "strategy_type"] = MAIN_WAVE_STRATEGY_TYPE
+            status_parts.append(main_wave_error or "main_wave_model_unavailable")
+    else:
+        status_parts.append("main_wave_no_physical_match")
+
     scored["预期溢价"] = pd.to_numeric(scored["预期溢价"], errors="coerce").replace([np.inf, -np.inf], 0).fillna(0)
 
     scored["风险评分"] = _risk_score(scored)
@@ -235,11 +357,13 @@ def score_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
         + scored["AI胜率"] * 0.10
     ).clip(0, 100)
     is_dipbuy = scored["strategy_type"].eq(DIPBUY_STRATEGY_TYPE)
+    is_swing = scored["strategy_type"].isin(SWING_STRATEGY_TYPES)
     scored.loc[is_dipbuy, "综合评分"] = (
         dipbuy_premium_score.loc[is_dipbuy] * 0.85
         + scored.loc[is_dipbuy, "AI胜率"] * 0.10
         + scored.loc[is_dipbuy, "流动性评分"] * 0.05
     ).clip(0, 100)
+    scored.loc[is_swing, "综合评分"] = _num(scored.loc[is_swing], "预期溢价").clip(-20, 30)
     model_status = "; ".join(status_parts) if status_parts else "ready"
     return scored, model_status
 
@@ -253,6 +377,33 @@ def _dipbuy_physical_mask(df: pd.DataFrame) -> pd.Series:
         & (_num(df, "今日缩量比例") < DIPBUY_FILTERS["max_amount_shrink_pct"])
         & (_num(df, "3日累计涨幅") > DIPBUY_FILTERS["min_3d_return"])
         & (_num(df, "昨日实体涨跌幅") > DIPBUY_FILTERS["min_prev_body_change"])
+    ).fillna(False)
+
+
+def _reversal_physical_mask(df: pd.DataFrame) -> pd.Series:
+    return (
+        (_num(df, "ma60_bias_prev") < 0)
+        & (_num(df, "drawdown_60d") <= -20.0)
+        & (_num(df, "min_volume_5d_ratio_to_60d") < 0.4)
+        & (_num(df, "body_pct") >= 5.0)
+        & (_num(df, "ma5_bias") > 0)
+        & (_num(df, "ma10_bias") > 0)
+        & (_num(df, "ma20_bias") <= 5.0)
+        & (_num(df, "ma30_bias") <= 5.0)
+        & (_num(df, "ma30_slope") >= -0.005)
+        & (_num(df, "volume_ratio_to_10d") >= 2.0)
+    ).fillna(False)
+
+
+def _main_wave_physical_mask(df: pd.DataFrame) -> pd.Series:
+    return (
+        (_num(df, "ma20_ma60_spread_prev") > 0)
+        & (_num(df, "pullback_from_60d_high") >= -15.0)
+        & (_num(df, "contraction_amplitude_5d") <= 12.0)
+        & (_num(df, "prev_volume_ratio_to_5d") < 1.0)
+        & (_num(df, "breakout_strength") > 0)
+        & (_num(df, "body_pct") >= 3.5)
+        & (_num(df, "volume_burst_ratio") >= 1.3)
     ).fillna(False)
 
 
@@ -294,12 +445,14 @@ def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = Non
     else:
         filtered["market_gate_mode"] = str(gate.get("mode") or "晴天")
     if "涨跌幅" in filtered.columns:
-        filtered = filtered[filtered["涨跌幅"] < 7].copy()
+        is_swing = filtered.get("strategy_type", "").isin(SWING_STRATEGY_TYPES) if "strategy_type" in filtered.columns else pd.Series(False, index=filtered.index)
+        filtered = filtered[(is_swing) | (filtered["涨跌幅"] < 7)].copy()
     if "准涨停未封板标记" in filtered.columns:
         filtered = filtered[pd.to_numeric(filtered["准涨停未封板标记"], errors="coerce").fillna(0) < 0.5].copy()
     if "上影线比例" in filtered.columns:
         is_dipbuy = filtered.get("strategy_type", "").eq(DIPBUY_STRATEGY_TYPE) if "strategy_type" in filtered.columns else pd.Series(False, index=filtered.index)
-        filtered = filtered[(is_dipbuy) | (filtered["上影线比例"] < 2)].copy()
+        is_swing = filtered.get("strategy_type", "").isin(SWING_STRATEGY_TYPES) if "strategy_type" in filtered.columns else pd.Series(False, index=filtered.index)
+        filtered = filtered[(is_dipbuy) | (is_swing) | (filtered["上影线比例"] < 2)].copy()
     if "预期溢价" in filtered.columns:
         filtered = filtered[filtered["预期溢价"] > 0].copy()
     if {"60日高位比例", "量比", "5日量能堆积"}.issubset(filtered.columns):
@@ -315,8 +468,10 @@ def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = Non
         filtered = filtered[pd.to_numeric(filtered["尾盘诱多标记"], errors="coerce").fillna(0) < 0.5].copy()
     if "近3日断头铡刀标记" in filtered.columns:
         is_dipbuy = filtered.get("strategy_type", "").eq(DIPBUY_STRATEGY_TYPE) if "strategy_type" in filtered.columns else pd.Series(False, index=filtered.index)
+        is_swing = filtered.get("strategy_type", "").isin(SWING_STRATEGY_TYPES) if "strategy_type" in filtered.columns else pd.Series(False, index=filtered.index)
         filtered = filtered[
             (is_dipbuy)
+            | (is_swing)
             | (pd.to_numeric(filtered["近3日断头铡刀标记"], errors="coerce").fillna(0) < 0.5)
         ].copy()
     return apply_strategy_score_gate(filtered, gate)
@@ -330,10 +485,19 @@ def apply_strategy_score_gate(df: pd.DataFrame, gate: dict[str, Any] | None = No
     filtered["strategy_type"] = filtered["strategy_type"].fillna(BREAKOUT_STRATEGY_TYPE)
     score = _num(filtered, "综合评分").replace([np.inf, -np.inf], 0).fillna(0)
     is_dipbuy = filtered["strategy_type"].eq(DIPBUY_STRATEGY_TYPE)
-    is_breakout = filtered["strategy_type"].eq(BREAKOUT_STRATEGY_TYPE) | ~is_dipbuy
+    is_reversal = filtered["strategy_type"].eq(REVERSAL_STRATEGY_TYPE)
+    is_main_wave = filtered["strategy_type"].eq(MAIN_WAVE_STRATEGY_TYPE)
+    is_breakout = filtered["strategy_type"].eq(BREAKOUT_STRATEGY_TYPE) | (~is_dipbuy & ~is_reversal & ~is_main_wave)
     threshold = pd.Series(BREAKOUT_MIN_SCORE, index=filtered.index, dtype="float64")
     threshold.loc[is_dipbuy] = DIPBUY_MIN_SCORE
-    qualified = ((is_breakout) & (score >= BREAKOUT_MIN_SCORE)) | ((is_dipbuy) & (score >= DIPBUY_MIN_SCORE))
+    threshold.loc[is_reversal] = REVERSAL_MIN_SCORE
+    threshold.loc[is_main_wave] = MAIN_WAVE_MIN_SCORE
+    qualified = (
+        ((is_breakout) & (score >= BREAKOUT_MIN_SCORE))
+        | ((is_dipbuy) & (score >= DIPBUY_MIN_SCORE))
+        | ((is_reversal) & (score >= REVERSAL_MIN_SCORE))
+        | ((is_main_wave) & (score >= MAIN_WAVE_MIN_SCORE))
+    )
     filtered = filtered[qualified].copy()
     filtered["生产门槛"] = threshold.loc[filtered.index]
     return apply_strategy_sort_score(filtered, gate)
@@ -355,10 +519,12 @@ def apply_strategy_sort_score(df: pd.DataFrame, gate: dict[str, Any] | None = No
         scored = _attach_historical_market_modes(scored)
         modes = scored["market_gate_mode"].fillna("晴天").astype(str)
     is_dipbuy = scored["strategy_type"].eq(DIPBUY_STRATEGY_TYPE)
+    is_swing = scored["strategy_type"].isin(SWING_STRATEGY_TYPES)
     bonus = pd.Series(0.0, index=scored.index)
     bonus.loc[is_dipbuy & modes.isin(["阴天", "震荡"])] = DIPBUY_SENTIMENT_BONUS
     scored["情绪补偿分"] = bonus
     scored["排序评分"] = (base_score + bonus).clip(0, 110)
+    scored.loc[is_swing, "排序评分"] = (50 + _num(scored.loc[is_swing], "综合评分").clip(-5, 15) * 5).clip(0, 110)
     scored["market_gate_mode"] = modes
     return scored
 
@@ -431,7 +597,7 @@ def scan_market(
             "id": None,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "model_status": f"{model_status}; 生产过滤后无合格标的",
-            "strategy": f"生产策略：实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；准涨停未封板、高位爆量、尾盘诱多直接剔除；当前没有股票满足双轨准入门槛。",
+            "strategy": f"生产策略：实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；准涨停未封板、高位爆量、尾盘诱多直接剔除；当前没有股票满足四轨准入门槛。",
             "market_gate": gate,
             "intraday_snapshot": intraday_snapshot,
             "rows": [],
@@ -441,12 +607,12 @@ def scan_market(
         return payload
     df = df.sort_values(["排序评分", "预期溢价", "综合评分"], ascending=[False, False, False]).head(final_limit)
     rows = [_row_to_api(row) for _, row in df.iterrows()]
-    snapshot_id = save_prediction_snapshot("dual_xgboost_regressor" if "regressor_ready" in model_status else "rule_fallback", rows) if cache_prediction else None
+    snapshot_id = save_prediction_snapshot("quad_xgboost_regressor" if "regressor_ready" in model_status else "rule_fallback", rows) if cache_prediction else None
     payload = {
         "id": snapshot_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_status": model_status,
-        "strategy": f"生产策略：尾盘突破与首阴低吸双轨回归器预测次日开盘预期溢价；实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；突破门槛>={BREAKOUT_MIN_SCORE:.1f}，低吸门槛>={DIPBUY_MIN_SCORE:.1f}；阴天/震荡时首阴低吸仅排序加{DIPBUY_SENTIMENT_BONUS:.0f}分，不改变原始综合评分；雷暴或大盘下跌且缩量时空仓；准涨停未封板、高位爆量、尾盘诱多直接剔除；近3日断头铡刀和上影线强过滤仅约束尾盘突破，首阴低吸豁免。",
+        "strategy": f"生产策略：尾盘突破/首阴低吸预测次日开盘预期溢价，中线超跌反转/右侧主升浪预测T+3最大涨幅；实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；突破门槛>={BREAKOUT_MIN_SCORE:.1f}，低吸门槛>={DIPBUY_MIN_SCORE:.1f}，反转门槛>={REVERSAL_MIN_SCORE:.1f}%，主升浪门槛>={MAIN_WAVE_MIN_SCORE:.1f}%；阴天/震荡时首阴低吸仅排序加{DIPBUY_SENTIMENT_BONUS:.0f}分，不改变原始综合评分；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多直接剔除；近3日断头铡刀和上影线强过滤仅约束尾盘突破，波段策略豁免。",
         "market_gate": gate,
         "intraday_snapshot": intraday_snapshot,
         "rows": rows,
@@ -650,15 +816,32 @@ def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
 
     prev3_close = group["最新价"].shift(3)
     prev5_close = group["最新价"].shift(5)
+    prev10_close = group["最新价"].shift(10)
+    prev20_close = group["最新价"].shift(20)
+    prev60_close = group["最新价"].shift(60)
     ma5 = group["最新价"].transform(lambda values: values.rolling(5, min_periods=3).mean())
     ma10 = group["最新价"].transform(lambda values: values.rolling(10, min_periods=5).mean())
     ma20 = group["最新价"].transform(lambda values: values.rolling(20, min_periods=10).mean())
+    ma30 = group["最新价"].transform(lambda values: values.rolling(30, min_periods=30).mean())
+    ma60 = group["最新价"].transform(lambda values: values.rolling(60, min_periods=60).mean())
     ma10_prev = ma10.groupby(combined["纯代码"], sort=False).shift(1)
+    ma20_prev = ma20.groupby(combined["纯代码"], sort=False).shift(1)
+    ma30_prev = ma30.groupby(combined["纯代码"], sort=False).shift(1)
+    ma60_prev = ma60.groupby(combined["纯代码"], sort=False).shift(1)
     high5 = group["最高"].transform(lambda values: values.rolling(5, min_periods=3).max())
     high60 = group["最新价"].transform(lambda values: values.rolling(60, min_periods=20).max())
+    high_60_prev = group["最高"].transform(lambda values: values.shift(1).rolling(60, min_periods=60).max())
+    low_60_prev = group["最低"].transform(lambda values: values.shift(1).rolling(60, min_periods=60).min())
+    platform_high = group["最高"].transform(lambda values: values.shift(1).rolling(5, min_periods=5).max())
+    platform_low = group["最低"].transform(lambda values: values.shift(1).rolling(5, min_periods=5).min())
+    platform_max_close = group["最新价"].transform(lambda values: values.shift(1).rolling(5, min_periods=5).max())
     avg_turn3 = group["换手率"].transform(lambda values: values.rolling(3, min_periods=2).mean())
     avg_vol5 = group["volume"].transform(lambda values: values.shift(1).rolling(5, min_periods=3).mean())
     avg_vol10 = group["volume"].transform(lambda values: values.shift(1).rolling(10, min_periods=5).mean())
+    avg_vol20 = group["volume"].transform(lambda values: values.shift(1).rolling(20, min_periods=10).mean())
+    avg_vol60 = group["volume"].transform(lambda values: values.shift(1).rolling(60, min_periods=60).mean())
+    avg_amount10 = group["amount"].transform(lambda values: values.shift(1).rolling(10, min_periods=5).mean())
+    avg_amount20 = group["amount"].transform(lambda values: values.shift(1).rolling(20, min_periods=10).mean())
     red3 = (close > open_price).astype(float).groupby(combined["纯代码"], sort=False).transform(lambda values: values.rolling(3, min_periods=2).mean() * 100)
     min_vol5 = group["volume"].transform(lambda values: values.rolling(5, min_periods=3).min())
     prev_close = group["最新价"].shift(1)
@@ -686,12 +869,47 @@ def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     combined["近3日断头铡刀标记"] = (recent_3d_min_change <= -7).astype(float)
     combined["60日高位比例"] = ((close / high60) * 100).replace([np.inf, -np.inf], 0).fillna(0)
     combined["高位爆量标记"] = ((combined["60日高位比例"] >= 97) & ((combined["量比"] > 3) | (combined["5日量能堆积"] > 3))).astype(float)
+    combined["body_pct"] = ((close / open_price.replace(0, np.nan) - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["upper_shadow_pct"] = ((high - combined[["今开", "最新价"]].max(axis=1)) / prev_close.replace(0, np.nan) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["lower_shadow_pct"] = ((combined[["今开", "最新价"]].min(axis=1) - low) / prev_close.replace(0, np.nan) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["amplitude_pct"] = ((high - low) / prev_close.replace(0, np.nan) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["change_pct"] = combined["涨跌幅"]
+    combined["return_5d"] = ((close / prev5_close - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["return_10d"] = ((close / prev10_close - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["return_20d"] = ((close / prev20_close - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["return_60d"] = ((close / prev60_close - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["ma5_bias"] = ((close / ma5 - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["ma10_bias"] = ((close / ma10 - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["ma20_bias"] = ((close / ma20 - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["ma30_bias"] = ((close / ma30 - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["ma60_bias"] = ((close / ma60 - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["ma30_slope"] = ((ma30 - ma30_prev) / ma30_prev).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["ma20_ma60_spread"] = ((ma20 - ma60) / ma60).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["ma20_ma60_spread_prev"] = ((ma20_prev - ma60_prev) / ma60_prev).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["ma60_bias_prev"] = ((prev_close / ma60_prev - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["drawdown_60d"] = ((low_60_prev / high_60_prev - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["pullback_from_60d_high"] = ((prev_close / high_60_prev - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["low_position_60d"] = ((close / low_60_prev - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["min_volume_5d_ratio_to_60d"] = (group["volume"].transform(lambda values: values.shift(1).rolling(5, min_periods=5).min()) / avg_vol60).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["volume_ratio_to_10d"] = (volume / avg_vol10).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["volume_ratio_to_60d"] = (volume / avg_vol60).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["contraction_amplitude_5d"] = ((platform_high / platform_low - 1) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["prev_volume_ratio_to_5d"] = (group["volume"].shift(1) / avg_vol5).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["breakout_strength"] = (close / platform_max_close - 1).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["volume_burst_ratio"] = (volume / avg_vol5).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["volume_ratio_to_20d"] = (volume / avg_vol20).replace([np.inf, -np.inf], 0).fillna(0)
+    ma_stack = pd.concat([ma5, ma10, ma20], axis=1)
+    combined["ma_convergence_pct"] = ((ma_stack.max(axis=1) - ma_stack.min(axis=1)) / close.replace(0, np.nan) * 100).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["amount_ratio_to_10d"] = (amount / avg_amount10).replace([np.inf, -np.inf], 0).fillna(0)
+    combined["amount_ratio_to_20d"] = (amount / avg_amount20).replace([np.inf, -np.inf], 0).fillna(0)
     for col in ["振幅换手比", "缩量大涨标记", "极端下影线标记"]:
         if col not in combined.columns:
             combined[col] = 0.0
     if "尾盘诱多标记" not in combined.columns:
         combined["尾盘诱多标记"] = 0.0
     combined[DIPBUY_TEMPORAL_FEATURE_COLS] = combined[DIPBUY_TEMPORAL_FEATURE_COLS].replace([np.inf, -np.inf], 0).fillna(0)
+    combined[REVERSAL_FEATURE_COLS] = combined[REVERSAL_FEATURE_COLS].replace([np.inf, -np.inf], 0).fillna(0)
+    combined[MAIN_WAVE_FEATURE_COLS] = combined[MAIN_WAVE_FEATURE_COLS].replace([np.inf, -np.inf], 0).fillna(0)
 
     result = combined[combined["_current_row"]].copy()
     return result.drop(columns=["_current_row", "date_sort"], errors="ignore")
@@ -968,6 +1186,7 @@ def _row_to_api(row: pd.Series) -> dict[str, Any]:
         "turnover": round(float(row["换手率"]), 4),
         "win_rate": round(float(row["AI胜率"]), 4),
         "expected_premium": round(float(row.get("预期溢价", 0)), 4),
+        "expected_t3_max_gain_pct": round(float(row.get("预期溢价", 0)), 4) if str(row.get("strategy_type", "")) in SWING_STRATEGY_TYPES else None,
         "risk_score": round(float(row.get("风险评分", 0)), 4),
         "liquidity_score": round(float(row.get("流动性评分", 0)), 4),
         "composite_score": round(float(row.get("综合评分", row["AI胜率"])), 4),
@@ -1009,6 +1228,12 @@ def _row_to_api(row: pd.Series) -> dict[str, Any]:
             "is_late_pull_trap": bool(float(row.get("尾盘诱多标记", 0)) >= 0.5),
             "is_near_limit_unsealed": bool(float(row.get("准涨停未封板标记", 0)) >= 0.5),
             "live_proxy_factor": round(float(row.get("live_proxy_factor", 1.0)), 4),
+            "reversal_drawdown_60d": round(float(row.get("drawdown_60d", 0)), 4),
+            "reversal_min_volume_ratio": round(float(row.get("min_volume_5d_ratio_to_60d", 0)), 4),
+            "reversal_volume_ratio_10d": round(float(row.get("volume_ratio_to_10d", 0)), 4),
+            "reversal_ma_convergence": round(float(row.get("ma_convergence_pct", 0)), 4),
+            "reversal_ma30_bias": round(float(row.get("ma30_bias", 0)), 4),
+            "reversal_ma30_slope": round(float(row.get("ma30_slope", 0)), 6),
         },
         "market_context": {
             "up_rate": round(float(row.get("market_up_rate", 0)), 4),

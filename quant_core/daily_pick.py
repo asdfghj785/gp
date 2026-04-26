@@ -14,6 +14,9 @@ from .storage import (
 )
 
 
+SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪"}
+
+
 def is_weekday(day: date | None = None) -> bool:
     current = day or date.today()
     return current.weekday() < 5
@@ -24,6 +27,13 @@ def next_weekday(day: date | None = None) -> date:
     target = current + timedelta(days=1)
     while target.weekday() >= 5:
         target += timedelta(days=1)
+    return target
+
+
+def nth_weekday(day: date, n: int) -> date:
+    target = day
+    for _ in range(max(1, int(n))):
+        target = next_weekday(target)
     return target
 
 
@@ -56,16 +66,19 @@ def save_pushed_top_pick(winner: dict[str, Any], scan: dict[str, Any], force: bo
 
 def _pick_from_winner(winner: dict[str, Any], scan: dict[str, Any], selected_at: str) -> dict[str, Any]:
     today = date.today()
+    strategy_type = winner.get("strategy_type", "尾盘突破")
+    target_date = nth_weekday(today, 3) if strategy_type in SWING_STRATEGY_TYPES else next_weekday(today)
     return {
         "selection_date": today.isoformat(),
-        "target_date": next_weekday(today).isoformat(),
+        "target_date": target_date.isoformat(),
         "selected_at": selected_at,
         "code": winner["code"],
         "name": winner["name"],
-        "strategy_type": winner.get("strategy_type", "尾盘突破"),
+        "strategy_type": strategy_type,
         "win_rate": float(winner["win_rate"]),
         "selection_price": float(winner["price"]),
         "selection_change": float(winner["change"]),
+        "t3_max_gain_pct": None,
         "model_status": scan.get("model_status", ""),
         "status": "pending_open",
         "raw": {
@@ -86,6 +99,7 @@ def update_pending_open_results(force: bool = False) -> dict[str, Any]:
         return {"status": "skipped", "reason": "非工作日不更新开盘结果", "updated": []}
 
     pending = pending_daily_picks(target_date=today.isoformat())
+    pending = [pick for pick in pending if pick.get("strategy_type") not in SWING_STRATEGY_TYPES]
     if not pending:
         return {"status": "noop", "updated": []}
 

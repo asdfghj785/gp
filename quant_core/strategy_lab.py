@@ -15,7 +15,7 @@ from .backtest import (
     _valid_trading_dates,
 )
 from .cache_utils import read_dataframe_cache, write_dataframe_cache
-from .config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE
+from .config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE, REVERSAL_MIN_SCORE
 from .predictor import PROFIT_TARGET_PCT, apply_production_filters, build_features, score_candidates
 from .storage import init_db
 
@@ -147,10 +147,28 @@ def prepare_evaluated_candidates(months: int, refresh: bool = False) -> dict[str
 def _attach_next_open(candidates: pd.DataFrame, raw: pd.DataFrame, trading_dates: list[str]) -> pd.DataFrame:
     next_trade_date = {trading_dates[index]: trading_dates[index + 1] for index in range(len(trading_dates) - 1)}
     opens = raw.set_index(["date", "code"])["open"]
+    highs = raw.set_index(["date", "code"])["high"]
     out = candidates.copy()
     out["next_date"] = out["date"].map(next_trade_date)
     out["next_open"] = [opens.get((next_date, code), np.nan) for next_date, code in zip(out["next_date"], out["纯代码"])]
     out["open_premium"] = (pd.to_numeric(out["next_open"], errors="coerce") / out["最新价"] - 1) * 100
+    future_dates = {
+        day: trading_dates[index + 1 : index + 4]
+        for index, day in enumerate(trading_dates)
+        if index + 1 < len(trading_dates)
+    }
+    out["t3_exit_date"] = out["date"].map(lambda day: future_dates.get(str(day), [None])[-1] if len(future_dates.get(str(day), [])) == 3 else None)
+    future_highs: list[float] = []
+    for day, code in zip(out["date"], out["纯代码"]):
+        candidate_dates = future_dates.get(str(day), [])
+        if len(candidate_dates) < 3:
+            future_highs.append(np.nan)
+            continue
+        values = [highs.get((future_day, code), np.nan) for future_day in candidate_dates]
+        numeric = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
+        future_highs.append(float(numeric.max()) if len(numeric) == 3 else np.nan)
+    out["t3_max_high"] = future_highs
+    out["t3_max_gain_pct"] = (pd.to_numeric(out["t3_max_high"], errors="coerce") / out["最新价"] - 1) * 100
     return out
 
 
@@ -193,7 +211,7 @@ def _strategy_variants() -> list[dict[str, Any]]:
         },
         {
             "name": "生产风险过滤",
-            "description": f"剔除科创板，叠加成交额豁免、策略独立门槛：突破>={BREAKOUT_MIN_SCORE:.1f}、低吸>={DIPBUY_MIN_SCORE:.1f}，并在阴天/震荡给低吸排序补偿。",
+            "description": f"剔除科创板，叠加成交额豁免、策略独立门槛：突破>={BREAKOUT_MIN_SCORE:.1f}、低吸>={DIPBUY_MIN_SCORE:.1f}、反转>={REVERSAL_MIN_SCORE:.1f}%，并在阴天/震荡给低吸排序补偿。",
             "filter": lambda df: apply_production_filters(df),
         },
         {
@@ -271,12 +289,16 @@ def _daily_pick_rows(df: pd.DataFrame, limit: int) -> list[dict[str, Any]]:
     picks = _daily_top(df).sort_values("date", ascending=False).head(limit)
     rows = []
     for _, row in picks.iterrows():
+        strategy_type = str(row.get("strategy_type", "尾盘突破"))
+        t3_gain = row.get("t3_max_gain_pct")
+        open_premium = row.get("open_premium")
+        success = bool(t3_gain > 0) if strategy_type in {"中线超跌反转", "右侧主升浪"} and pd.notna(t3_gain) else (bool(open_premium > PROFIT_TARGET_PCT) if pd.notna(open_premium) else None)
         rows.append(
             {
                 "date": str(row["date"]),
                 "code": str(row["纯代码"]),
                 "name": str(row["名称"]),
-                "strategy_type": str(row.get("strategy_type", "尾盘突破")),
+                "strategy_type": strategy_type,
                 "win_rate": round(float(row["AI胜率"]), 4),
                 "expected_premium": round(float(row["预期溢价"]), 4),
                 "risk_score": round(float(row["风险评分"]), 4),
@@ -284,9 +306,11 @@ def _daily_pick_rows(df: pd.DataFrame, limit: int) -> list[dict[str, Any]]:
                 "composite_score": round(float(row["综合评分"]), 4),
                 "close": round(float(row["最新价"]), 4),
                 "next_date": str(row["next_date"]) if pd.notna(row["next_date"]) else None,
+                "t3_exit_date": str(row["t3_exit_date"]) if pd.notna(row.get("t3_exit_date")) else None,
                 "next_open": round(float(row["next_open"]), 4) if pd.notna(row["next_open"]) else None,
                 "open_premium": round(float(row["open_premium"]), 4) if pd.notna(row["open_premium"]) else None,
-                "success": bool(row["open_premium"] > PROFIT_TARGET_PCT) if pd.notna(row["open_premium"]) else None,
+                "t3_max_gain_pct": round(float(row["t3_max_gain_pct"]), 4) if pd.notna(row.get("t3_max_gain_pct")) else None,
+                "success": success,
             }
         )
     return rows

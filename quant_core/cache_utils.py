@@ -7,11 +7,19 @@ from typing import Any
 
 import pandas as pd
 
-from .config import BASE_DIR, BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE, DIPBUY_PREMIUM_MODEL_PATH, PREMIUM_MODEL_PATH
+from .config import (
+    BASE_DIR,
+    BREAKOUT_MIN_SCORE,
+    DIPBUY_MIN_SCORE,
+    DIPBUY_PREMIUM_MODEL_PATH,
+    PREMIUM_MODEL_PATH,
+    REVERSAL_MIN_SCORE,
+    REVERSAL_MODEL_PATH,
+)
 from .storage import database_overview
 
 
-CACHE_VERSION = "strategy-cache-v11-dipbuy-shadow-mode"
+CACHE_VERSION = "strategy-cache-v13-reversal-pressure-filter"
 CACHE_DIR = BASE_DIR / "data" / "strategy_cache"
 
 
@@ -24,8 +32,10 @@ def strategy_cache_signature(months: int) -> dict[str, Any]:
         "rows_count": overview.get("rows_count"),
         "breakout_min_score": BREAKOUT_MIN_SCORE,
         "dipbuy_min_score": DIPBUY_MIN_SCORE,
+        "reversal_min_score": REVERSAL_MIN_SCORE,
         "premium_model_mtime": _mtime(PREMIUM_MODEL_PATH),
         "dipbuy_model_mtime": _mtime(DIPBUY_PREMIUM_MODEL_PATH),
+        "reversal_model_mtime": _mtime(REVERSAL_MODEL_PATH),
     }
 
 

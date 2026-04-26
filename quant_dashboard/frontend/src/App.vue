@@ -100,7 +100,7 @@
               <tr v-for="row in radar.rows" :key="row.code">
                 <td class="mono">{{ row.code }}</td>
                 <td>{{ row.name }}</td>
-                <td><span :class="strategyBadgeClass(row.strategy_type)">{{ row.strategy_type || '尾盘突破' }}</span></td>
+                <td><span :class="strategyBadgeClass(row.strategy_type)">{{ strategyBadgeText(row.strategy_type) }}</span></td>
                 <td class="num">{{ money(row.price) }}</td>
                 <td :class="['num', row.change >= 0 ? 'up' : 'down']">{{ pct(row.change) }}</td>
                 <td class="num">{{ pct(row.turnover) }}</td>
@@ -182,12 +182,12 @@
           <thead>
             <tr>
               <th>保存日</th>
-              <th>目标开盘日</th>
+              <th>目标/观察日</th>
               <th>股票</th>
               <th class="num">收益信号</th>
               <th class="num">保存价</th>
-              <th class="num">开盘价</th>
-              <th class="num">开盘溢价</th>
+              <th class="num">开盘/持仓</th>
+              <th class="num">收益口径</th>
               <th>结果</th>
             </tr>
           </thead>
@@ -197,16 +197,19 @@
             </tr>
             <tr v-for="pick in dailyPicks.rows" :key="pick.id">
               <td>{{ pick.selection_date }}</td>
-              <td>{{ pick.target_date }}</td>
+              <td>{{ tradeExitDateText(pick) }}</td>
               <td>
                 <span class="mono">{{ pick.code }}</span> {{ pick.name }}
-                <span :class="strategyBadgeClass(pick.strategy_type)">{{ pick.strategy_type || '尾盘突破' }}</span>
+                <span :class="strategyBadgeClass(pick.strategy_type)">{{ strategyBadgeText(pick.strategy_type) }}</span>
               </td>
               <td class="num score">{{ pct(pick.win_rate) }}</td>
               <td class="num">{{ money(pick.selection_price) }}</td>
-              <td class="num">{{ pick.open_price ? money(pick.open_price) : '-' }}</td>
-              <td :class="['num', Number(pick.open_premium) >= 0 ? 'up' : 'down']">
-                {{ pick.open_premium === null || pick.open_premium === undefined ? '-' : pct(pick.open_premium) }}
+              <td class="num">{{ exitPriceText(pick) }}</td>
+              <td :class="['num', resultPremiumClass(pick)]">
+                <span class="metric-stack">
+                  <small>{{ resultPremiumLabel(pick) }}</small>
+                  <strong>{{ resultPremiumText(pick) }}</strong>
+                </span>
               </td>
               <td>
                 <strong v-if="pick.status === 'pending_open'" class="pending">待开盘</strong>
@@ -244,7 +247,7 @@
 
           <div class="shadow-compare">
             <div class="shadow-side">
-              <span>14:50 预期</span>
+              <span>{{ shadowExpectedLabel(pick) }}</span>
               <strong :class="Number(expectedPremium(pick)) >= 0 ? 'up' : 'down'">{{ pct(expectedPremium(pick)) }}</strong>
               <div class="premium-track">
                 <i :class="premiumBarClass(expectedPremium(pick))" :style="premiumBarStyle(expectedPremium(pick))"></i>
@@ -264,10 +267,11 @@
 
           <footer>
             <span :class="precisionBadgeClass(pick)">{{ precisionBadgeText(pick) }}</span>
-            <span>误差 {{ premiumErrorText(pick) }}</span>
+            <span v-if="!isSwingStrategy(pick)">误差 {{ premiumErrorText(pick) }}</span>
+            <span v-else>波段持仓等待结算</span>
             <span>综合评分 {{ scoreText(pick.composite_score) }}</span>
           </footer>
-          <p class="shadow-instruction">{{ pick.exit_instruction || '等待 09:26 哨兵生成操作指令' }}</p>
+          <p class="shadow-instruction">{{ shadowInstructionText(pick) }}</p>
         </article>
       </div>
     </section>
@@ -308,7 +312,7 @@
               <th class="num">收盘买入</th>
               <th>卖出日</th>
               <th class="num">开盘卖出</th>
-              <th class="num">开盘溢价</th>
+              <th class="num">收益口径</th>
               <th>结果</th>
             </tr>
           </thead>
@@ -320,16 +324,19 @@
               <td>{{ row.date }}</td>
               <td>
                 <span class="mono">{{ row.code }}</span> {{ row.name }}
-                <span :class="strategyBadgeClass(row.strategy_type)">{{ row.strategy_type || '尾盘突破' }}</span>
+                <span :class="strategyBadgeClass(row.strategy_type)">{{ strategyBadgeText(row.strategy_type) }}</span>
               </td>
               <td class="num score">{{ pct(row.win_rate) }}</td>
               <td :class="['num', Number(row.expected_premium) >= 0 ? 'up' : 'down']">{{ pct(row.expected_premium) }}</td>
               <td class="num score">{{ scoreText(row.composite_score) }}</td>
               <td class="num">{{ money(row.close) }}</td>
-              <td>{{ row.next_date || '-' }}</td>
-              <td class="num">{{ row.next_open ? money(row.next_open) : '-' }}</td>
-              <td :class="['num', Number(row.open_premium) >= 0 ? 'up' : 'down']">
-                {{ row.open_premium === null || row.open_premium === undefined ? '-' : pct(row.open_premium) }}
+              <td>{{ tradeExitDateText(row) }}</td>
+              <td class="num">{{ exitPriceText(row) }}</td>
+              <td :class="['num', resultPremiumClass(row)]">
+                <span class="metric-stack">
+                  <small>{{ resultPremiumLabel(row) }}</small>
+                  <strong>{{ resultPremiumText(row) }}</strong>
+                </span>
               </td>
               <td>
                 <strong v-if="row.success === null" class="pending">待开盘</strong>
@@ -356,7 +363,7 @@
               <th>策略</th>
               <th class="num">预期溢价</th>
               <th class="num">综合评分</th>
-              <th class="num">实际开盘</th>
+              <th class="num">实际结果</th>
               <th>结果</th>
             </tr>
           </thead>
@@ -367,11 +374,14 @@
             <tr v-for="row in backtest.strategy_rows" :key="`${row.date}-${row.strategy_type}-${row.code}`">
               <td>{{ row.date }}</td>
               <td><span class="mono">{{ row.code }}</span> {{ row.name }}</td>
-              <td><span :class="strategyBadgeClass(row.strategy_type)">{{ row.strategy_type || '尾盘突破' }}</span></td>
+              <td><span :class="strategyBadgeClass(row.strategy_type)">{{ strategyBadgeText(row.strategy_type) }}</span></td>
               <td :class="['num', Number(row.expected_premium) >= 0 ? 'up' : 'down']">{{ pct(row.expected_premium) }}</td>
               <td class="num score">{{ scoreText(row.composite_score) }}</td>
-              <td :class="['num', Number(row.open_premium) >= 0 ? 'up' : 'down']">
-                {{ row.open_premium === null || row.open_premium === undefined ? '-' : pct(row.open_premium) }}
+              <td :class="['num', resultPremiumClass(row)]">
+                <span class="metric-stack">
+                  <small>{{ resultPremiumLabel(row) }}</small>
+                  <strong>{{ resultPremiumText(row) }}</strong>
+                </span>
               </td>
               <td>
                 <strong v-if="row.success === null" class="pending">待开盘</strong>
@@ -851,10 +861,55 @@ const busy = reactive({
 const money = (value) => Number(value ?? 0).toFixed(2)
 const pct = (value) => `${Number(value ?? 0).toFixed(2)}%`
 const scoreText = (value) => Number(value ?? 0).toFixed(2)
+const strategyBadgeText = (strategyType) => (
+  strategyType === '中线超跌反转'
+    ? '⏳ 中线超跌反转'
+    : strategyType === '右侧主升浪'
+      ? '🚀 顺势主升浪'
+      : (strategyType || '尾盘突破')
+)
 const strategyBadgeClass = (strategyType) => [
   'strategy-badge',
-  strategyType === '首阴低吸' ? 'strategy-badge-dipbuy' : 'strategy-badge-breakout',
+  strategyType === '中线超跌反转'
+    ? 'strategy-badge-reversal'
+    : strategyType === '右侧主升浪'
+      ? 'strategy-badge-main-wave'
+    : strategyType === '首阴低吸'
+      ? 'strategy-badge-dipbuy'
+      : 'strategy-badge-breakout',
 ]
+const isReversalStrategy = (row) => (row?.strategy_type || row) === '中线超跌反转'
+const isMainWaveStrategy = (row) => (row?.strategy_type || row) === '右侧主升浪'
+const isSwingStrategy = (row) => isReversalStrategy(row) || isMainWaveStrategy(row)
+const resultPremiumValue = (row) => {
+  if (!row) return null
+  const value = isSwingStrategy(row) ? row.t3_max_gain_pct : row.open_premium
+  return value === null || value === undefined ? null : Number(value)
+}
+const resultPremiumLabel = (row) => (isSwingStrategy(row) ? 'T+3最大涨幅' : 'T+1开盘溢价')
+const resultPremiumText = (row) => {
+  const value = resultPremiumValue(row)
+  return value === null || Number.isNaN(value) ? '-' : pct(value)
+}
+const resultPremiumClass = (row) => {
+  const value = resultPremiumValue(row)
+  if (value === null || Number.isNaN(value)) return ''
+  return value >= 0 ? 'up' : 'down'
+}
+const tradeExitDateText = (row) => {
+  if (!row) return '-'
+  if (isSwingStrategy(row)) {
+    const date = row.t3_exit_date || row.target_date
+    return date ? `${date} · T+3观察期` : 'T+3观察期'
+  }
+  return row.next_date || row.target_date || '-'
+}
+const exitPriceText = (row) => {
+  if (!row) return '-'
+  if (isSwingStrategy(row)) return '波段持仓'
+  const price = row.next_open ?? row.open_price
+  return price ? money(price) : '-'
+}
 const strategyCountsText = (counts) => {
   if (!counts || Object.keys(counts).length === 0) return '-'
   return Object.entries(counts).map(([name, count]) => `${name} ${count}`).join(' / ')
@@ -902,12 +957,18 @@ const radarEmptyReason = computed(() => {
   }
   return '暂无预测数据，点击“实时预测”获取最新候选池。'
 })
-const expectedPremium = (pick) => Number(pick.expected_premium ?? pick.predicted_open_premium ?? 0)
+const expectedPremium = (pick) => Number(
+  isSwingStrategy(pick)
+    ? (pick.expected_t3_max_gain_pct ?? pick.expected_premium ?? pick.predicted_open_premium ?? 0)
+    : (pick.expected_premium ?? pick.predicted_open_premium ?? 0),
+)
+const shadowExpectedLabel = (pick) => (isSwingStrategy(pick) ? '14:50 T+3预期' : '14:50 预期')
 const actualPremium = (pick) => {
   if (pick.open_premium === null || pick.open_premium === undefined) return null
   return Number(pick.open_premium)
 }
 const premiumError = (pick) => {
+  if (isSwingStrategy(pick)) return null
   const actual = actualPremium(pick)
   if (actual === null) return null
   return Math.abs(actual - expectedPremium(pick))
@@ -917,18 +978,34 @@ const premiumErrorText = (pick) => {
   return value === null ? '-' : pct(value)
 }
 const precisionBadgeText = (pick) => {
+  if (isSwingStrategy(pick)) return '波段持仓等待结算'
   const value = premiumError(pick)
   if (value === null) return '等待回填'
   return value < 1 ? '外推精准' : '偏差过大'
 }
 const precisionBadgeClass = (pick) => [
   'precision-badge',
-  premiumError(pick) === null ? 'precision-pending' : premiumError(pick) < 1 ? 'precision-good' : 'precision-bad',
+  isSwingStrategy(pick)
+    ? 'precision-pending'
+    : premiumError(pick) === null
+      ? 'precision-pending'
+      : premiumError(pick) < 1
+        ? 'precision-good'
+        : 'precision-bad',
 ]
-const exitActionText = (pick) => pick.exit_action || (actualPremium(pick) === null ? '待审判' : '落袋为安')
+const exitActionText = (pick) => {
+  const actual = actualPremium(pick)
+  if (isSwingStrategy(pick)) {
+    if (actual === null) return '待审判'
+    return actual < -4 ? '破位核按钮' : '静默洗盘'
+  }
+  return pick.exit_action || (actual === null ? '待审判' : '落袋为安')
+}
 const exitActionClass = (pick) => [
   'exit-tag',
-  pick.exit_level === 'danger' || exitActionText(pick) === '核按钮'
+  isSwingStrategy(pick) && exitActionText(pick) === '静默洗盘'
+    ? 'exit-silent'
+    : pick.exit_level === 'danger' || ['核按钮', '破位核按钮'].includes(exitActionText(pick))
     ? 'exit-danger'
     : pick.exit_level === 'strong' || exitActionText(pick) === '超预期锁仓'
       ? 'exit-strong'
@@ -936,6 +1013,15 @@ const exitActionClass = (pick) => [
         ? 'exit-pending'
         : 'exit-profit',
 ]
+const shadowInstructionText = (pick) => {
+  const actual = actualPremium(pick)
+  if (isSwingStrategy(pick)) {
+    if (actual === null) return '等待 09:26 哨兵回填开盘波动，并等待 14:45 波段巡逻兵指令。'
+    if (actual < -4) return '遭遇极端低开下杀，洗盘过度逻辑破位，按跌停价挂单斩断亏损！'
+    return '开盘波动在正常洗盘区间 (>-4%)，保持静默，等待 14:45 波段巡逻兵指令。'
+  }
+  return pick.exit_instruction || '等待 09:26 哨兵生成操作指令'
+}
 const premiumBarClass = (value) => ['premium-bar', Number(value) >= 0 ? 'premium-bar-up' : 'premium-bar-down']
 const premiumBarStyle = (value) => ({
   width: `${Math.min(Math.max(Math.abs(Number(value ?? 0)) * 18, 4), 100)}%`,
@@ -1530,6 +1616,26 @@ tbody tr:hover {
   text-align: right;
 }
 
+.metric-stack {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.metric-stack small {
+  margin: 0;
+  color: #66758c;
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.metric-stack strong {
+  font-size: 0.92rem;
+}
+
 .mono {
   font-family: 'SF Mono', Menlo, monospace;
 }
@@ -1556,6 +1662,7 @@ tbody tr:hover {
 .pill {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   min-height: 24px;
   padding: 3px 8px;
   border: 1px solid #c9d3e1;
@@ -1570,6 +1677,7 @@ tbody tr:hover {
 .strategy-badge {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   min-height: 22px;
   margin-left: 6px;
   padding: 2px 8px;
@@ -1592,6 +1700,18 @@ tbody tr:hover {
   border-color: #fed7aa;
   background: #ffedd5;
   color: #9a3412;
+}
+
+.strategy-badge-reversal {
+  border-color: #fecaca;
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.strategy-badge-main-wave {
+  border-color: #ddd6fe;
+  background: #f5f3ff;
+  color: #6d28d9;
 }
 
 .shadow-grid {
@@ -1713,6 +1833,12 @@ tbody tr:hover {
   border-color: #bbf7d0;
   background: #dcfce7;
   color: #166534;
+}
+
+.exit-silent {
+  border-color: #bfdbfe;
+  background: #e0f2fe;
+  color: #075985;
 }
 
 .exit-strong {
@@ -2006,6 +2132,18 @@ pre {
     color: #fed7aa;
   }
 
+  .strategy-badge-reversal {
+    border-color: #f87171;
+    background: #450a0a;
+    color: #fecaca;
+  }
+
+  .strategy-badge-main-wave {
+    border-color: #a78bfa;
+    background: #2e1065;
+    color: #ddd6fe;
+  }
+
   .precision-good,
   .exit-profit {
     border-color: #22c55e;
@@ -2026,6 +2164,12 @@ pre {
     border-color: #fb923c;
     background: #431407;
     color: #fed7aa;
+  }
+
+  .exit-silent {
+    border-color: #38bdf8;
+    background: #082f49;
+    color: #bae6fd;
   }
 }
 

@@ -11,6 +11,8 @@ SQLITE_PATH = Path(os.getenv("QUANT_SQLITE_PATH", str(CORE_DB_DIR / "quant_works
 MODEL_PATH = Path(os.getenv("QUANT_MODEL_PATH", str(BASE_DIR / "overnight_xgboost.json")))
 PREMIUM_MODEL_PATH = Path(os.getenv("QUANT_PREMIUM_MODEL_PATH", str(BASE_DIR / "overnight_premium_xgboost.json")))
 DIPBUY_PREMIUM_MODEL_PATH = Path(os.getenv("QUANT_DIPBUY_PREMIUM_MODEL_PATH", str(BASE_DIR / "dipbuy_premium_xgboost.json")))
+REVERSAL_MODEL_PATH = Path(os.getenv("QUANT_REVERSAL_MODEL_PATH", str(BASE_DIR / "reversal_t3_xgboost.json")))
+MAIN_WAVE_MODEL_PATH = Path(os.getenv("QUANT_MAIN_WAVE_MODEL_PATH", str(BASE_DIR / "main_wave_t3_xgboost.json")))
 LATEST_TOP50_PATH = Path(os.getenv("QUANT_LATEST_TOP50", str(BASE_DIR / "latest_top_50.json")))
 INTRADAY_SNAPSHOT_PATH = Path(os.getenv("QUANT_INTRADAY_SNAPSHOT_PATH", str(BASE_DIR / "data" / "intraday" / "price_1430.json")))
 OLLAMA_API = os.getenv("OLLAMA_API", "http://127.0.0.1:11434/api/generate")
@@ -20,6 +22,8 @@ PROFIT_TARGET_PCT = float(os.getenv("QUANT_PROFIT_TARGET_PCT", "1.00"))
 BREAKOUT_HIGH_TARGET_PCT = float(os.getenv("QUANT_BREAKOUT_HIGH_TARGET_PCT", "2.00"))
 BREAKOUT_MIN_SCORE = float(os.getenv("QUANT_BREAKOUT_MIN_SCORE", os.getenv("QUANT_MIN_COMPOSITE_SCORE", "65.50")))
 DIPBUY_MIN_SCORE = float(os.getenv("QUANT_DIPBUY_MIN_SCORE", "99.00"))
+REVERSAL_MIN_SCORE = float(os.getenv("QUANT_REVERSAL_MIN_SCORE", "6.00"))
+MAIN_WAVE_MIN_SCORE = float(os.getenv("QUANT_MAIN_WAVE_MIN_SCORE", "6.60"))
 MIN_COMPOSITE_SCORE = BREAKOUT_MIN_SCORE
 LATE_PULL_TRAP_THRESHOLD_PCT = float(os.getenv("QUANT_LATE_PULL_TRAP_THRESHOLD_PCT", "4.00"))
 

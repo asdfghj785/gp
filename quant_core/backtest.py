@@ -8,10 +8,13 @@ from typing import Any
 
 import pandas as pd
 
-from .config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE
+from .config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE, MAIN_WAVE_MIN_SCORE, REVERSAL_MIN_SCORE
 from .market import fetch_sina_snapshot
 from .predictor import PROFIT_TARGET_PCT, apply_production_filters, build_features, score_candidates
 from .storage import connect, init_db
+
+
+SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪"}
 
 
 def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, Any]:
@@ -47,6 +50,10 @@ def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, 
     evaluated = [row for row in results if row["success"] is not None]
     wins = [row for row in evaluated if row["success"]]
     premiums = [float(row["open_premium"]) for row in evaluated if row["open_premium"] is not None]
+    reversal_rows = [row for row in results if row.get("strategy_type") == "中线超跌反转" and row.get("t3_max_gain_pct") is not None]
+    reversal_gains = [float(row["t3_max_gain_pct"]) for row in reversal_rows]
+    main_wave_rows = [row for row in results if row.get("strategy_type") == "右侧主升浪" and row.get("t3_max_gain_pct") is not None]
+    main_wave_gains = [float(row["t3_max_gain_pct"]) for row in main_wave_rows]
     strategy_counts = pd.Series([row.get("strategy_type", "尾盘突破") for row in results]).value_counts().to_dict()
     summary = {
         "months": months,
@@ -61,13 +68,19 @@ def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, 
         "strategy_counts": {str(key): int(value) for key, value in strategy_counts.items()},
         "candidate_strategy_counts": {str(key): int(value) for key, value in candidate_strategy_counts.items()},
         "avg_open_premium": round(float(pd.Series(premiums).mean()), 4) if premiums else 0.0,
+        "reversal_trade_count": len(reversal_rows),
+        "reversal_t3_win_rate": round(float((pd.Series(reversal_gains) > 0).mean() * 100), 4) if reversal_gains else 0.0,
+        "reversal_avg_t3_max_gain_pct": round(float(pd.Series(reversal_gains).mean()), 4) if reversal_gains else 0.0,
+        "main_wave_trade_count": len(main_wave_rows),
+        "main_wave_t3_win_rate": round(float((pd.Series(main_wave_gains) > 0).mean() * 100), 4) if main_wave_gains else 0.0,
+        "main_wave_avg_t3_max_gain_pct": round(float(pd.Series(main_wave_gains).mean()), 4) if main_wave_gains else 0.0,
         "median_open_premium": round(float(pd.Series(premiums).median()), 4) if premiums else 0.0,
         "best_open_premium": round(max(premiums), 4) if premiums else 0.0,
         "worst_open_premium": round(min(premiums), 4) if premiums else 0.0,
         "model_status": prepared["model_status"],
         "repaired_pre_close_count": prepared["repaired_pre_close_count"],
         "repaired_volume_ratio_count": prepared["repaired_volume_ratio_count"],
-        "rule": f"生产策略复盘：排除周末、节假日、非完整交易日、创业板、北交所、科创板、ST/退市；大盘风控采用晴天/震荡/阴天/雷暴分级，尾盘突破综合评分>={BREAKOUT_MIN_SCORE:.1f}，首阴低吸综合评分>={DIPBUY_MIN_SCORE:.1f}；阴天/震荡时首阴低吸排序补偿10分；雷暴或大盘下跌且缩量时空仓；过滤涨幅>=7%、上影>=2%、预期溢价<=0、高位爆量、尾盘诱多、近3日断头铡刀。停盘前最后一个交易日按排序评分选第一名，停盘后第一个交易日开盘卖出；扣除滑点费率后的有效成功阈值为开盘溢价>{PROFIT_TARGET_PCT:.2f}%。",
+        "rule": f"生产策略复盘：排除周末、节假日、非完整交易日、创业板、北交所、科创板、ST/退市；大盘风控采用晴天/震荡/阴天/雷暴分级，尾盘突破综合评分>={BREAKOUT_MIN_SCORE:.1f}，首阴低吸综合评分>={DIPBUY_MIN_SCORE:.1f}，中线超跌反转预期T+3最大涨幅>={REVERSAL_MIN_SCORE:.1f}%，右侧主升浪预期T+3最大涨幅>={MAIN_WAVE_MIN_SCORE:.1f}%；阴天/震荡时首阴低吸排序补偿10分；雷暴或大盘下跌且缩量时空仓；过滤高位爆量、尾盘诱多，突破额外过滤涨幅>=7%、上影>=2%、近3日断头铡刀。停盘前最后一个交易日按排序评分选第一名，短线策略按次日开盘卖出，波段策略统计T+3最大区间涨幅。",
         "trading_day_filter": "weekday<5 且全市场有效样本>=1000 且成交额>0。",
         "rank_rule": f"XGBRegressor 直接预测次日开盘预期溢价；突破与低吸使用独立准入门槛，最终按排序评分选择 Top1；排序评分=原始综合评分+阴天/震荡低吸情绪补偿分，原始综合评分仍独立展示。",
     }
@@ -76,12 +89,15 @@ def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, 
 
 def _backtest_row(pick: pd.Series, current_close: float, next_open: float | None, premium: float | None) -> dict[str, Any]:
     code = str(pick["纯代码"])
+    strategy_type = str(pick.get("strategy_type", "尾盘突破"))
+    t3_gain = float(pick["t3_max_gain_pct"]) if pd.notna(pick.get("t3_max_gain_pct")) else None
+    success = (t3_gain > 0) if strategy_type in SWING_STRATEGY_TYPES and t3_gain is not None else (premium > PROFIT_TARGET_PCT if premium is not None else None)
     return {
         "date": str(pick["date"]),
         "code": code,
         "name": _display_name(code, pick.get("名称")),
         "name_source": str(pick.get("name_source", "unknown")),
-        "strategy_type": str(pick.get("strategy_type", "尾盘突破")),
+        "strategy_type": strategy_type,
         "win_rate": round(float(pick["AI胜率"]), 4),
         "close": round(current_close, 4),
         "change": round(float(pick["涨跌幅"]), 4),
@@ -95,9 +111,11 @@ def _backtest_row(pick: pd.Series, current_close: float, next_open: float | None
         "sentiment_bonus": round(float(pick.get("情绪补偿分", 0)), 4),
         "market_gate_mode": str(pick.get("market_gate_mode", "")),
         "next_date": str(pick.get("next_date")) if pd.notna(pick.get("next_date")) else None,
+        "t3_exit_date": str(pick.get("t3_exit_date")) if pd.notna(pick.get("t3_exit_date")) else None,
         "next_open": round(next_open, 4) if next_open is not None else None,
         "open_premium": round(premium, 4) if premium is not None else None,
-        "success": premium > PROFIT_TARGET_PCT if premium is not None else None,
+        "t3_max_gain_pct": round(t3_gain, 4) if t3_gain is not None else None,
+        "success": success,
     }
 
 
