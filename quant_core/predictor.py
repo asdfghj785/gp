@@ -84,6 +84,12 @@ BREAKOUT_STRATEGY_TYPE = "尾盘突破"
 REVERSAL_STRATEGY_TYPE = "中线超跌反转"
 MAIN_WAVE_STRATEGY_TYPE = "右侧主升浪"
 SWING_STRATEGY_TYPES = {REVERSAL_STRATEGY_TYPE, MAIN_WAVE_STRATEGY_TYPE}
+STRATEGY_PRIORITY = {
+    MAIN_WAVE_STRATEGY_TYPE: 3,
+    REVERSAL_STRATEGY_TYPE: 2,
+    BREAKOUT_STRATEGY_TYPE: 1,
+    DIPBUY_STRATEGY_TYPE: 0,
+}
 REVERSAL_FEATURE_COLS = [
     "body_pct",
     "upper_shadow_pct",
@@ -525,6 +531,7 @@ def apply_strategy_sort_score(df: pd.DataFrame, gate: dict[str, Any] | None = No
     scored["情绪补偿分"] = bonus
     scored["排序评分"] = (base_score + bonus).clip(0, 110)
     scored.loc[is_swing, "排序评分"] = (50 + _num(scored.loc[is_swing], "综合评分").clip(-5, 15) * 5).clip(0, 110)
+    scored["策略优先级"] = scored["strategy_type"].map(STRATEGY_PRIORITY).fillna(1).astype(float)
     scored["market_gate_mode"] = modes
     return scored
 
@@ -605,7 +612,7 @@ def scan_market(
         if cache_prediction:
             LATEST_TOP50_PATH.write_text(json.dumps([], ensure_ascii=False, indent=2), encoding="utf-8")
         return payload
-    df = df.sort_values(["排序评分", "预期溢价", "综合评分"], ascending=[False, False, False]).head(final_limit)
+    df = df.sort_values(["策略优先级", "排序评分", "预期溢价", "综合评分"], ascending=[False, False, False, False]).head(final_limit)
     rows = [_row_to_api(row) for _, row in df.iterrows()]
     snapshot_id = save_prediction_snapshot("quad_xgboost_regressor" if "regressor_ready" in model_status else "rule_fallback", rows) if cache_prediction else None
     payload = {

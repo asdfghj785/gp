@@ -106,9 +106,12 @@ def _daily_strategy_top(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     if "排序评分" not in df.columns:
         df["排序评分"] = (50 + pd.to_numeric(df["综合评分"], errors="coerce").fillna(0).clip(-5, 15) * 5).clip(0, 110)
-    sorted_df = df.sort_values(["date", "排序评分", "预期溢价", "综合评分"], ascending=[True, False, False, False])
-    idx = sorted_df.groupby("date")["排序评分"].idxmax()
-    return sorted_df.loc[idx].sort_values("date").copy()
+    sort_cols = ["date"]
+    if "策略优先级" in df.columns:
+        sort_cols.append("策略优先级")
+    sort_cols.extend(["排序评分", "预期溢价", "综合评分"])
+    sorted_df = df.sort_values(sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1))
+    return sorted_df.drop_duplicates("date", keep="first").sort_values("date").copy()
 
 
 def _max_losing_streak(wins: list[bool]) -> int:

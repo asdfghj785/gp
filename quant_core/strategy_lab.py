@@ -252,10 +252,12 @@ def _threshold_stats(df: pd.DataFrame, threshold: int) -> dict[str, Any]:
 def _daily_top(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    sort_cols = ["date", "排序评分", "预期溢价", "综合评分"] if "排序评分" in df.columns else ["date", "预期溢价", "综合评分"]
-    idx_col = "排序评分" if "排序评分" in df.columns else "预期溢价"
-    idx = df.sort_values(sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1)).groupby("date")[idx_col].idxmax()
-    return df.loc[idx].sort_values("date").copy()
+    sort_cols = ["date"]
+    if "策略优先级" in df.columns:
+        sort_cols.append("策略优先级")
+    sort_cols.extend(["排序评分", "预期溢价", "综合评分"] if "排序评分" in df.columns else ["预期溢价", "综合评分"])
+    sorted_df = df.sort_values(sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1))
+    return sorted_df.drop_duplicates("date", keep="first").sort_values("date").copy()
 
 
 def _stats_row(name: str, description: str, picks: pd.DataFrame) -> dict[str, Any]:

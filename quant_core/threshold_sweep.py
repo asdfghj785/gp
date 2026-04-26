@@ -143,9 +143,12 @@ def _apply_variable_score_gate(df: pd.DataFrame, breakout_threshold: float) -> p
 def _daily_top(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    sort_cols = ["date", "排序评分", "预期溢价", "综合评分"]
-    idx = df.sort_values(sort_cols, ascending=[True, False, False, False]).groupby("date")["排序评分"].idxmax()
-    return df.loc[idx].sort_values("date").copy()
+    sort_cols = ["date"]
+    if "策略优先级" in df.columns:
+        sort_cols.append("策略优先级")
+    sort_cols.extend(["排序评分", "预期溢价", "综合评分"])
+    sorted_df = df.sort_values(sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1))
+    return sorted_df.drop_duplicates("date", keep="first").sort_values("date").copy()
 
 
 def _max_loss_streak(success: list[bool]) -> int:

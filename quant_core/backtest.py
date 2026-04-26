@@ -34,9 +34,11 @@ def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, 
         result["summary"]["candidate_strategy_counts"] = {str(key): int(value) for key, value in candidate_strategy_counts.items()}
         return result
 
-    feature_df = feature_df.sort_values(["date", "排序评分", "预期溢价", "综合评分"], ascending=[True, False, False, False])
-    idx = feature_df.groupby("date")["排序评分"].idxmax()
-    picks = feature_df.loc[idx].sort_values("date").copy()
+    feature_df = feature_df.sort_values(
+        ["date", "策略优先级", "排序评分", "预期溢价", "综合评分"],
+        ascending=[True, False, False, False, False],
+    )
+    picks = feature_df.drop_duplicates("date", keep="first").sort_values("date").copy()
 
     results: list[dict[str, Any]] = []
     for _, pick in picks.iterrows():

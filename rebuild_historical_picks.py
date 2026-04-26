@@ -30,9 +30,11 @@ def rebuild_historical_picks(months: int = 12) -> dict[str, Any]:
     trading_dates = sorted(evaluated["date"].dropna().astype(str).unique().tolist())
     production_pool = apply_production_filters(evaluated)
     if not production_pool.empty:
-        production_pool = production_pool.sort_values(["date", "排序评分", "预期溢价", "综合评分"], ascending=[True, False, False, False])
-        top_index = production_pool.groupby("date")["排序评分"].idxmax()
-        daily_top = production_pool.loc[top_index].set_index("date", drop=False).sort_index()
+        production_pool = production_pool.sort_values(
+            ["date", "策略优先级", "排序评分", "预期溢价", "综合评分"],
+            ascending=[True, False, False, False, False],
+        )
+        daily_top = production_pool.drop_duplicates("date", keep="first").set_index("date", drop=False).sort_index()
     else:
         daily_top = pd.DataFrame()
 
