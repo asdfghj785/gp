@@ -81,7 +81,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS daily_picks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                selection_date TEXT NOT NULL UNIQUE,
+                selection_date TEXT NOT NULL,
                 target_date TEXT NOT NULL,
                 selected_at TEXT NOT NULL,
                 code TEXT NOT NULL,
@@ -90,6 +90,10 @@ def init_db() -> None:
                 win_rate REAL NOT NULL,
                 selection_price REAL NOT NULL,
                 selection_change REAL,
+                snapshot_time TEXT,
+                snapshot_price REAL,
+                snapshot_vol_ratio REAL,
+                is_shadow_test INTEGER NOT NULL DEFAULT 1,
                 model_status TEXT,
                 status TEXT NOT NULL DEFAULT 'pending_open',
                 open_price REAL,
@@ -128,14 +132,23 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_market_sync_runs_status ON market_sync_runs(status);
             """
         )
+        _ensure_daily_picks_multi_strategy_schema(conn)
         _ensure_column(conn, "daily_picks", "strategy_type", "TEXT NOT NULL DEFAULT '尾盘突破'")
         _ensure_column(conn, "daily_picks", "t3_max_gain_pct", "REAL DEFAULT NULL")
+        _ensure_column(conn, "daily_picks", "snapshot_time", "TEXT")
+        _ensure_column(conn, "daily_picks", "snapshot_price", "REAL")
+        _ensure_column(conn, "daily_picks", "snapshot_vol_ratio", "REAL")
+        _ensure_column(conn, "daily_picks", "is_shadow_test", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "daily_picks", "is_closed", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "daily_picks", "close_date", "TEXT")
         _ensure_column(conn, "daily_picks", "close_price", "REAL")
         _ensure_column(conn, "daily_picks", "close_return_pct", "REAL")
         _ensure_column(conn, "daily_picks", "close_reason", "TEXT")
         _ensure_column(conn, "daily_picks", "close_checked_at", "TEXT")
+        _ensure_column(conn, "daily_picks", "push_sent_at", "TEXT")
+        _ensure_column(conn, "daily_picks", "push_status", "TEXT")
+        _ensure_column(conn, "daily_picks", "push_message_id", "TEXT")
+        _ensure_column(conn, "daily_picks", "push_error", "TEXT")
         conn.execute(
             """
             UPDATE daily_picks
@@ -145,6 +158,43 @@ def init_db() -> None:
                 '尾盘突破'
             )
             WHERE strategy_type IS NULL OR strategy_type = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE daily_picks
+            SET is_shadow_test = 0
+            WHERE json_extract(raw_json, '$.source') = 'historical_production_replay'
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uidx_daily_picks_date_strategy
+            ON daily_picks(selection_date, strategy_type)
+            """
+        )
+        conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_daily_picks_snapshot_time_immutable
+            BEFORE UPDATE OF snapshot_time ON daily_picks
+            WHEN OLD.snapshot_time IS NOT NULL AND NEW.snapshot_time IS NOT OLD.snapshot_time
+            BEGIN
+                SELECT RAISE(ABORT, 'snapshot_time is immutable once written');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_daily_picks_snapshot_price_immutable
+            BEFORE UPDATE OF snapshot_price ON daily_picks
+            WHEN OLD.snapshot_price IS NOT NULL AND NEW.snapshot_price IS NOT OLD.snapshot_price
+            BEGIN
+                SELECT RAISE(ABORT, 'snapshot_price is immutable once written');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_daily_picks_snapshot_vol_ratio_immutable
+            BEFORE UPDATE OF snapshot_vol_ratio ON daily_picks
+            WHEN OLD.snapshot_vol_ratio IS NOT NULL AND NEW.snapshot_vol_ratio IS NOT OLD.snapshot_vol_ratio
+            BEGIN
+                SELECT RAISE(ABORT, 'snapshot_vol_ratio is immutable once written');
+            END;
             """
         )
 
@@ -391,26 +441,37 @@ def save_daily_pick(pick: dict[str, Any]) -> int:
     init_db()
     strategy_type = pick.get("strategy_type") or (pick.get("raw") or {}).get("winner", {}).get("strategy_type") or "尾盘突破"
     t3_max_gain_pct = pick.get("t3_max_gain_pct")
+    selected_at = str(pick["selected_at"])
+    snapshot_time = pick.get("snapshot_time") or (selected_at.split("T", 1)[1] if "T" in selected_at else selected_at)
+    snapshot_price = pick.get("snapshot_price", pick.get("selection_price"))
+    snapshot_vol_ratio = pick.get("snapshot_vol_ratio")
+    if snapshot_vol_ratio is None:
+        snapshot_vol_ratio = (pick.get("raw") or {}).get("winner", {}).get("volume_ratio")
     with connect() as conn:
         cursor = conn.execute(
             """
             INSERT INTO daily_picks (
                 selection_date, target_date, selected_at, code, name, strategy_type, win_rate,
-                selection_price, selection_change, model_status, status, t3_max_gain_pct, raw_json
+                selection_price, selection_change, snapshot_time, snapshot_price, snapshot_vol_ratio,
+                is_shadow_test, model_status, status, t3_max_gain_pct, raw_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(selection_date) DO NOTHING
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(selection_date, strategy_type) DO NOTHING
             """,
             (
                 pick["selection_date"],
                 pick["target_date"],
-                pick["selected_at"],
+                selected_at,
                 pick["code"],
                 pick["name"],
                 strategy_type,
                 pick["win_rate"],
                 pick["selection_price"],
                 pick.get("selection_change"),
+                snapshot_time,
+                snapshot_price,
+                snapshot_vol_ratio,
+                1 if pick.get("is_shadow_test", True) else 0,
                 pick.get("model_status"),
                 pick.get("status", "pending_open"),
                 t3_max_gain_pct,
@@ -430,16 +491,66 @@ def clear_daily_picks() -> int:
     return count
 
 
+def list_unpushed_daily_picks(selection_date: str) -> list[dict[str, Any]]:
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM daily_picks
+            WHERE selection_date = ?
+              AND COALESCE(is_shadow_test, 0) = 1
+              AND COALESCE(push_status, '') != 'sent'
+            ORDER BY strategy_type ASC, id ASC
+            """,
+            (selection_date,),
+        ).fetchall()
+    return [_decode_daily_pick(row) for row in rows if row]
+
+
+def mark_daily_picks_push_result(
+    selection_date: str,
+    status: str,
+    pushed_at: str | None = None,
+    message_id: str | None = None,
+    error: str | None = None,
+    pick_ids: list[int] | None = None,
+) -> int:
+    init_db()
+    timestamp = pushed_at or datetime.now().isoformat(timespec="seconds")
+    params: list[Any] = [status, timestamp if status == "sent" else None, message_id, error, selection_date]
+    where = "selection_date = ? AND COALESCE(is_shadow_test, 0) = 1"
+    if pick_ids:
+        placeholders = ",".join("?" for _ in pick_ids)
+        where += f" AND id IN ({placeholders})"
+        params.extend(int(item) for item in pick_ids)
+    with connect() as conn:
+        cursor = conn.execute(
+            f"""
+            UPDATE daily_picks
+            SET push_status = ?, push_sent_at = COALESCE(?, push_sent_at),
+                push_message_id = ?, push_error = ?
+            WHERE {where}
+            """,
+            tuple(params),
+        )
+        return int(cursor.rowcount or 0)
+
+
 def update_daily_pick_open(
     selection_date: str,
     open_price: float,
     checked_at: str,
     exit_signal: dict[str, Any] | None = None,
     close_position: bool = False,
+    strategy_type: str | None = None,
+    code: str | None = None,
+    pick_id: int | None = None,
 ) -> dict[str, Any] | None:
     init_db()
     with connect() as conn:
-        row = conn.execute("SELECT * FROM daily_picks WHERE selection_date = ?", (selection_date,)).fetchone()
+        where, params = _daily_pick_identity_where(selection_date, strategy_type=strategy_type, code=code, pick_id=pick_id)
+        row = conn.execute(f"SELECT * FROM daily_picks WHERE {where} ORDER BY id LIMIT 1", params).fetchone()
         if not row:
             return None
         item = dict(row)
@@ -456,7 +567,7 @@ def update_daily_pick_open(
                     status = 'open_checked', is_closed = 1, close_date = ?,
                     close_price = ?, close_return_pct = ?, close_reason = ?,
                     close_checked_at = ?, raw_json = ?
-                WHERE selection_date = ?
+                WHERE id = ?
                 """,
                 (
                     open_price,
@@ -469,7 +580,7 @@ def update_daily_pick_open(
                     (exit_signal or {}).get("action") if exit_signal else "开盘闭环",
                     checked_at,
                     json.dumps(raw, ensure_ascii=False),
-                    selection_date,
+                    int(item["id"]),
                 ),
             )
         else:
@@ -477,17 +588,25 @@ def update_daily_pick_open(
                 """
                 UPDATE daily_picks
                 SET open_price = ?, open_checked_at = ?, open_premium = ?, success = ?, status = 'open_checked', raw_json = ?
-                WHERE selection_date = ?
+                WHERE id = ?
                 """,
-                (open_price, checked_at, premium, success, json.dumps(raw, ensure_ascii=False), selection_date),
+                (open_price, checked_at, premium, success, json.dumps(raw, ensure_ascii=False), int(item["id"])),
             )
-    return get_daily_pick(selection_date)
+    return get_daily_pick(selection_date, strategy_type=strategy_type or item.get("strategy_type"), code=code or item.get("code"), pick_id=int(item["id"]))
 
 
-def update_daily_pick_t3_gain(selection_date: str, t3_max_gain_pct: float, checked_at: str | None = None) -> dict[str, Any] | None:
+def update_daily_pick_t3_gain(
+    selection_date: str,
+    t3_max_gain_pct: float,
+    checked_at: str | None = None,
+    strategy_type: str | None = None,
+    code: str | None = None,
+    pick_id: int | None = None,
+) -> dict[str, Any] | None:
     init_db()
     with connect() as conn:
-        row = conn.execute("SELECT * FROM daily_picks WHERE selection_date = ?", (selection_date,)).fetchone()
+        where, params = _daily_pick_identity_where(selection_date, strategy_type=strategy_type, code=code, pick_id=pick_id)
+        row = conn.execute(f"SELECT * FROM daily_picks WHERE {where} ORDER BY id LIMIT 1", params).fetchone()
         if not row:
             return None
         item = dict(row)
@@ -501,11 +620,11 @@ def update_daily_pick_t3_gain(selection_date: str, t3_max_gain_pct: float, check
             """
             UPDATE daily_picks
             SET t3_max_gain_pct = ?, success = ?, status = 't3_checked', raw_json = ?
-            WHERE selection_date = ?
+            WHERE id = ?
             """,
-            (float(t3_max_gain_pct), success, json.dumps(raw, ensure_ascii=False), selection_date),
+            (float(t3_max_gain_pct), success, json.dumps(raw, ensure_ascii=False), int(item["id"])),
         )
-    return get_daily_pick(selection_date)
+    return get_daily_pick(selection_date, strategy_type=strategy_type or item.get("strategy_type"), code=code or item.get("code"), pick_id=int(item["id"]))
 
 
 def mark_daily_pick_closed(
@@ -515,11 +634,15 @@ def mark_daily_pick_closed(
     close_reason: str,
     checked_at: str | None = None,
     close_signal: dict[str, Any] | None = None,
+    strategy_type: str | None = None,
+    code: str | None = None,
+    pick_id: int | None = None,
 ) -> dict[str, Any] | None:
     init_db()
     timestamp = checked_at or datetime.now().isoformat(timespec="seconds")
     with connect() as conn:
-        row = conn.execute("SELECT * FROM daily_picks WHERE selection_date = ?", (selection_date,)).fetchone()
+        where, params = _daily_pick_identity_where(selection_date, strategy_type=strategy_type, code=code, pick_id=pick_id)
+        row = conn.execute(f"SELECT * FROM daily_picks WHERE {where} ORDER BY id LIMIT 1", params).fetchone()
         if not row:
             return None
         item = dict(row)
@@ -533,7 +656,7 @@ def mark_daily_pick_closed(
                 close_date = ?, close_price = ?,
                 close_return_pct = ?, close_reason = ?, close_checked_at = ?,
                 raw_json = ?
-            WHERE selection_date = ?
+            WHERE id = ?
             """,
             (
                 1 if float(close_return_pct) > 0 else 0,
@@ -543,10 +666,10 @@ def mark_daily_pick_closed(
                 close_reason,
                 timestamp,
                 json.dumps(raw, ensure_ascii=False),
-                selection_date,
+                int(item["id"]),
             ),
         )
-    return get_daily_pick(selection_date)
+    return get_daily_pick(selection_date, strategy_type=strategy_type or item.get("strategy_type"), code=code or item.get("code"), pick_id=int(item["id"]))
 
 
 def open_position_picks(today: str | None = None) -> list[dict[str, Any]]:
@@ -593,11 +716,27 @@ def stock_daily_row(code: str, trade_date: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def get_daily_pick(selection_date: str) -> dict[str, Any] | None:
+def get_daily_pick(
+    selection_date: str,
+    strategy_type: str | None = None,
+    code: str | None = None,
+    pick_id: int | None = None,
+) -> dict[str, Any] | None:
     init_db()
     with connect() as conn:
-        row = conn.execute("SELECT * FROM daily_picks WHERE selection_date = ?", (selection_date,)).fetchone()
+        where, params = _daily_pick_identity_where(selection_date, strategy_type=strategy_type, code=code, pick_id=pick_id)
+        row = conn.execute(f"SELECT * FROM daily_picks WHERE {where} ORDER BY id LIMIT 1", params).fetchone()
     return _decode_daily_pick(row)
+
+
+def get_daily_picks(selection_date: str) -> list[dict[str, Any]]:
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM daily_picks WHERE selection_date = ? ORDER BY strategy_type ASC, id ASC",
+            (selection_date,),
+        ).fetchall()
+    return [_decode_daily_pick(row) for row in rows if row]
 
 
 def pending_daily_picks(target_date: str | None = None) -> list[dict[str, Any]]:
@@ -614,10 +753,16 @@ def pending_daily_picks(target_date: str | None = None) -> list[dict[str, Any]]:
     return [_decode_daily_pick(row) for row in rows if row]
 
 
-def latest_daily_picks(limit: int = 10) -> list[dict[str, Any]]:
+def latest_daily_picks(limit: int = 10, shadow_only: bool = False) -> list[dict[str, Any]]:
     init_db()
     with connect() as conn:
-        rows = conn.execute("SELECT * FROM daily_picks ORDER BY selection_date DESC LIMIT ?", (limit,)).fetchall()
+        if shadow_only:
+            rows = conn.execute(
+                "SELECT * FROM daily_picks WHERE COALESCE(is_shadow_test, 0) = 1 ORDER BY selection_date DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM daily_picks ORDER BY selection_date DESC LIMIT ?", (limit,)).fetchall()
     return [_decode_daily_pick(row) for row in rows if row]
 
 
@@ -704,6 +849,82 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
     existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _ensure_daily_picks_multi_strategy_schema(conn: sqlite3.Connection) -> None:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_picks'"
+    ).fetchone()
+    table_sql = str(row["sql"] or "") if row else ""
+    if "selection_date TEXT NOT NULL UNIQUE" not in table_sql:
+        return
+
+    conn.execute("ALTER TABLE daily_picks RENAME TO daily_picks_legacy_single_date")
+    conn.execute(
+        """
+        CREATE TABLE daily_picks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            selection_date TEXT NOT NULL,
+            target_date TEXT NOT NULL,
+            selected_at TEXT NOT NULL,
+            code TEXT NOT NULL,
+            name TEXT NOT NULL,
+            win_rate REAL NOT NULL,
+            selection_price REAL NOT NULL,
+            selection_change REAL,
+            snapshot_time TEXT,
+            snapshot_price REAL,
+            snapshot_vol_ratio REAL,
+            is_shadow_test INTEGER NOT NULL DEFAULT 1,
+            model_status TEXT,
+            status TEXT NOT NULL DEFAULT 'pending_open',
+            open_price REAL,
+            open_checked_at TEXT,
+            open_premium REAL,
+            success INTEGER,
+            raw_json TEXT NOT NULL,
+            strategy_type TEXT NOT NULL DEFAULT '尾盘突破',
+            t3_max_gain_pct REAL DEFAULT NULL,
+            is_closed INTEGER NOT NULL DEFAULT 0,
+            close_date TEXT,
+            close_price REAL,
+            close_return_pct REAL,
+            close_reason TEXT,
+            close_checked_at TEXT
+        )
+        """
+    )
+    old_cols = {row["name"] for row in conn.execute("PRAGMA table_info(daily_picks_legacy_single_date)").fetchall()}
+    new_cols = [row["name"] for row in conn.execute("PRAGMA table_info(daily_picks)").fetchall()]
+    common_cols = [col for col in new_cols if col in old_cols]
+    col_sql = ", ".join(common_cols)
+    conn.execute(
+        f"""
+        INSERT INTO daily_picks ({col_sql})
+        SELECT {col_sql}
+        FROM daily_picks_legacy_single_date
+        """
+    )
+    conn.execute("DROP TABLE daily_picks_legacy_single_date")
+
+
+def _daily_pick_identity_where(
+    selection_date: str,
+    strategy_type: str | None = None,
+    code: str | None = None,
+    pick_id: int | None = None,
+) -> tuple[str, tuple[Any, ...]]:
+    if pick_id is not None:
+        return "id = ?", (int(pick_id),)
+    where = ["selection_date = ?"]
+    params: list[Any] = [selection_date]
+    if strategy_type:
+        where.append("strategy_type = ?")
+        params.append(strategy_type)
+    if code:
+        where.append("code = ?")
+        params.append(str(code).zfill(6))
+    return " AND ".join(where), tuple(params)
 
 
 def save_market_sync_run(report: dict[str, Any]) -> int:

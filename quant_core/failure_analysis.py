@@ -7,10 +7,10 @@ import numpy as np
 import pandas as pd
 
 from .config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE
-from .predictor import PROFIT_TARGET_PCT, apply_production_filters
+from quant_core.engine.predictor import PROFIT_TARGET_PCT, apply_production_filters
 from .daily_pick import list_daily_pick_results
 from .storage import connect, init_db
-from .strategy_lab import _daily_top, _stats_row, prepare_evaluated_candidates
+from quant_core.strategies.labs.strategy_lab import _daily_top, _stats_row, prepare_evaluated_candidates
 
 
 def analyze_prediction_failures(months: int = 12, refresh: bool = False) -> dict[str, Any]:

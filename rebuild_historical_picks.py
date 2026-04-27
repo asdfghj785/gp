@@ -8,9 +8,9 @@ import pandas as pd
 
 from quant_core.config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE, MAIN_WAVE_MIN_SCORE, PROFIT_TARGET_PCT, REVERSAL_MIN_SCORE
 from quant_core.daily_pick import list_daily_pick_results
-from quant_core.predictor import apply_production_filters
+from quant_core.engine.predictor import apply_production_filters, select_strategy_top_picks
 from quant_core.storage import clear_daily_picks, save_daily_pick, update_daily_pick_open, update_daily_pick_t3_gain
-from quant_core.strategy_lab import prepare_evaluated_candidates
+from quant_core.strategies.labs.strategy_lab import prepare_evaluated_candidates
 
 
 SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪"}
@@ -30,11 +30,15 @@ def rebuild_historical_picks(months: int = 12) -> dict[str, Any]:
     trading_dates = sorted(evaluated["date"].dropna().astype(str).unique().tolist())
     production_pool = apply_production_filters(evaluated)
     if not production_pool.empty:
-        production_pool = production_pool.sort_values(
-            ["date", "策略优先级", "排序评分", "预期溢价", "综合评分"],
-            ascending=[True, False, False, False, False],
-        )
-        daily_top = production_pool.drop_duplicates("date", keep="first").set_index("date", drop=False).sort_index()
+        daily_frames = []
+        for _, day_pool in production_pool.groupby("date", sort=True):
+            daily_frames.append(select_strategy_top_picks(day_pool, limit_per_strategy=1))
+        daily_top = pd.concat(daily_frames, ignore_index=True) if daily_frames else pd.DataFrame()
+        if not daily_top.empty:
+            daily_top = daily_top.sort_values(
+                ["date", "策略优先级", "排序评分", "预期溢价", "综合评分"],
+                ascending=[True, False, False, False, False],
+            )
     else:
         daily_top = pd.DataFrame()
 
@@ -48,7 +52,8 @@ def rebuild_historical_picks(months: int = 12) -> dict[str, Any]:
         return _summary(months, deleted, inserted, updated, skipped, model_status=prepared.get("model_status", "no_trading_dates"))
 
     for index, selection_date in enumerate(trading_dates, start=1):
-        if daily_top.empty or selection_date not in daily_top.index:
+        day_rows = daily_top[daily_top["date"].astype(str).eq(selection_date)] if not daily_top.empty else pd.DataFrame()
+        if day_rows.empty:
             skipped += 1
             print(
                 f"进度 {index}/{total} 天 {selection_date}：无生产级标的"
@@ -57,50 +62,70 @@ def rebuild_historical_picks(months: int = 12) -> dict[str, Any]:
             )
             continue
 
-        pick_row = daily_top.loc[selection_date]
-        if isinstance(pick_row, pd.DataFrame):
-            pick_row = pick_row.iloc[0]
-        code = str(pick_row["纯代码"])
-        score = float(pick_row.get("综合评分") or 0)
-        strategy_type = str(pick_row.get("strategy_type") or "尾盘突破")
-        fallback_threshold = (
-            MAIN_WAVE_MIN_SCORE if strategy_type == "右侧主升浪"
-            else REVERSAL_MIN_SCORE if strategy_type == "中线超跌反转"
-            else DIPBUY_MIN_SCORE if strategy_type == "首阴低吸"
-            else BREAKOUT_MIN_SCORE
-        )
-        threshold = float(pick_row.get("生产门槛") or fallback_threshold)
-        if score < threshold:
-            skipped += 1
-            print(f"进度 {index}/{total} 天 {selection_date}：{code} 综合评分 {score:.2f} < {threshold:.2f}，跳过。", flush=True)
-            continue
-        t3_gain = pick_row.get("t3_max_gain_pct")
-        if strategy_type in SWING_STRATEGY_TYPES and pd.isna(t3_gain):
-            skipped += 1
-            print(f"进度 {index}/{total} 天 {selection_date}：{code} 波段策略缺少完整 T+3 结果，跳过。", flush=True)
-            continue
+        day_inserted = 0
+        day_messages: list[str] = []
+        for _, pick_row in day_rows.iterrows():
+            code = str(pick_row["纯代码"])
+            score = float(pick_row.get("综合评分") or 0)
+            strategy_type = str(pick_row.get("strategy_type") or "尾盘突破")
+            fallback_threshold = (
+                MAIN_WAVE_MIN_SCORE if strategy_type == "右侧主升浪"
+                else REVERSAL_MIN_SCORE if strategy_type == "中线超跌反转"
+                else DIPBUY_MIN_SCORE if strategy_type == "首阴低吸"
+                else BREAKOUT_MIN_SCORE
+            )
+            threshold = float(pick_row.get("生产门槛") or fallback_threshold)
+            if score < threshold:
+                skipped += 1
+                day_messages.append(f"{code}[{strategy_type}] 评分 {score:.2f} < {threshold:.2f} 跳过")
+                continue
+            t3_gain = pick_row.get("t3_max_gain_pct")
+            if strategy_type in SWING_STRATEGY_TYPES and pd.isna(t3_gain):
+                skipped += 1
+                day_messages.append(f"{code}[{strategy_type}] 缺少完整 T+3 结果跳过")
+                continue
 
-        pick = _pick_from_candidate_row(pick_row, prepared)
-        row_id = save_daily_pick(pick)
-        if row_id:
-            inserted += 1
-        next_open = pick_row.get("next_open")
-        if pd.notna(next_open):
-            checked_at = f"{pick_row.get('next_date') or selection_date}T09:30:00"
-            if update_daily_pick_open(selection_date, float(next_open), checked_at):
-                updated += 1
-        if strategy_type in SWING_STRATEGY_TYPES and pd.notna(t3_gain):
-            checked_at = f"{pick_row.get('t3_exit_date') or pick_row.get('next_date') or selection_date}T15:00:00"
-            if update_daily_pick_t3_gain(selection_date, float(t3_gain), checked_at):
-                updated += 1
-        premium = pick_row.get("open_premium")
-        premium_text = "-" if pd.isna(premium) else f"{float(premium):.2f}%"
-        t3_text = ""
-        if strategy_type in SWING_STRATEGY_TYPES and pd.notna(t3_gain):
-            t3_text = f"，T+3最大涨幅 {float(t3_gain):.2f}%"
+            pick = _pick_from_candidate_row(pick_row, prepared)
+            row_id = save_daily_pick(pick)
+            if row_id:
+                inserted += 1
+                day_inserted += 1
+            next_open = pick_row.get("next_open")
+            if pd.notna(next_open):
+                checked_at = f"{pick_row.get('next_date') or selection_date}T09:30:00"
+                if update_daily_pick_open(
+                    selection_date,
+                    float(next_open),
+                    checked_at,
+                    strategy_type=strategy_type,
+                    code=code,
+                    pick_id=row_id or None,
+                ):
+                    updated += 1
+            if strategy_type in SWING_STRATEGY_TYPES and pd.notna(t3_gain):
+                checked_at = f"{pick_row.get('t3_exit_date') or pick_row.get('next_date') or selection_date}T15:00:00"
+                if update_daily_pick_t3_gain(
+                    selection_date,
+                    float(t3_gain),
+                    checked_at,
+                    strategy_type=strategy_type,
+                    code=code,
+                    pick_id=row_id or None,
+                ):
+                    updated += 1
+            premium = pick_row.get("open_premium")
+            premium_text = "-" if pd.isna(premium) else f"{float(premium):.2f}%"
+            t3_text = ""
+            if strategy_type in SWING_STRATEGY_TYPES and pd.notna(t3_gain):
+                t3_text = f"，T+3最大涨幅 {float(t3_gain):.2f}%"
+            day_messages.append(
+                f"{code} {pick_row.get('名称', '')}[{strategy_type}] "
+                f"评分 {score:.2f}/排序 {float(pick_row.get('排序评分') or score):.2f}/开盘 {premium_text}{t3_text}"
+            )
+        if day_inserted == 0:
+            skipped += 1
         print(
-            f"进度 {index}/{total} 天 {selection_date}：锁定 {code} {pick_row.get('名称', '')} "
-            f"[{strategy_type}] 评分 {score:.2f}，排序 {float(pick_row.get('排序评分') or score):.2f}，次日开盘溢价 {premium_text}{t3_text}。",
+            f"进度 {index}/{total} 天 {selection_date}：锁定 {day_inserted} 只；" + "；".join(day_messages),
             flush=True,
         )
 
@@ -147,6 +172,10 @@ def _pick_from_candidate_row(row: pd.Series, prepared: dict[str, Any]) -> dict[s
         "win_rate": winner["win_rate"],
         "selection_price": winner["price"],
         "selection_change": winner["change"],
+        "snapshot_time": "14:50:00",
+        "snapshot_price": winner["price"],
+        "snapshot_vol_ratio": float(row.get("量比") or 0),
+        "is_shadow_test": False,
         "t3_max_gain_pct": float(row.get("t3_max_gain_pct")) if str(row.get("strategy_type") or "") in SWING_STRATEGY_TYPES and pd.notna(row.get("t3_max_gain_pct")) else None,
         "model_status": str(prepared.get("model_status", "")),
         "status": "pending_open",
@@ -161,7 +190,7 @@ def _pick_from_candidate_row(row: pd.Series, prepared: dict[str, Any]) -> dict[s
 
 
 def _summary(months: int, deleted: int, inserted: int, updated: int, skipped: int, model_status: str) -> dict[str, Any]:
-    stored = list_daily_pick_results(limit=10000).get("rows", [])
+    stored = list_daily_pick_results(limit=10000, shadow_only=False).get("rows", [])
     evaluated = [row for row in stored if row.get("success") is not None]
     wins = [row for row in evaluated if row.get("success")]
     strategy_counts = Counter(str(row.get("strategy_type") or "尾盘突破") for row in stored)

@@ -4,23 +4,55 @@
 
 @layer base {
   :root {
-    color-scheme: light;
+    color-scheme: dark;
+    --terminal-bg: #101014;
+    --terminal-card: #18181c;
+    --terminal-panel: #202027;
+    --terminal-border: rgba(225, 225, 230, 0.1);
+    --terminal-text: #e1e1e6;
+    --terminal-muted: #9292a0;
+    --quant-rise: #f5222d;
+    --quant-fall: #52c41a;
+    --quant-neutral: #1890ff;
+    --quant-main-wave: #722ed1;
+    --el-bg-color: #101014;
+    --el-bg-color-page: #101014;
+    --el-bg-color-overlay: #18181c;
+    --el-fill-color-blank: #18181c;
+    --el-fill-color-light: #202027;
+    --el-fill-color-lighter: #24242c;
+    --el-border-color: rgba(225, 225, 230, 0.12);
+    --el-border-color-light: rgba(225, 225, 230, 0.1);
+    --el-border-color-lighter: rgba(225, 225, 230, 0.08);
+    --el-text-color-primary: #e1e1e6;
+    --el-text-color-regular: #b8b8c2;
+    --el-text-color-secondary: #9292a0;
+    --el-color-primary: #1890ff;
+    --el-color-danger: #52c41a;
+    --el-color-success: #f5222d;
+    --el-color-warning: #f5c542;
   }
 
   * {
     box-sizing: border-box;
   }
 
+  html,
   body {
     margin: 0;
     min-height: 100vh;
-    background: #f5f7fb;
-    color: #162033;
+    background: #101014;
+    color: #e1e1e6;
     font-family: 'Inter', 'PingFang SC', 'Helvetica Neue', Arial, sans-serif;
     letter-spacing: 0;
+  }
+
+  html.dark {
+    background: #101014;
   }
 }
 
 #app {
   min-height: 100vh;
+  background: #101014;
 }

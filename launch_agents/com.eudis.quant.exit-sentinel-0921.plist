@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.eudis.quant.exit-sentinel-0921</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/eudis/ths/scripts/shell/run_exit_sentinel.sh</string>
+		<string>--stage</string>
+		<string>audit</string>
+		<string>--sleep-seconds</string>
+		<string>5</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/eudis/ths</string>
+	<key>StandardOutPath</key>
+	<string>/Users/eudis/ths/exit_sentinel_0921_agent.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/eudis/ths/exit_sentinel_0921_agent_err.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>9</integer>
+		<key>Minute</key>
+		<integer>21</integer>
+	</dict>
+</dict>
+</plist>

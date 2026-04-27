@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from .market import fetch_sina_snapshot
-from .predictor import scan_market
+from quant_core.data_pipeline.market import fetch_sina_snapshot
+from quant_core.engine.predictor import scan_market
 from .storage import (
+    get_daily_picks,
     latest_daily_picks,
     pending_daily_picks,
     save_daily_pick,
@@ -47,21 +48,53 @@ def save_today_top_pick(limit: int = 10, force: bool = False) -> dict[str, Any]:
     if not rows:
         raise RuntimeError("实时预测没有返回候选股票，无法保存 14:50 推送标的")
 
-    return save_pushed_top_pick(rows[0], scan, force=force)
+    return save_pushed_top_picks(rows, scan, force=force)
 
 
 def save_pushed_top_pick(winner: dict[str, Any], scan: dict[str, Any], force: bool = False) -> dict[str, Any]:
+    result = save_pushed_top_picks([winner], scan, force=force)
+    if result.get("saved"):
+        return {"status": result["status"], "pick": result["saved"][0]}
+    if result.get("existing"):
+        return {"status": "exists", "reason": "今日 14:50 推送标的已锁定，不覆盖修改", "pick": result["existing"][0]}
+    return result
+
+
+def save_pushed_top_picks(winners: list[dict[str, Any]], scan: dict[str, Any], force: bool = False) -> dict[str, Any]:
     today = date.today()
     if not force and not is_weekday(today):
         return {"status": "skipped", "reason": "非工作日不保存 14:50 推送标的", "selection_date": today.isoformat()}
 
     selected_at = datetime.now().isoformat(timespec="seconds")
-    pick = _pick_from_winner(winner, scan, selected_at)
-    inserted_id = save_daily_pick(pick)
-    saved = latest_daily_picks(limit=1)[0]
-    if inserted_id == 0 and saved and saved.get("selection_date") == today.isoformat():
-        return {"status": "exists", "reason": "今日 14:50 推送标的已锁定，不覆盖修改", "pick": saved}
-    return {"status": "saved", "pick": saved}
+    saved: list[dict[str, Any]] = []
+    existing: list[dict[str, Any]] = []
+    for winner in winners:
+        pick = _pick_from_winner(winner, scan, selected_at)
+        inserted_id = save_daily_pick(pick)
+        day_picks = get_daily_picks(today.isoformat())
+        matched = next(
+            (
+                item
+                for item in day_picks
+                if item.get("strategy_type") == pick["strategy_type"] and item.get("code") == pick["code"]
+            ),
+            None,
+        )
+        if inserted_id == 0:
+            matched = matched or next((item for item in day_picks if item.get("strategy_type") == pick["strategy_type"]), None)
+            if matched:
+                existing.append(matched)
+        elif matched:
+            saved.append(matched)
+    status = "saved" if saved else "exists" if existing else "noop"
+    return {
+        "status": status,
+        "selection_date": today.isoformat(),
+        "saved": saved,
+        "existing": existing,
+        "count": len(saved),
+        "existing_count": len(existing),
+    }
 
 
 def _pick_from_winner(winner: dict[str, Any], scan: dict[str, Any], selected_at: str) -> dict[str, Any]:
@@ -78,6 +111,10 @@ def _pick_from_winner(winner: dict[str, Any], scan: dict[str, Any], selected_at:
         "win_rate": float(winner["win_rate"]),
         "selection_price": float(winner["price"]),
         "selection_change": float(winner["change"]),
+        "snapshot_time": selected_at.split("T", 1)[1] if "T" in selected_at else selected_at,
+        "snapshot_price": float(winner["price"]),
+        "snapshot_vol_ratio": float(winner.get("volume_ratio") or 0),
+        "is_shadow_test": True,
         "t3_max_gain_pct": None,
         "model_status": scan.get("model_status", ""),
         "status": "pending_open",
@@ -121,12 +158,19 @@ def update_pending_open_results(force: bool = False) -> dict[str, Any]:
         if open_price <= 0:
             missing.append(pick["code"])
             continue
-        result = update_daily_pick_open(pick["selection_date"], open_price, checked_at)
+        result = update_daily_pick_open(
+            pick["selection_date"],
+            open_price,
+            checked_at,
+            strategy_type=pick.get("strategy_type"),
+            code=pick.get("code"),
+            pick_id=pick.get("id"),
+        )
         if result:
             updated.append(result)
 
     return {"status": "updated", "updated": updated, "missing": missing}
 
 
-def list_daily_pick_results(limit: int = 10) -> dict[str, Any]:
-    return {"rows": latest_daily_picks(limit=limit)}
+def list_daily_pick_results(limit: int = 10, shadow_only: bool = True) -> dict[str, Any]:
+    return {"rows": latest_daily_picks(limit=limit, shadow_only=shadow_only)}

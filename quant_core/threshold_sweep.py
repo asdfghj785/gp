@@ -8,13 +8,13 @@ import numpy as np
 import pandas as pd
 
 from quant_core.config import DIPBUY_MIN_SCORE, PROFIT_TARGET_PCT
-from quant_core.predictor import (
+from quant_core.engine.predictor import (
     BREAKOUT_STRATEGY_TYPE,
     DIPBUY_STRATEGY_TYPE,
     _attach_historical_market_modes,
     apply_strategy_sort_score,
 )
-from quant_core.strategy_lab import prepare_evaluated_candidates
+from quant_core.strategies.labs.strategy_lab import prepare_evaluated_candidates
 
 
 @dataclass(frozen=True)

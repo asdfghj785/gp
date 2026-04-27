@@ -10,7 +10,7 @@ import requests
 from sklearn.metrics import roc_auc_score
 
 from .config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE, OLLAMA_API, OLLAMA_MODEL
-from .strategy_lab import prepare_evaluated_candidates
+from quant_core.strategies.labs.strategy_lab import prepare_evaluated_candidates
 
 
 REASON_FEATURES = [

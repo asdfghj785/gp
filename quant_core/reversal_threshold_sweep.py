@@ -6,9 +6,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .predictor import MAIN_WAVE_STRATEGY_TYPE, REVERSAL_STRATEGY_TYPE
+from quant_core.engine.predictor import MAIN_WAVE_STRATEGY_TYPE, REVERSAL_STRATEGY_TYPE
 from .storage import init_db
-from .strategy_lab import prepare_evaluated_candidates
+from quant_core.strategies.labs.strategy_lab import prepare_evaluated_candidates
 
 
 SWEEP_PROFILES = {

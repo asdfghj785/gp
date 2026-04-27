@@ -1,1031 +1,296 @@
 <template>
-  <main class="page">
-    <header class="topbar">
-      <div>
-        <p class="eyebrow">Local Quant Workstation</p>
-        <h1>离岸量化数据控制台</h1>
-      </div>
-      <div class="toolbar">
-        <button type="button" :disabled="busy.overview" @click="loadOverview">刷新状态</button>
-        <button type="button" :disabled="busy.scan" @click="scanRadar">
-          {{ busy.scan ? '扫描中' : '实时预测' }}
-        </button>
-      </div>
-    </header>
+  <div class="terminal-app dark">
+    <StatsHeader
+      :title="currentTitle"
+      :locked-count="todayLockedCount"
+      :latest-sync="latestSync"
+      :health="health"
+      :model-status="radar.model_status"
+    />
 
-    <section class="status-grid">
-      <article class="metric">
-        <span>数据库股票数</span>
-        <strong>{{ overview.stock_count ?? 0 }}</strong>
-      </article>
-      <article class="metric">
-        <span>数据库 K 线</span>
-        <strong>{{ overview.rows_count ?? 0 }}</strong>
-      </article>
-      <article class="metric">
-        <span>Parquet 文件</span>
-        <strong>{{ overview.parquet_files ?? 0 }}</strong>
-      </article>
-      <article class="metric">
-        <span>日期范围</span>
-        <strong>{{ overview.min_date || '未同步' }} / {{ overview.max_date || '-' }}</strong>
-      </article>
-      <article class="metric sync-metric">
-        <span>最近盘后同步</span>
-        <strong :class="latestSync?.status === 'success' ? 'pass' : 'fail'">
-          {{ latestSync ? syncStatusText(latestSync) : '暂无记录' }}
-        </strong>
-        <small v-if="latestSync">
-          {{ latestSync.finished_at }} · 新增 {{ latestSync.inserted_rows }} · 更新 {{ latestSync.updated_rows }}
-        </small>
-      </article>
-    </section>
+    <div class="main-grid">
+      <Sidebar v-model:active="activeSection" :health="health" />
 
-    <section v-if="message" :class="['notice', messageType]">{{ message }}</section>
+      <main class="content">
+        <el-alert
+          v-if="message.text"
+          :title="message.text"
+          :type="message.type === 'error' ? 'error' : 'info'"
+          show-icon
+          :closable="false"
+          class="message-alert"
+        />
 
-    <nav class="tabbar" aria-label="功能分区">
-      <button
-        v-for="tab in tabs"
-        :key="tab.id"
-        type="button"
-        :class="{ active: activeTab === tab.id }"
-        @click="setActiveTab(tab.id)"
-      >
-        <span>{{ tab.label }}</span>
-        <small>{{ tab.hint }}</small>
-      </button>
-    </nav>
+        <section v-show="activeSection === 'dashboard'" class="page-stack">
+          <section class="dashboard-grid">
+            <el-card class="dark-card signal-card" shadow="never">
+              <template #header>
+                <div class="card-head">
+                  <div>
+                    <p class="eyebrow">Signal Control</p>
+                    <h2>今日核心出票与指令</h2>
+                  </div>
+                  <el-tag effect="dark" type="primary">Forward Shadow</el-tag>
+                </div>
+              </template>
 
-    <section v-show="activeTab === 'radar' || activeTab === 'data'" class="workbench single-panel">
-      <div v-show="activeTab === 'radar'" class="panel radar-panel">
-        <div class="panel-head">
-          <div>
-            <h2>预测雷达</h2>
-            <p>{{ radar.created_at ? `缓存时间 ${radar.created_at}` : '点击实时预测后缓存 10 只候选股' }}</p>
-            <p v-if="radar.market_gate" :class="radar.market_gate.blocked ? 'fail' : 'pass'">
-              大盘风控：{{ marketGateText(radar.market_gate) }}
-            </p>
-            <p v-if="radar.intraday_snapshot" class="muted-line">
-              14:30 快照：{{ intradaySnapshotText(radar.intraday_snapshot) }}
-            </p>
-          </div>
-          <span class="model-state">{{ radar.model_status || '未扫描' }}</span>
-        </div>
+              <div v-if="operationCards.length === 0" class="empty-panel">
+                <strong>暂无操作指令</strong>
+                <span>等待 14:50 真实快照锁定、09:26 早盘哨兵、14:45 波段巡逻兵自动写入。</span>
+              </div>
 
-        <section v-if="radar.rows.length === 0" class="empty-state risk-off">
-          <strong>空仓避险</strong>
-          <span>{{ radarEmptyReason }}</span>
+              <div v-else class="instruction-grid">
+                <article v-for="pick in operationCards" :key="`op-${pick.id}`" class="instruction-card">
+                  <header>
+                    <span :class="strategyBadgeClass(pick.strategy_type)">{{ strategyLabel(pick.strategy_type) }}</span>
+                    <strong :class="instructionClass(pick)">{{ instructionTitle(pick) }}</strong>
+                  </header>
+                  <p><span class="mono">{{ pick.code }}</span> {{ pick.name }}</p>
+                  <small>{{ instructionBody(pick) }}</small>
+                </article>
+              </div>
+            </el-card>
+
+            <el-card class="dark-card" shadow="never">
+              <template #header>
+                <div class="card-head">
+                  <div>
+                    <p class="eyebrow">System Pulse</p>
+                    <h2>实时状态</h2>
+                  </div>
+                  <el-button :loading="busy.refresh" @click="refreshAll">刷新</el-button>
+                </div>
+              </template>
+
+              <div class="pulse-grid">
+                <article>
+                  <span>大盘风控</span>
+                  <strong :class="radar.market_gate?.blocked ? 'risk' : 'neutral'">
+                    {{ radar.market_gate?.blocked ? '空仓' : (radar.market_gate?.mode || '待扫描') }}
+                  </strong>
+                </article>
+                <article>
+                  <span>成交额</span>
+                  <strong>{{ amountYi(radar.market_gate?.market_amount_yi) }}</strong>
+                </article>
+                <article>
+                  <span>数据同步</span>
+                  <strong>{{ latestSync?.finished_at || '-' }}</strong>
+                </article>
+                <article>
+                  <span>雷达缓存</span>
+                  <strong>{{ radar.created_at || '无缓存' }}</strong>
+                </article>
+              </div>
+            </el-card>
+          </section>
+
+          <section class="toolbar-panel">
+            <div>
+              <p class="eyebrow">Realtime Radar</p>
+              <h2>14:50 扫描结果</h2>
+            </div>
+            <div class="toolbar-actions">
+              <el-button :loading="busy.refresh" @click="refreshAll">刷新状态</el-button>
+              <el-button type="primary" :loading="busy.scan" @click="scanRadar">实时预测</el-button>
+            </div>
+          </section>
+
+          <el-empty v-if="radar.rows.length === 0" class="radar-empty" description="空仓避险：当前没有达到生产门槛的候选股" />
+
+          <section v-else class="dual-board">
+            <SelectionTable
+              title="短线极速看板"
+              eyebrow="T+1 Breakout"
+              :rows="radar.rows"
+              mode="short"
+              :table-height="360"
+              show-inspect
+              @inspect="inspectStock"
+            />
+            <SelectionTable
+              title="波段策略看板"
+              eyebrow="T+3 Swing"
+              :rows="radar.rows"
+              mode="swing"
+              :table-height="360"
+              show-inspect
+              @inspect="inspectStock"
+            />
+          </section>
+
+          <el-card v-if="selectedStock" class="dark-card" shadow="never">
+            <template #header>
+              <div class="card-head">
+                <div>
+                  <p class="eyebrow">Ollama Risk Control</p>
+                  <h2><span class="mono">{{ selectedStock.code }}</span> {{ selectedStock.name }}</h2>
+                </div>
+                <el-button type="primary" :loading="busy.analyze" @click="analyzeStock">运行风控</el-button>
+              </div>
+            </template>
+            <div v-if="analysis" class="analysis-grid">
+              <article>
+                <span>结论</span>
+                <strong :class="analysis.analysis?.verdict?.includes('红灯') ? 'risk' : 'buy'">
+                  {{ analysis.analysis?.verdict || '-' }}
+                </strong>
+              </article>
+              <article>
+                <span>情绪</span>
+                <strong>{{ analysis.analysis?.sentiment || '-' }}</strong>
+              </article>
+              <article class="wide">
+                <span>逻辑</span>
+                <strong>{{ analysis.analysis?.logic || '-' }}</strong>
+              </article>
+            </div>
+            <p v-else class="muted">点击运行风控后，Ollama 返回的舆情结论会在这里展示。</p>
+          </el-card>
         </section>
 
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>代码</th>
-                <th>名称</th>
-                <th>策略</th>
-                <th class="num">现价</th>
-                <th class="num">涨跌幅</th>
-                <th class="num">换手</th>
-                <th class="num">收益信号</th>
-                <th class="num">预期溢价</th>
-                <th class="num">综合评分</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-if="radar.rows.length === 0">
-                <td colspan="10" class="empty">当前没有达到高置信生产规则的候选股</td>
-              </tr>
-              <tr v-for="row in radar.rows" :key="row.code">
-                <td class="mono">{{ row.code }}</td>
-                <td>{{ row.name }}</td>
-                <td><span :class="strategyBadgeClass(row.strategy_type)">{{ strategyBadgeText(row.strategy_type) }}</span></td>
-                <td class="num">{{ money(row.price) }}</td>
-                <td :class="['num', row.change >= 0 ? 'up' : 'down']">{{ pct(row.change) }}</td>
-                <td class="num">{{ pct(row.turnover) }}</td>
-                <td class="num score">{{ pct(row.win_rate) }}</td>
-                <td :class="['num', Number(row.expected_premium) >= 0 ? 'up' : 'down']">{{ pct(row.expected_premium) }}</td>
-                <td class="num score">{{ scoreText(row.composite_score) }}</td>
-                <td>
-                  <button class="link-btn" type="button" @click="inspectStock(row)">验算</button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
+        <section v-show="activeSection === 'ledger'" class="page-stack">
+          <section class="legion-grid">
+            <el-card v-for="stat in strategyStats" :key="stat.strategy" class="dark-card legion-card" shadow="never">
+              <span :class="strategyBadgeClass(stat.strategy)">{{ strategyLabel(stat.strategy) }}</span>
+              <strong>{{ stat.count }} 次</strong>
+              <dl>
+                <div><dt>胜率</dt><dd>{{ stat.winRate }}</dd></div>
+                <div><dt>{{ stat.isSwing ? 'T+3均值' : 'T+1均值' }}</dt><dd :class="numberClass(stat.avgReturnRaw)">{{ stat.avgReturn }}</dd></div>
+                <div><dt>持仓</dt><dd>{{ stat.openCount }}</dd></div>
+              </dl>
+            </el-card>
+          </section>
 
-      <aside v-show="activeTab === 'data'" class="panel audit-panel">
-        <div class="panel-head compact">
-          <div>
-            <h2>数据三重验证</h2>
-            <p>结构完整性、金融逻辑、来源真实性</p>
-          </div>
-        </div>
-
-        <div class="audit-actions">
-          <label>
-            抽检文件数
-            <input v-model.number="validationSample" min="1" max="10000" type="number" />
-          </label>
-          <label class="check-line">
-            <input v-model="sourceCheck" type="checkbox" />
-            实时源交叉核验
-          </label>
-          <button type="button" :disabled="busy.validate" @click="runValidation">
-            {{ busy.validate ? '验证中' : '开始验证' }}
-          </button>
-        </div>
-
-        <div v-if="validation.summary" class="audit-summary">
-          <div>
-            <span>状态</span>
-            <strong :class="validation.status === 'pass' ? 'pass' : 'fail'">{{ validation.status }}</strong>
-          </div>
-          <div>
-            <span>错误</span>
-            <strong>{{ validation.summary.error_count }}</strong>
-          </div>
-          <div>
-            <span>警告</span>
-            <strong>{{ validation.summary.warning_count }}</strong>
-          </div>
-        </div>
-
-        <div class="issue-list">
-          <article v-for="(issue, index) in validation.issues.slice(0, 12)" :key="index" class="issue">
-            <div>
-              <strong :class="issue.level">{{ issue.level }}</strong>
-              <span>{{ issue.stage }}</span>
-            </div>
-            <p>{{ issue.code || '全局' }} {{ issue.date || '' }} {{ issue.message }}</p>
-          </article>
-          <p v-if="validation.issues.length === 0" class="empty">尚未发现异常或尚未运行验证</p>
-        </div>
-      </aside>
-    </section>
-
-    <section v-show="activeTab === 'radar'" class="panel pick-panel">
-      <div class="panel-head compact">
-        <div>
-          <h2>14:50 推送标的跟踪</h2>
-          <p>工作日 14:50 PushPlus 推送成功后自动锁定该标的，不允许前端手动修改；次日开盘后自动输出结果</p>
-        </div>
-        <div class="toolbar">
-          <button class="secondary-btn" type="button" @click="loadDailyPicks">刷新记录</button>
-        </div>
-      </div>
-
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>保存日</th>
-              <th>目标/观察日</th>
-              <th>股票</th>
-              <th class="num">收益信号</th>
-              <th class="num">保存价</th>
-              <th class="num">开盘/持仓</th>
-              <th class="num">收益口径</th>
-              <th>结果</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-if="dailyPicks.rows.length === 0">
-              <td colspan="8" class="empty">暂无 14:50 推送锁定记录</td>
-            </tr>
-            <tr v-for="pick in dailyPicks.rows" :key="pick.id">
-              <td>{{ pick.selection_date }}</td>
-              <td>{{ tradeExitDateText(pick) }}</td>
-              <td>
-                <span class="mono">{{ pick.code }}</span> {{ pick.name }}
-                <span :class="strategyBadgeClass(pick.strategy_type)">{{ strategyBadgeText(pick.strategy_type) }}</span>
-              </td>
-              <td class="num score">{{ pct(pick.win_rate) }}</td>
-              <td class="num">{{ money(pick.selection_price) }}</td>
-              <td class="num">{{ exitPriceText(pick) }}</td>
-              <td :class="['num', resultPremiumClass(pick)]">
-                <span class="metric-stack">
-                  <small>{{ resultPremiumLabel(pick) }}</small>
-                  <strong>{{ resultPremiumText(pick) }}</strong>
-                </span>
-              </td>
-              <td>
-                <strong v-if="pick.status === 'pending_open'" class="pending">待开盘</strong>
-                <strong v-else :class="pick.success ? 'pass' : 'fail'">{{ pick.success ? '成功' : '失败' }}</strong>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <section v-show="activeTab === 'radar'" class="panel shadow-panel">
-      <div class="panel-head compact">
-        <div>
-          <h2>影子测试与外推精准度观测</h2>
-          <p>对比昨日 14:50 预期开盘溢价与 09:25 集合竞价实际溢价，监控 14:50 外推算法偏差</p>
-        </div>
-        <span class="model-state">09:26 哨兵闭环</span>
-      </div>
-
-      <div v-if="shadowRows.length === 0" class="empty-state">
-        <strong>暂无影子测试记录</strong>
-        <span>14:50 锁定标的并由 09:26 哨兵回填开盘结果后，这里会自动显示预测与实盘误差。</span>
-      </div>
-
-      <div v-else class="shadow-grid">
-        <article v-for="pick in shadowRows" :key="`shadow-${pick.id}`" class="shadow-card">
-          <header>
-            <div>
-              <strong><span class="mono">{{ pick.code }}</span> {{ pick.name }}</strong>
-              <small>{{ pick.selection_date }} → {{ pick.target_date }}</small>
-            </div>
-            <span :class="exitActionClass(pick)">{{ exitActionText(pick) }}</span>
-          </header>
-
-          <div class="shadow-compare">
-            <div class="shadow-side">
-              <span>{{ shadowExpectedLabel(pick) }}</span>
-              <strong :class="Number(expectedPremium(pick)) >= 0 ? 'up' : 'down'">{{ pct(expectedPremium(pick)) }}</strong>
-              <div class="premium-track">
-                <i :class="premiumBarClass(expectedPremium(pick))" :style="premiumBarStyle(expectedPremium(pick))"></i>
-              </div>
-            </div>
-            <div class="shadow-side">
-              <span>09:25 实盘</span>
-              <strong v-if="actualPremium(pick) !== null" :class="Number(actualPremium(pick)) >= 0 ? 'up' : 'down'">
-                {{ pct(actualPremium(pick)) }}
-              </strong>
-              <strong v-else class="pending">待哨兵</strong>
-              <div class="premium-track">
-                <i v-if="actualPremium(pick) !== null" :class="premiumBarClass(actualPremium(pick))" :style="premiumBarStyle(actualPremium(pick))"></i>
-              </div>
-            </div>
-          </div>
-
-          <footer>
-            <span :class="precisionBadgeClass(pick)">{{ precisionBadgeText(pick) }}</span>
-            <span v-if="!isSwingStrategy(pick)">误差 {{ premiumErrorText(pick) }}</span>
-            <span v-else>波段持仓等待结算</span>
-            <span>综合评分 {{ scoreText(pick.composite_score) }}</span>
-          </footer>
-          <p class="shadow-instruction">{{ shadowInstructionText(pick) }}</p>
-        </article>
-      </div>
-    </section>
-
-    <section v-show="activeTab === 'strategy'" class="panel backtest-panel">
-      <div class="panel-head compact">
-        <div>
-          <h2>近十二个月生产策略复盘</h2>
-          <p>{{ backtest.summary?.rule || '每日选预期溢价最高股票，次日开盘卖出统计胜率' }}</p>
-          <p v-if="backtest.summary?.rank_rule">{{ backtest.summary.rank_rule }}</p>
-        </div>
-        <button type="button" :disabled="busy.backtest" @click="loadBacktest(true)">
-          {{ busy.backtest ? '统计中' : '刷新复盘' }}
-        </button>
-      </div>
-
-      <div v-if="backtest.summary" class="backtest-summary">
-        <div><span>区间</span><strong>{{ backtest.summary.start_date }} / {{ backtest.summary.end_date }}</strong></div>
-        <div><span>已评估天数</span><strong>{{ backtest.summary.evaluated_days }}</strong></div>
-        <div><span>成功 / 失败</span><strong>{{ backtest.summary.win_count }} / {{ backtest.summary.loss_count }}</strong></div>
-        <div><span>开盘胜率</span><strong class="score">{{ pct(backtest.summary.win_rate) }}</strong></div>
-        <div><span>平均溢价</span><strong :class="Number(backtest.summary.avg_open_premium) >= 0 ? 'up' : 'down'">{{ pct(backtest.summary.avg_open_premium) }}</strong></div>
-        <div><span>中位溢价</span><strong :class="Number(backtest.summary.median_open_premium) >= 0 ? 'up' : 'down'">{{ pct(backtest.summary.median_open_premium) }}</strong></div>
-        <div><span>修复昨收/量比</span><strong>{{ backtest.summary.repaired_pre_close_count || 0 }} / {{ backtest.summary.repaired_volume_ratio_count || 0 }}</strong></div>
-        <div><span>成交策略分布</span><strong>{{ strategyCountsText(backtest.summary.strategy_counts) }}</strong></div>
-        <div><span>候选策略分布</span><strong>{{ strategyCountsText(backtest.summary.candidate_strategy_counts) }}</strong></div>
-      </div>
-
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>预测日</th>
-              <th>股票</th>
-              <th class="num">收益信号</th>
-              <th class="num">预期溢价</th>
-              <th class="num">综合评分</th>
-              <th class="num">收盘买入</th>
-              <th>卖出日</th>
-              <th class="num">开盘卖出</th>
-              <th class="num">收益口径</th>
-              <th>结果</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-if="backtest.rows.length === 0">
-              <td colspan="10" class="empty">暂无复盘数据</td>
-            </tr>
-            <tr v-for="row in backtest.rows" :key="`${row.date}-${row.code}`">
-              <td>{{ row.date }}</td>
-              <td>
-                <span class="mono">{{ row.code }}</span> {{ row.name }}
-                <span :class="strategyBadgeClass(row.strategy_type)">{{ strategyBadgeText(row.strategy_type) }}</span>
-              </td>
-              <td class="num score">{{ pct(row.win_rate) }}</td>
-              <td :class="['num', Number(row.expected_premium) >= 0 ? 'up' : 'down']">{{ pct(row.expected_premium) }}</td>
-              <td class="num score">{{ scoreText(row.composite_score) }}</td>
-              <td class="num">{{ money(row.close) }}</td>
-              <td>{{ tradeExitDateText(row) }}</td>
-              <td class="num">{{ exitPriceText(row) }}</td>
-              <td :class="['num', resultPremiumClass(row)]">
-                <span class="metric-stack">
-                  <small>{{ resultPremiumLabel(row) }}</small>
-                  <strong>{{ resultPremiumText(row) }}</strong>
-                </span>
-              </td>
-              <td>
-                <strong v-if="row.success === null" class="pending">待开盘</strong>
-                <strong v-else :class="row.success ? 'pass' : 'fail'">{{ row.success ? '成功' : '失败' }}</strong>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <div class="panel-subhead">
-        <div>
-          <h3>双轨候选观察</h3>
-          <p>近两个月按交易日分别展示双轨 Top1；有生产合格标的时优先展示生产合格 Top1，共 {{ backtest.strategy_rows.length }} 条。</p>
-        </div>
-      </div>
-
-      <div class="table-wrap compact-table">
-        <table>
-          <thead>
-            <tr>
-              <th>预测日</th>
-              <th>股票</th>
-              <th>策略</th>
-              <th class="num">预期溢价</th>
-              <th class="num">综合评分</th>
-              <th class="num">实际结果</th>
-              <th>结果</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-if="backtest.strategy_rows.length === 0">
-              <td colspan="7" class="empty">暂无双轨候选观察数据</td>
-            </tr>
-            <tr v-for="row in backtest.strategy_rows" :key="`${row.date}-${row.strategy_type}-${row.code}`">
-              <td>{{ row.date }}</td>
-              <td><span class="mono">{{ row.code }}</span> {{ row.name }}</td>
-              <td><span :class="strategyBadgeClass(row.strategy_type)">{{ strategyBadgeText(row.strategy_type) }}</span></td>
-              <td :class="['num', Number(row.expected_premium) >= 0 ? 'up' : 'down']">{{ pct(row.expected_premium) }}</td>
-              <td class="num score">{{ scoreText(row.composite_score) }}</td>
-              <td :class="['num', resultPremiumClass(row)]">
-                <span class="metric-stack">
-                  <small>{{ resultPremiumLabel(row) }}</small>
-                  <strong>{{ resultPremiumText(row) }}</strong>
-                </span>
-              </td>
-              <td>
-                <strong v-if="row.success === null" class="pending">待开盘</strong>
-                <strong v-else :class="row.success ? 'pass' : 'fail'">{{ row.success ? '成功' : '失败' }}</strong>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <section v-show="activeTab === 'strategy'" class="panel strategy-panel">
-      <div class="panel-head compact">
-        <div>
-          <h2>策略实验室</h2>
-          <p>{{ strategyLab.summary?.note || '同一批历史候选池对比不同过滤规则、阈值和综合评分表现' }}</p>
-        </div>
-        <button type="button" :disabled="busy.strategyLab" @click="loadStrategyLab(true)">
-          {{ busy.strategyLab ? '实验中' : '刷新实验' }}
-        </button>
-      </div>
-
-      <div v-if="strategyLab.summary" class="backtest-summary">
-        <div><span>候选样本</span><strong>{{ strategyLab.summary.candidate_rows }}</strong></div>
-        <div><span>交易日</span><strong>{{ strategyLab.summary.trading_days }}</strong></div>
-        <div>
-          <span>最佳规则</span>
-          <strong>{{ strategyLab.summary.best_strategy?.name || '-' }}</strong>
-        </div>
-        <div>
-          <span>最佳均值</span>
-          <strong :class="Number(strategyLab.summary.best_strategy?.avg_open_premium) >= 0 ? 'up' : 'down'">
-            {{ pct(strategyLab.summary.best_strategy?.avg_open_premium) }}
-          </strong>
-        </div>
-        <div><span>综合分相关</span><strong>{{ scoreText((strategyLab.summary.correlation?.composite_pearson || 0) * 100) }}</strong></div>
-        <div><span>模型状态</span><strong>{{ strategyLab.summary.model_status }}</strong></div>
-      </div>
-
-      <div class="strategy-grid">
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>规则</th>
-                <th class="num">交易数</th>
-                <th class="num">胜率</th>
-                <th class="num">平均溢价</th>
-                <th class="num">中位溢价</th>
-                <th class="num">最差</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-if="strategyLab.variants.length === 0">
-                <td colspan="6" class="empty">暂无实验数据</td>
-              </tr>
-              <tr v-for="variant in strategyLab.variants" :key="variant.name">
-                <td>
-                  <strong>{{ variant.name }}</strong>
-                  <small>{{ variant.description }}</small>
-                </td>
-                <td class="num">{{ variant.trades }}</td>
-                <td class="num score">{{ pct(variant.win_rate) }}</td>
-                <td :class="['num', Number(variant.avg_open_premium) >= 0 ? 'up' : 'down']">{{ pct(variant.avg_open_premium) }}</td>
-                <td :class="['num', Number(variant.median_open_premium) >= 0 ? 'up' : 'down']">{{ pct(variant.median_open_premium) }}</td>
-                <td class="num down">{{ pct(variant.worst_open_premium) }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>阈值</th>
-                <th class="num">交易数</th>
-                <th class="num">胜率</th>
-                <th class="num">平均溢价</th>
-                <th class="num">中位溢价</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="row in strategyLab.thresholds" :key="row.name">
-                <td>{{ row.name }}</td>
-                <td class="num">{{ row.trades }}</td>
-                <td class="num score">{{ pct(row.win_rate) }}</td>
-                <td :class="['num', Number(row.avg_open_premium) >= 0 ? 'up' : 'down']">{{ pct(row.avg_open_premium) }}</td>
-                <td :class="['num', Number(row.median_open_premium) >= 0 ? 'up' : 'down']">{{ pct(row.median_open_premium) }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <section v-show="activeTab === 'strategy'" class="panel strategy-panel">
-      <div class="panel-head compact">
-        <div>
-          <h2>失败归因分析</h2>
-          <p>{{ failureAnalysis.summary?.optimization_note || '用 12 个月生产策略历史样本，分析失败股票的共同特征和可优化规则' }}</p>
-        </div>
-        <button type="button" :disabled="busy.failureAnalysis" @click="loadFailureAnalysis(true)">
-          {{ busy.failureAnalysis ? '分析中' : '刷新归因' }}
-        </button>
-      </div>
-
-      <div v-if="failureAnalysis.summary" class="backtest-summary">
-        <div><span>区间</span><strong>{{ failureAnalysis.summary.start_date }} / {{ failureAnalysis.summary.end_date }}</strong></div>
-        <div><span>交易数</span><strong>{{ failureAnalysis.summary.trades }}</strong></div>
-        <div><span>成功 / 失败</span><strong>{{ failureAnalysis.summary.success_count }} / {{ failureAnalysis.summary.failure_count }}</strong></div>
-        <div><span>基准胜率</span><strong class="score">{{ pct(failureAnalysis.summary.baseline?.win_rate) }}</strong></div>
-        <div>
-          <span>基准平均溢价</span>
-          <strong :class="Number(failureAnalysis.summary.baseline?.avg_open_premium) >= 0 ? 'up' : 'down'">
-            {{ pct(failureAnalysis.summary.baseline?.avg_open_premium) }}
-          </strong>
-        </div>
-        <div><span>模型状态</span><strong>{{ failureAnalysis.summary.model_status }}</strong></div>
-      </div>
-
-      <div class="strategy-grid">
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>失败原因</th>
-                <th class="num">失败占比</th>
-                <th class="num">成功占比</th>
-                <th class="num">差值</th>
-                <th class="num">失败数</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-if="failureAnalysis.reasons.length === 0">
-                <td colspan="5" class="empty">暂无失败归因数据</td>
-              </tr>
-              <tr v-for="reason in failureAnalysis.reasons" :key="reason.reason">
-                <td>
-                  <strong>{{ reason.reason }}</strong>
-                  <small>{{ reason.description }}</small>
-                </td>
-                <td class="num fail">{{ pct(reason.failure_rate) }}</td>
-                <td class="num pass">{{ pct(reason.success_rate) }}</td>
-                <td :class="['num', Number(reason.lift_vs_success) >= 0 ? 'fail' : 'pass']">{{ pct(reason.lift_vs_success) }}</td>
-                <td class="num">{{ reason.failure_count }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>优化规则</th>
-                <th class="num">交易数</th>
-                <th class="num">胜率变化</th>
-                <th class="num">均值变化</th>
-                <th class="num">覆盖率</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="rule in failureAnalysis.optimizations" :key="rule.name">
-                <td>{{ rule.name }}</td>
-                <td class="num">{{ rule.trades }}</td>
-                <td :class="['num', Number(rule.delta_win_rate) >= 0 ? 'pass' : 'fail']">{{ pct(rule.delta_win_rate) }}</td>
-                <td :class="['num', Number(rule.delta_avg_open_premium) >= 0 ? 'pass' : 'fail']">{{ pct(rule.delta_avg_open_premium) }}</td>
-                <td class="num">{{ pct(rule.coverage) }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="table-wrap failure-samples">
-        <table>
-          <thead>
-            <tr>
-              <th>最差失败日</th>
-              <th>股票</th>
-              <th class="num">实际溢价</th>
-              <th class="num">胜率</th>
-              <th class="num">预期溢价</th>
-              <th class="num">综合分</th>
-              <th class="num">涨跌幅</th>
-              <th class="num">上影</th>
-              <th class="num">振幅</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="row in failureAnalysis.sample_failures.slice(0, 10)" :key="`${row.date}-${row.code}`">
-              <td>{{ row.date }}</td>
-              <td><span class="mono">{{ row.code }}</span> {{ row.name }}</td>
-              <td class="num down">{{ pct(row.open_premium) }}</td>
-              <td class="num">{{ pct(row.win_rate) }}</td>
-              <td :class="['num', Number(row.expected_premium) >= 0 ? 'up' : 'down']">{{ pct(row.expected_premium) }}</td>
-              <td class="num score">{{ scoreText(row.composite_score) }}</td>
-              <td :class="['num', Number(row.change) >= 0 ? 'up' : 'down']">{{ pct(row.change) }}</td>
-              <td class="num">{{ pct(row.upper_shadow) }}</td>
-              <td class="num">{{ pct(row.amplitude) }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <section v-show="activeTab === 'strategy'" class="panel strategy-panel">
-      <div class="panel-head compact">
-        <div>
-          <h2>次日上涨原因分析</h2>
-          <p>{{ upReason.summary?.method || '统计次日开盘上涨股票，并用技术因子模型和本地大模型解释上涨原因' }}</p>
-        </div>
-        <button type="button" :disabled="busy.upReason" @click="loadUpReason(true)">
-          {{ busy.upReason ? '分析中' : '运行上涨归因' }}
-        </button>
-      </div>
-
-      <div v-if="upReason.summary" class="backtest-summary">
-        <div><span>区间</span><strong>{{ upReason.summary.start_date }} / {{ upReason.summary.end_date }}</strong></div>
-        <div><span>候选样本</span><strong>{{ upReason.summary.candidate_rows }}</strong></div>
-        <div><span>上涨 / 下跌</span><strong>{{ upReason.summary.up_count }} / {{ upReason.summary.down_count }}</strong></div>
-        <div><span>上涨率</span><strong class="score">{{ pct(upReason.summary.up_rate) }}</strong></div>
-        <div><span>上涨均值</span><strong class="up">{{ pct(upReason.summary.avg_up_premium) }}</strong></div>
-        <div><span>下跌均值</span><strong class="down">{{ pct(upReason.summary.avg_down_premium) }}</strong></div>
-        <div><span>模型 AUC</span><strong>{{ scoreText(upReason.model_report?.auc) }}</strong></div>
-        <div><span>Top10% 上涨率</span><strong>{{ pct(upReason.model_report?.top_decile_up_rate) }}</strong></div>
-      </div>
-
-      <section v-if="upReason.llm_summary?.conclusion" class="analysis-box compact-analysis">
-        <h3>{{ upReason.llm_summary.primary_driver }} · 置信 {{ scoreText(upReason.llm_summary.confidence) }}</h3>
-        <p>{{ upReason.llm_summary.conclusion }}</p>
-        <p><strong>舆情状态：</strong>{{ upReason.summary?.sentiment_status }}</p>
-      </section>
-
-      <div class="strategy-grid">
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>上涨因子</th>
-                <th>类型</th>
-                <th class="num">样本</th>
-                <th class="num">上涨率</th>
-                <th class="num">提升</th>
-                <th class="num">均值溢价</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-if="upReason.factor_lifts.length === 0">
-                <td colspan="6" class="empty">点击运行上涨归因后显示</td>
-              </tr>
-              <tr v-for="factor in upReason.factor_lifts.slice(0, 12)" :key="factor.factor">
-                <td>
-                  <strong>{{ factor.factor }}</strong>
-                  <small>{{ factor.explanation }}</small>
-                </td>
-                <td>{{ factor.category }}</td>
-                <td class="num">{{ factor.sample_count }}</td>
-                <td class="num score">{{ pct(factor.up_rate) }}</td>
-                <td :class="['num', Number(factor.lift) >= 0 ? 'pass' : 'fail']">{{ pct(factor.lift) }}</td>
-                <td :class="['num', Number(factor.avg_open_premium) >= 0 ? 'up' : 'down']">{{ pct(factor.avg_open_premium) }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>模型重要因子</th>
-                <th class="num">重要度</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="item in upReason.model_report.feature_importance || []" :key="item.feature">
-                <td>{{ item.feature }}</td>
-                <td class="num score">{{ scoreText(item.importance) }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <section v-show="activeTab === 'stock' || activeTab === 'data'" class="detail-grid single-panel">
-      <div v-show="activeTab === 'stock'" class="panel">
-        <div class="panel-head compact">
-          <div>
-            <h2>单票数据验算</h2>
-            <p>查看数据库历史记录和最近收盘曲线</p>
-          </div>
-          <div class="stock-search">
-            <input v-model.trim="selectedCode" maxlength="6" placeholder="股票代码，如 600519" />
-            <button type="button" @click="loadHistory">查看</button>
-          </div>
-        </div>
-
-        <div v-if="chartData.points.length" class="chart-box" @mouseleave="hoverPoint = null">
-          <svg class="chart" viewBox="0 0 760 320" role="img" aria-label="K线与成交量走势">
-            <line x1="48" y1="34" x2="48" y2="220" stroke="#d5dce8" />
-            <line x1="48" y1="220" x2="730" y2="220" stroke="#d5dce8" />
-            <line x1="48" y1="270" x2="730" y2="270" stroke="#d5dce8" />
-            <text x="50" y="24" class="axis-label">价格</text>
-            <text x="50" y="292" class="axis-label">成交量</text>
-            <text x="672" y="24" class="axis-label">最高 {{ money(chartData.maxPrice) }}</text>
-            <text x="672" y="218" class="axis-label">最低 {{ money(chartData.minPrice) }}</text>
-
-            <g v-for="point in chartData.points" :key="point.date">
-              <rect
-                :x="point.x - point.volumeWidth / 2"
-                :y="point.volumeY"
-                :width="point.volumeWidth"
-                :height="point.volumeHeight"
-                :fill="point.close >= point.open ? '#ef4444' : '#16a34a'"
-                opacity="0.28"
-              />
-              <line
-                :x1="point.x"
-                :x2="point.x"
-                :y1="point.yHigh"
-                :y2="point.yLow"
-                :stroke="point.close >= point.open ? '#dc2626' : '#15803d'"
-                stroke-width="1.4"
-              />
-              <rect
-                :x="point.x - point.candleWidth / 2"
-                :y="Math.min(point.yOpen, point.yClose)"
-                :width="point.candleWidth"
-                :height="Math.max(2, Math.abs(point.yOpen - point.yClose))"
-                :fill="point.close >= point.open ? '#fee2e2' : '#dcfce7'"
-                :stroke="point.close >= point.open ? '#dc2626' : '#15803d'"
-              />
-              <circle
-                :cx="point.x"
-                :cy="point.yClose"
-                r="8"
-                fill="transparent"
-                @mouseenter="hoverPoint = point"
-                @mousemove="hoverPoint = point"
-              />
-            </g>
-          </svg>
-          <div
-            v-if="hoverPoint"
-            class="chart-tooltip"
-            :style="{ left: `${Math.min(hoverPoint.x + 18, 560)}px`, top: `${Math.max(hoverPoint.yClose - 78, 10)}px` }"
-          >
-            <strong>{{ hoverPoint.date }}</strong>
-            <span>开盘 {{ money(hoverPoint.open) }} / 收盘 {{ money(hoverPoint.close) }}</span>
-            <span>最高 {{ money(hoverPoint.high) }} / 最低 {{ money(hoverPoint.low) }}</span>
-            <span>涨跌 {{ pct(hoverPoint.change_pct) }} / 换手 {{ pct(hoverPoint.turnover) }}</span>
-            <span>成交额 {{ amountText(hoverPoint.amount) }}</span>
-          </div>
-        </div>
-        <p v-else class="empty">先同步数据库后输入代码查看历史。</p>
-      </div>
-
-      <div v-show="activeTab === 'data'" class="panel">
-        <div class="panel-head compact">
-          <div>
-            <h2>盘后数据入库</h2>
-            <p>收盘后同步全市场最新行情到数据库，并记录同步审计结果</p>
-          </div>
-        </div>
-        <div class="sync-row">
-          <button type="button" :disabled="busy.sync" @click="syncData">
-            {{ busy.sync ? '同步中' : '立即盘后同步' }}
-          </button>
-        </div>
-        <div v-if="latestSync" class="sync-detail">
-          <div><span>状态</span><strong :class="latestSync.status === 'success' ? 'pass' : 'fail'">{{ latestSync.status }}</strong></div>
-          <div><span>完成时间</span><strong>{{ latestSync.finished_at }}</strong></div>
-          <div><span>同步日期</span><strong>{{ latestSync.sync_date || '-' }}</strong></div>
-          <div><span>拉取行数</span><strong>{{ latestSync.fetched_rows }}</strong></div>
-          <div><span>有效行数</span><strong>{{ latestSync.valid_rows }}</strong></div>
-          <div><span>新增/更新</span><strong>{{ latestSync.inserted_rows }} / {{ latestSync.updated_rows }}</strong></div>
-        </div>
-        <pre v-if="syncResult">{{ syncResult }}</pre>
-      </div>
-    </section>
-
-    <div v-if="drawer.open" class="drawer-mask" @click.self="drawer.open = false">
-      <aside class="drawer">
-        <header>
-          <div>
-            <h2>{{ drawer.stock?.name }} {{ drawer.stock?.code }}</h2>
-            <p>技术特征与舆情风控</p>
-          </div>
-          <button type="button" @click="drawer.open = false">关闭</button>
-        </header>
-        <div v-if="drawer.stock" class="feature-grid">
-          <div><span>实体比例</span><strong>{{ pct(drawer.stock.tech_features.body_ratio) }}</strong></div>
-          <div><span>上影线</span><strong>{{ pct(drawer.stock.tech_features.upper_shadow) }}</strong></div>
-          <div><span>下影线</span><strong>{{ pct(drawer.stock.tech_features.lower_shadow) }}</strong></div>
-          <div><span>日内振幅</span><strong>{{ pct(drawer.stock.tech_features.amplitude) }}</strong></div>
-          <div><span>3日涨幅</span><strong>{{ pct(drawer.stock.trend_features?.return_3d) }}</strong></div>
-          <div><span>5日涨幅</span><strong>{{ pct(drawer.stock.trend_features?.return_5d) }}</strong></div>
-          <div><span>5日乖离</span><strong>{{ pct(drawer.stock.trend_features?.bias_5d) }}</strong></div>
-          <div><span>20日乖离</span><strong>{{ pct(drawer.stock.trend_features?.bias_20d) }}</strong></div>
-          <div><span>5日量能</span><strong>{{ scoreText(drawer.stock.trend_features?.volume_stack_5d) }}</strong></div>
-          <div><span>10日量比</span><strong>{{ scoreText(drawer.stock.trend_features?.volume_ratio_10d) }}</strong></div>
-          <div><span>3日红盘</span><strong>{{ pct(drawer.stock.trend_features?.red_ratio_3d) }}</strong></div>
-          <div><span>60日位置</span><strong>{{ pct(drawer.stock.trend_features?.high_position_60d) }}</strong></div>
-          <div><span>振幅/换手</span><strong>{{ scoreText(drawer.stock.trend_features?.amplitude_turnover_ratio) }}</strong></div>
-          <div><span>尾盘拉升</span><strong>{{ pct(drawer.stock.trend_features?.late_pull_pct) }}</strong></div>
-          <div><span>缩量大涨</span><strong>{{ drawer.stock.trend_features?.is_low_volume_rally ? '是' : '否' }}</strong></div>
-          <div><span>极端下影</span><strong>{{ drawer.stock.trend_features?.is_extreme_lower_shadow ? '是' : '否' }}</strong></div>
-          <div><span>断头铡刀</span><strong>{{ drawer.stock.trend_features?.is_recent_guillotine ? '是' : '否' }}</strong></div>
-        </div>
-        <button class="wide-btn" type="button" :disabled="busy.analyze" @click="analyzeStock">
-          {{ busy.analyze ? '分析中' : '运行舆情风控' }}
-        </button>
-        <section v-if="analysis" class="analysis-box">
-          <h3 :class="analysis.analysis.verdict.includes('绿') ? 'pass' : 'fail'">{{ analysis.analysis.verdict }}</h3>
-          <p><strong>情绪：</strong>{{ analysis.analysis.sentiment }}</p>
-          <p>{{ analysis.analysis.logic }}</p>
-          <ul>
-            <li v-for="(item, index) in analysis.analysis.evidence" :key="index">
-              {{ item.source }}：{{ item.quote }}
-            </li>
-          </ul>
+          <SelectionTable
+            title="影子账本月度复盘"
+            eyebrow="Monthly Shadow Test"
+            :rows="dailyPicks.rows"
+            mode="all"
+            use-months
+            :table-height="620"
+          />
         </section>
-      </aside>
+
+        <section v-show="activeSection === 'validation'" class="validation-grid">
+          <el-card class="dark-card" shadow="never">
+            <template #header>
+              <div class="card-head">
+                <div>
+                  <p class="eyebrow">15:05 Market Sync</p>
+                  <h2>数据同步</h2>
+                </div>
+                <el-button type="primary" :loading="busy.sync" @click="syncData">立即同步</el-button>
+              </div>
+            </template>
+
+            <el-descriptions :column="2" border class="dark-desc">
+              <el-descriptions-item label="状态">{{ latestSync?.status || '-' }}</el-descriptions-item>
+              <el-descriptions-item label="完成时间">{{ latestSync?.finished_at || '-' }}</el-descriptions-item>
+              <el-descriptions-item label="同步日期">{{ latestSync?.sync_date || '-' }}</el-descriptions-item>
+              <el-descriptions-item label="新增/更新">{{ latestSync ? `${latestSync.inserted_rows} / ${latestSync.updated_rows}` : '-' }}</el-descriptions-item>
+            </el-descriptions>
+            <pre v-if="syncResult">{{ syncResult }}</pre>
+          </el-card>
+
+          <el-card class="dark-card" shadow="never">
+            <template #header>
+              <div class="card-head">
+                <div>
+                  <p class="eyebrow">Triple Validation</p>
+                  <h2>校验报告</h2>
+                </div>
+                <el-button :loading="busy.validate" @click="runValidation">运行校验</el-button>
+              </div>
+            </template>
+
+            <div class="validation-form">
+              <el-input-number v-model="validationSample" :min="1" :max="10000" />
+              <el-checkbox v-model="sourceCheck">实时源交叉核验</el-checkbox>
+            </div>
+
+            <div class="pulse-grid validation-summary">
+              <article><span>状态</span><strong>{{ validation.status || overview.latest_report?.status || '-' }}</strong></article>
+              <article><span>错误</span><strong>{{ validation.summary?.error_count ?? overview.latest_report?.summary?.error_count ?? 0 }}</strong></article>
+              <article><span>警告</span><strong>{{ validation.summary?.warning_count ?? overview.latest_report?.summary?.warning_count ?? 0 }}</strong></article>
+              <article><span>最新日期</span><strong>{{ overview.latest_report?.summary?.latest_date_seen || overview.max_date || '-' }}</strong></article>
+            </div>
+          </el-card>
+
+          <el-card class="dark-card full-span" shadow="never">
+            <template #header>
+              <div class="card-head">
+                <div>
+                  <p class="eyebrow">Data Assets</p>
+                  <h2>数据资产</h2>
+                </div>
+              </div>
+            </template>
+            <div class="asset-grid">
+              <article><span>股票数</span><strong>{{ overview.stock_count ?? 0 }}</strong></article>
+              <article><span>K 线行数</span><strong>{{ overview.rows_count ?? 0 }}</strong></article>
+              <article><span>Parquet 文件</span><strong>{{ overview.parquet_files ?? 0 }}</strong></article>
+              <article><span>日期范围</span><strong>{{ overview.min_date || '-' }} / {{ overview.max_date || '-' }}</strong></article>
+            </div>
+          </el-card>
+        </section>
+      </main>
     </div>
-  </main>
+  </div>
 </template>
 
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
+import Sidebar from './components/Sidebar.vue'
+import StatsHeader from './components/StatsHeader.vue'
+import SelectionTable from './components/SelectionTable.vue'
 
-const API = 'http://127.0.0.1:8000'
+const API = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
 
-const tabs = [
-  { id: 'radar', label: '预测', hint: '实时候选与跟踪' },
-  { id: 'strategy', label: '策略', hint: '复盘与归因' },
-  { id: 'data', label: '数据', hint: '同步与验证' },
-  { id: 'stock', label: '单票', hint: 'K线验算' },
-]
-const activeTab = ref('radar')
-const loaded = reactive({
-  strategy: false,
-  data: false,
-  stock: false,
-})
+const activeSection = ref('dashboard')
 const overview = ref({})
-const radar = reactive({ rows: [], created_at: '', model_status: '', market_gate: null, strategy: '', intraday_snapshot: null })
+const health = ref({})
+const radar = reactive({ rows: [], created_at: '', model_status: '', market_gate: null })
 const dailyPicks = reactive({ rows: [] })
-const backtest = reactive({ summary: null, rows: [], strategy_rows: [], created_at: '' })
-const strategyLab = reactive({ summary: null, variants: [], thresholds: [], daily_picks: [], created_at: '' })
-const failureAnalysis = reactive({ summary: null, reasons: [], optimizations: [], sample_failures: [], created_at: '' })
-const upReason = reactive({ summary: null, factor_lifts: [], model_report: { feature_importance: [] }, llm_summary: {}, up_examples: [], down_examples: [], created_at: '' })
 const validation = reactive({ status: '', summary: null, issues: [] })
-const drawer = reactive({ open: false, stock: null })
+const message = reactive({ text: '', type: 'info' })
+const selectedStock = ref(null)
 const analysis = ref(null)
-const historyRows = ref([])
-const hoverPoint = ref(null)
-const selectedCode = ref('600519')
+const syncResult = ref('')
 const validationSample = ref(200)
 const sourceCheck = ref(false)
-const syncResult = ref('')
-const message = ref('')
-const messageType = ref('info')
-const busy = reactive({
-  overview: false,
-  scan: false,
-  validate: false,
-  sync: false,
-  analyze: false,
-  backtest: false,
-  strategyLab: false,
-  failureAnalysis: false,
-  upReason: false,
-})
+const busy = reactive({ refresh: false, scan: false, sync: false, validate: false, analyze: false })
 
-const money = (value) => Number(value ?? 0).toFixed(2)
-const pct = (value) => `${Number(value ?? 0).toFixed(2)}%`
-const scoreText = (value) => Number(value ?? 0).toFixed(2)
-const strategyBadgeText = (strategyType) => (
-  strategyType === '中线超跌反转'
-    ? '⏳ 中线超跌反转'
-    : strategyType === '右侧主升浪'
-      ? '🚀 顺势主升浪'
-      : (strategyType || '尾盘突破')
-)
-const strategyBadgeClass = (strategyType) => [
-  'strategy-badge',
-  strategyType === '中线超跌反转'
-    ? 'strategy-badge-reversal'
-    : strategyType === '右侧主升浪'
-      ? 'strategy-badge-main-wave'
-    : strategyType === '首阴低吸'
-      ? 'strategy-badge-dipbuy'
-      : 'strategy-badge-breakout',
-]
-const isReversalStrategy = (row) => (row?.strategy_type || row) === '中线超跌反转'
-const isMainWaveStrategy = (row) => (row?.strategy_type || row) === '右侧主升浪'
-const isSwingStrategy = (row) => isReversalStrategy(row) || isMainWaveStrategy(row)
-const resultPremiumValue = (row) => {
-  if (!row) return null
-  const value = isSwingStrategy(row) ? row.t3_max_gain_pct : row.open_premium
-  return value === null || value === undefined ? null : Number(value)
-}
-const resultPremiumLabel = (row) => (isSwingStrategy(row) ? 'T+3最大涨幅' : 'T+1开盘溢价')
-const resultPremiumText = (row) => {
-  const value = resultPremiumValue(row)
-  return value === null || Number.isNaN(value) ? '-' : pct(value)
-}
-const resultPremiumClass = (row) => {
-  const value = resultPremiumValue(row)
-  if (value === null || Number.isNaN(value)) return ''
-  return value >= 0 ? 'up' : 'down'
-}
-const tradeExitDateText = (row) => {
-  if (!row) return '-'
-  if (isSwingStrategy(row)) {
-    const date = row.t3_exit_date || row.target_date
-    return date ? `${date} · T+3观察期` : 'T+3观察期'
-  }
-  return row.next_date || row.target_date || '-'
-}
-const exitPriceText = (row) => {
-  if (!row) return '-'
-  if (isSwingStrategy(row)) return '波段持仓'
-  const price = row.next_open ?? row.open_price
-  return price ? money(price) : '-'
-}
-const strategyCountsText = (counts) => {
-  if (!counts || Object.keys(counts).length === 0) return '-'
-  return Object.entries(counts).map(([name, count]) => `${name} ${count}`).join(' / ')
-}
-const amountText = (value) => {
-  const amount = Number(value ?? 0)
-  if (amount >= 100000000) return `${(amount / 100000000).toFixed(2)} 亿`
-  if (amount >= 10000) return `${(amount / 10000).toFixed(2)} 万`
-  return amount.toFixed(0)
-}
+const currentTitle = computed(() => ({
+  dashboard: 'Dashboard 总览',
+  ledger: 'Shadow Test 影子账本',
+  validation: 'Validation 数据校验',
+})[activeSection.value] || 'Dashboard 总览')
 const latestSync = computed(() => overview.value.latest_sync || null)
-const shadowRows = computed(() => dailyPicks.rows.slice(0, 5))
-const syncStatusText = (sync) => {
-  if (!sync) return '暂无记录'
-  if (sync.status !== 'success') return '同步失败'
-  return `${sync.sync_date || '-'} 成功`
+const localDateText = (date = new Date()) => {
+  const y = date.getFullYear()
+  const m = String(date.getMonth() + 1).padStart(2, '0')
+  const d = String(date.getDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
 }
-const marketGateText = (gate) => {
-  if (!gate) return ''
-  const base = `${gate.mode || '-'}，成交额 ${Number(gate.market_amount_yi || 0).toFixed(0)} 亿，红盘率 ${pct(gate.market_up_rate)}，下跌 ${gate.market_down_count || 0}`
-  const reason = (gate.reasons || []).join('；')
-  return reason ? `${base}；${reason}` : base
-}
-const intradaySnapshotText = (snapshot) => {
-  if (!snapshot) return '未启用'
-  if (snapshot.status === 'ready') {
-    return `${snapshot.snapshot_at || '-'}，匹配 ${snapshot.matched_count || 0}，拦截 ${snapshot.trapped_count || 0}`
+const todayText = computed(() => localDateText())
+const todayLockedCount = computed(() => dailyPicks.rows.filter((row) => row.selection_date === todayText.value).length)
+const operationCards = computed(() => dailyPicks.rows.filter((row) => row.selection_date === todayText.value || row.status === 'pending_open' || !row.is_closed).slice(0, 6))
+const strategyStats = computed(() => ['右侧主升浪', '中线超跌反转', '尾盘突破'].map((strategy) => {
+  const rows = dailyPicks.rows.filter((row) => row.strategy_type === strategy)
+  const settled = rows.filter((row) => resultValue(row) !== null)
+  const wins = settled.filter((row) => resultValue(row) > 0).length
+  const avgRaw = settled.length ? settled.reduce((sum, row) => sum + resultValue(row), 0) / settled.length : null
+  return {
+    strategy,
+    isSwing: isSwingStrategy(strategy),
+    count: rows.length,
+    openCount: rows.filter((row) => !row.is_closed).length,
+    winRate: settled.length ? pct((wins / settled.length) * 100) : '-',
+    avgReturnRaw: avgRaw,
+    avgReturn: avgRaw === null ? '-' : pct(avgRaw),
   }
-  if (snapshot.status === 'missing_snapshot') return '未找到今日快照'
-  if (snapshot.status === 'stale_snapshot') return `快照日期 ${snapshot.snapshot_date || '-'}，非今日`
-  return snapshot.status || '未知'
-}
-const radarEmptyReason = computed(() => {
-  if (busy.scan) return '正在重新扫描全市场，请等待模型返回结果。'
-  if (!radar.created_at && radar.model_status === 'no_cache') return '还没有预测缓存，点击“实时预测”后会生成最新结果。'
-  if (radar.market_gate?.blocked) {
-    const reasons = (radar.market_gate.reasons || []).join('；')
-    return reasons || '大盘风控触发，系统已主动空仓。'
-  }
-  if (radar.intraday_snapshot?.trapped_count > 0) {
-    return `尾盘快照拦截 ${radar.intraday_snapshot.trapped_count} 只异动股，剩余股票未达到高置信规则。`
-  }
-  if (radar.model_status) {
-    return '当前没有股票同时满足高置信综合评分、正预期溢价、风险过滤和断头铡刀过滤。'
-  }
-  return '暂无预测数据，点击“实时预测”获取最新候选池。'
-})
-const expectedPremium = (pick) => Number(
-  isSwingStrategy(pick)
-    ? (pick.expected_t3_max_gain_pct ?? pick.expected_premium ?? pick.predicted_open_premium ?? 0)
-    : (pick.expected_premium ?? pick.predicted_open_premium ?? 0),
-)
-const shadowExpectedLabel = (pick) => (isSwingStrategy(pick) ? '14:50 T+3预期' : '14:50 预期')
-const actualPremium = (pick) => {
-  if (pick.open_premium === null || pick.open_premium === undefined) return null
-  return Number(pick.open_premium)
-}
-const premiumError = (pick) => {
-  if (isSwingStrategy(pick)) return null
-  const actual = actualPremium(pick)
-  if (actual === null) return null
-  return Math.abs(actual - expectedPremium(pick))
-}
-const premiumErrorText = (pick) => {
-  const value = premiumError(pick)
-  return value === null ? '-' : pct(value)
-}
-const precisionBadgeText = (pick) => {
-  if (isSwingStrategy(pick)) return '波段持仓等待结算'
-  const value = premiumError(pick)
-  if (value === null) return '等待回填'
-  return value < 1 ? '外推精准' : '偏差过大'
-}
-const precisionBadgeClass = (pick) => [
-  'precision-badge',
-  isSwingStrategy(pick)
-    ? 'precision-pending'
-    : premiumError(pick) === null
-      ? 'precision-pending'
-      : premiumError(pick) < 1
-        ? 'precision-good'
-        : 'precision-bad',
-]
-const exitActionText = (pick) => {
-  const actual = actualPremium(pick)
-  if (isSwingStrategy(pick)) {
-    if (actual === null) return '待审判'
-    return actual < -4 ? '破位核按钮' : '静默洗盘'
-  }
-  return pick.exit_action || (actual === null ? '待审判' : '落袋为安')
-}
-const exitActionClass = (pick) => [
-  'exit-tag',
-  isSwingStrategy(pick) && exitActionText(pick) === '静默洗盘'
-    ? 'exit-silent'
-    : pick.exit_level === 'danger' || ['核按钮', '破位核按钮'].includes(exitActionText(pick))
-    ? 'exit-danger'
-    : pick.exit_level === 'strong' || exitActionText(pick) === '超预期锁仓'
-      ? 'exit-strong'
-      : actualPremium(pick) === null
-        ? 'exit-pending'
-        : 'exit-profit',
-]
-const shadowInstructionText = (pick) => {
-  const actual = actualPremium(pick)
-  if (isSwingStrategy(pick)) {
-    if (actual === null) return '等待 09:26 哨兵回填开盘波动，并等待 14:45 波段巡逻兵指令。'
-    if (actual < -4) return '遭遇极端低开下杀，洗盘过度逻辑破位，按跌停价挂单斩断亏损！'
-    return '开盘波动在正常洗盘区间 (>-4%)，保持静默，等待 14:45 波段巡逻兵指令。'
-  }
-  return pick.exit_instruction || '等待 09:26 哨兵生成操作指令'
-}
-const premiumBarClass = (value) => ['premium-bar', Number(value) >= 0 ? 'premium-bar-up' : 'premium-bar-down']
-const premiumBarStyle = (value) => ({
-  width: `${Math.min(Math.max(Math.abs(Number(value ?? 0)) * 18, 4), 100)}%`,
-})
+}))
 
 const request = async (path, options = {}) => {
   const response = await fetch(`${API}${path}`, options)
@@ -1035,169 +300,63 @@ const request = async (path, options = {}) => {
   }
   return response.json()
 }
-
 const setMessage = (text, type = 'info') => {
-  message.value = text
-  messageType.value = type
+  message.text = text
+  message.type = type
 }
-
-const setActiveTab = async (tabId) => {
-  activeTab.value = tabId
-  if (tabId === 'strategy' && !loaded.strategy) {
-    loaded.strategy = true
-    await Promise.all([loadBacktest(), loadStrategyLab(), loadFailureAnalysis()])
-  }
-  if (tabId === 'data' && !loaded.data) {
-    loaded.data = true
-    await loadOverview()
-  }
-  if (tabId === 'stock' && !loaded.stock) {
-    loaded.stock = true
-    await loadHistory()
-  }
-}
-
-const loadOverview = async () => {
-  busy.overview = true
+const refreshAll = async () => {
+  busy.refresh = true
   try {
-    overview.value = await request('/api/overview')
+    await Promise.all([loadHealth(), loadOverview(), loadRadarCache(), loadDailyPicks()])
+    setMessage('工作站状态已刷新。')
   } catch (error) {
-    setMessage(`状态读取失败：${error.message}`, 'error')
+    setMessage(`刷新失败：${error.message}`, 'error')
   } finally {
-    busy.overview = false
+    busy.refresh = false
   }
 }
-
+const loadHealth = async () => {
+  try {
+    health.value = await request('/health')
+  } catch {
+    health.value = { ok: false, pushplus: { ok: false, reason: '后端不可达' } }
+  }
+}
+const loadOverview = async () => {
+  overview.value = await request('/api/overview')
+}
 const applyRadarPayload = (data) => {
-  radar.rows = (data.rows || []).slice(0, 10)
+  radar.rows = data.rows || []
   radar.created_at = data.created_at || ''
   radar.model_status = data.model_status || data.strategy || ''
   radar.market_gate = data.market_gate || null
-  radar.strategy = data.strategy || ''
-  radar.intraday_snapshot = data.intraday_snapshot || null
 }
-
-const loadCachedRadar = async () => {
-  try {
-    const data = await request('/api/radar/cache')
-    applyRadarPayload(data)
-  } catch (error) {
-    setMessage(`预测缓存读取失败：${error.message}`, 'error')
-  }
+const loadRadarCache = async () => {
+  const data = await request('/api/radar/cache')
+  applyRadarPayload(data)
 }
-
+const loadDailyPicks = async () => {
+  const data = await request('/api/daily-picks?limit=500')
+  dailyPicks.rows = data.rows || []
+}
 const scanRadar = async () => {
   busy.scan = true
   try {
     const data = await request('/api/radar/scan?limit=10')
     applyRadarPayload(data)
-    setMessage(radar.rows.length ? `完成实时预测并写入缓存，展示 ${radar.rows.length} 只股票。` : '完成实时预测：当前无高置信候选，空仓避险。', 'info')
-    await loadOverview()
+    setMessage(radar.rows.length ? `扫描完成：${radar.rows.length} 条候选。` : '扫描完成：当前空仓避险。')
   } catch (error) {
     setMessage(`实时预测失败：${error.message}`, 'error')
   } finally {
     busy.scan = false
   }
 }
-
-const loadDailyPicks = async () => {
-  try {
-    const data = await request('/api/daily-picks?limit=20')
-    dailyPicks.rows = data.rows || []
-  } catch (error) {
-    setMessage(`14:50 推送标的读取失败：${error.message}`, 'error')
-  }
-}
-
-const loadBacktest = async (refresh = false) => {
-  busy.backtest = true
-  try {
-    const data = await request(`/api/backtest/top-pick-open?months=12${refresh ? '&refresh=true' : ''}`)
-    backtest.summary = data.summary
-    backtest.rows = data.rows || []
-    backtest.strategy_rows = data.strategy_rows || []
-    backtest.created_at = data.created_at
-  } catch (error) {
-    setMessage(`复盘统计失败：${error.message}`, 'error')
-  } finally {
-    busy.backtest = false
-  }
-}
-
-const loadStrategyLab = async (refresh = false) => {
-  busy.strategyLab = true
-  try {
-    const data = await request(`/api/strategy/lab?months=12${refresh ? '&refresh=true' : ''}`)
-    strategyLab.summary = data.summary
-    strategyLab.variants = data.variants || []
-    strategyLab.thresholds = data.thresholds || []
-    strategyLab.daily_picks = data.daily_picks || []
-    strategyLab.created_at = data.created_at
-  } catch (error) {
-    setMessage(`策略实验失败：${error.message}`, 'error')
-  } finally {
-    busy.strategyLab = false
-  }
-}
-
-const loadFailureAnalysis = async (refresh = false) => {
-  busy.failureAnalysis = true
-  try {
-    const data = await request(`/api/strategy/failure-analysis?months=12${refresh ? '&refresh=true' : ''}`)
-    failureAnalysis.summary = data.summary
-    failureAnalysis.reasons = data.reasons || []
-    failureAnalysis.optimizations = data.optimizations || []
-    failureAnalysis.sample_failures = data.sample_failures || []
-    failureAnalysis.created_at = data.created_at
-  } catch (error) {
-    setMessage(`失败归因分析失败：${error.message}`, 'error')
-  } finally {
-    busy.failureAnalysis = false
-  }
-}
-
-const loadUpReason = async (refresh = false) => {
-  busy.upReason = true
-  try {
-    const data = await request(`/api/strategy/up-reason-analysis?months=12${refresh ? '&refresh=true' : ''}`)
-    upReason.summary = data.summary
-    upReason.factor_lifts = data.factor_lifts || []
-    upReason.model_report = data.model_report || { feature_importance: [] }
-    upReason.llm_summary = data.llm_summary || {}
-    upReason.up_examples = data.up_examples || []
-    upReason.down_examples = data.down_examples || []
-    upReason.created_at = data.created_at
-  } catch (error) {
-    setMessage(`上涨原因分析失败：${error.message}`, 'error')
-  } finally {
-    busy.upReason = false
-  }
-}
-
-const runValidation = async () => {
-  busy.validate = true
-  try {
-    const data = await request(`/api/data/validate?sample=${validationSample.value}&source_check=${sourceCheck.value}`, {
-      method: 'POST',
-    })
-    validation.status = data.status
-    validation.summary = data.summary
-    validation.issues = data.issues || []
-    setMessage(`验证完成：${data.status}，错误 ${data.summary.error_count}，警告 ${data.summary.warning_count}。`, data.status === 'pass' ? 'info' : 'error')
-    await loadOverview()
-  } catch (error) {
-    setMessage(`验证失败：${error.message}`, 'error')
-  } finally {
-    busy.validate = false
-  }
-}
-
 const syncData = async () => {
   busy.sync = true
   try {
     const data = await request('/api/data/market-sync/run', { method: 'POST' })
     syncResult.value = JSON.stringify(data, null, 2)
-    setMessage(`盘后同步完成：有效 ${data.valid_rows} 行，新增 ${data.inserted_rows}，更新 ${data.updated_rows}。`, 'info')
+    setMessage(`同步完成：有效 ${data.valid_rows} 行，新增 ${data.inserted_rows}，更新 ${data.updated_rows}。`)
     await loadOverview()
   } catch (error) {
     setMessage(`同步失败：${error.message}`, 'error')
@@ -1205,1039 +364,408 @@ const syncData = async () => {
     busy.sync = false
   }
 }
-
-const loadHistory = async () => {
-  if (!/^\d{6}$/.test(selectedCode.value)) {
-    setMessage('请输入 6 位股票代码。', 'error')
-    return
-  }
+const runValidation = async () => {
+  busy.validate = true
   try {
-    const data = await request(`/api/data/history/${selectedCode.value}?limit=120`)
-    historyRows.value = data.rows || []
+    const data = await request(`/api/data/validate?sample=${validationSample.value}&source_check=${sourceCheck.value}`, { method: 'POST' })
+    validation.status = data.status || ''
+    validation.summary = data.summary || null
+    validation.issues = data.issues || []
+    setMessage(`校验完成：${validation.status || '-'}。`, validation.status === 'pass' ? 'info' : 'error')
+    await loadOverview()
   } catch (error) {
-    historyRows.value = []
-    setMessage(`历史读取失败：${error.message}`, 'error')
+    setMessage(`校验失败：${error.message}`, 'error')
+  } finally {
+    busy.validate = false
   }
 }
-
-const inspectStock = async (stock) => {
-  drawer.open = true
-  drawer.stock = stock
-  analysis.value = null
-  selectedCode.value = stock.code
-  await loadHistory()
-}
-
 const analyzeStock = async () => {
-  if (!drawer.stock) return
+  if (!selectedStock.value) return
   busy.analyze = true
   try {
     analysis.value = await request('/api/radar/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code: drawer.stock.code, name: drawer.stock.name }),
+      body: JSON.stringify({ code: selectedStock.value.code, name: selectedStock.value.name }),
     })
   } catch (error) {
-    setMessage(`舆情分析失败：${error.message}`, 'error')
+    setMessage(`Ollama 风控失败：${error.message}`, 'error')
   } finally {
     busy.analyze = false
   }
 }
+const inspectStock = (row) => {
+  selectedStock.value = row
+  analysis.value = null
+}
 
-const chartData = computed(() => {
-  const rows = historyRows.value.filter((row) => Number(row.close) > 0)
-  if (rows.length < 2) return { points: [], minPrice: 0, maxPrice: 0 }
-  const visibleRows = rows.slice(-90)
-  const prices = visibleRows.flatMap((row) => [Number(row.high), Number(row.low), Number(row.open), Number(row.close)]).filter((value) => value > 0)
-  const volumes = visibleRows.map((row) => Number(row.volume ?? 0))
-  const minPrice = Math.min(...prices)
-  const maxPrice = Math.max(...prices)
-  const maxVolume = Math.max(...volumes, 1)
-  const priceSpread = maxPrice - minPrice || 1
-  const left = 54
-  const right = 724
-  const top = 38
-  const bottom = 218
-  const volumeBottom = 270
-  const volumeMaxHeight = 42
-  const step = (right - left) / Math.max(visibleRows.length - 1, 1)
-  const candleWidth = Math.max(3, Math.min(9, step * 0.58))
-  const volumeWidth = Math.max(2, Math.min(7, step * 0.42))
-  const yPrice = (value) => bottom - ((Number(value) - minPrice) / priceSpread) * (bottom - top)
-
-  return {
-    minPrice,
-    maxPrice,
-    points: visibleRows.map((row, index) => {
-      const volumeHeight = (Number(row.volume ?? 0) / maxVolume) * volumeMaxHeight
-      return {
-        ...row,
-        date: row.date,
-        open: Number(row.open ?? 0),
-        high: Number(row.high ?? 0),
-        low: Number(row.low ?? 0),
-        close: Number(row.close ?? 0),
-        change_pct: Number(row.change_pct ?? 0),
-        turnover: Number(row.turnover ?? 0),
-        amount: Number(row.amount ?? 0),
-        x: left + index * step,
-        yOpen: yPrice(row.open),
-        yHigh: yPrice(row.high),
-        yLow: yPrice(row.low),
-        yClose: yPrice(row.close),
-        candleWidth,
-        volumeWidth,
-        volumeHeight,
-        volumeY: volumeBottom - volumeHeight,
-      }
-    })
+const isSwingStrategy = (value) => {
+  const strategy = typeof value === 'string' ? value : value?.strategy_type
+  return strategy === '中线超跌反转' || strategy === '右侧主升浪'
+}
+const resultValue = (row) => {
+  const value = isSwingStrategy(row) ? row.t3_max_gain_pct : row.open_premium
+  const num = Number(value)
+  return Number.isFinite(num) ? num : null
+}
+const pct = (value) => {
+  const num = Number(value)
+  return Number.isFinite(num) ? `${num.toFixed(2)}%` : '-'
+}
+const amountYi = (value) => {
+  const num = Number(value)
+  return Number.isFinite(num) && num > 0 ? `${num.toFixed(0)} 亿` : '-'
+}
+const numberClass = (value) => {
+  const num = Number(value)
+  if (!Number.isFinite(num) || num === 0) return ''
+  return num > 0 ? 'buy' : 'risk'
+}
+const strategyLabel = (strategy) => {
+  if (strategy === '右侧主升浪') return '顺势主升浪'
+  if (strategy === '中线超跌反转') return '中线超跌反转'
+  if (strategy === '首阴低吸') return '低吸影子'
+  return '尾盘突破'
+}
+const strategyBadgeClass = (strategy) => [
+  'strategy-badge',
+  strategy === '右侧主升浪' ? 'strategy-main' : strategy === '中线超跌反转' ? 'strategy-reversal' : strategy === '首阴低吸' ? 'strategy-dip' : 'strategy-breakout',
+]
+const instructionTitle = (pick) => {
+  const actual = Number(pick.open_premium)
+  if (isSwingStrategy(pick)) {
+    if (!Number.isFinite(actual)) return '等待哨兵'
+    return actual < -4 ? '破位核按钮' : '静默洗盘'
   }
-})
+  if (!Number.isFinite(actual)) return '等待开盘'
+  if (actual < 0) return '核按钮'
+  if (actual >= 3) return '超预期锁仓'
+  return '落袋为安'
+}
+const instructionClass = (pick) => instructionTitle(pick).includes('核') ? 'risk' : instructionTitle(pick).includes('等待') ? 'neutral' : 'buy'
+const instructionBody = (pick) => {
+  const actual = Number(pick.open_premium)
+  if (isSwingStrategy(pick)) {
+    if (!Number.isFinite(actual)) return '等待 09:26 开盘哨兵，随后由 14:45 波段巡逻兵管理。'
+    return actual < -4 ? `开盘 ${pct(actual)}，洗盘过度，触发止损警告。` : `开盘 ${pct(actual)}，正常洗盘，等待 14:45 指令。`
+  }
+  if (!Number.isFinite(actual)) return '等待 T+1 集合竞价回填。'
+  return `T+1 开盘溢价 ${pct(actual)}，按极速隔夜规则处理。`
+}
 
-onMounted(async () => {
-  await loadOverview()
-  await loadCachedRadar()
-  await loadDailyPicks()
-})
+onMounted(refreshAll)
 </script>
 
 <style scoped>
-* {
-  box-sizing: border-box;
-}
-
-.page {
+.terminal-app {
   min-height: 100vh;
-  background:
-    linear-gradient(180deg, #eef4fb 0, #f7f8fb 260px),
-    #f7f8fb;
-  color: #162033;
-  padding: 24px;
+  background: var(--terminal-bg);
+  color: var(--terminal-text);
 }
 
-.topbar,
-.panel,
-.metric,
-.notice,
-.tabbar {
-  border: 1px solid #d9e0ea;
-  background: #ffffff;
-  border-radius: 8px;
+.main-grid {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  min-height: calc(100vh - 76px);
 }
 
-.topbar {
+.content {
+  min-width: 0;
+  padding: 16px;
+}
+
+.page-stack {
+  display: grid;
+  gap: 14px;
+}
+
+.dashboard-grid,
+.dual-board,
+.validation-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+}
+
+.full-span {
+  grid-column: 1 / -1;
+}
+
+.dark-card {
+  --el-card-bg-color: var(--terminal-card);
+  --el-card-border-color: var(--terminal-border);
+  --el-text-color-primary: var(--terminal-text);
+  --el-text-color-regular: #a8b3c7;
+  border-radius: 14px;
+}
+
+.card-head,
+.toolbar-panel {
   display: flex;
-  align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding: 18px 20px;
-  box-shadow: 0 10px 24px rgba(22, 32, 51, 0.06);
+  gap: 12px;
+  align-items: center;
+}
+
+.toolbar-panel {
+  border: 1px solid var(--terminal-border);
+  border-radius: 14px;
+  padding: 14px 16px;
+  background: var(--terminal-card);
+}
+
+.toolbar-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .eyebrow {
   margin: 0 0 4px;
-  color: #66758c;
-  font-size: 0.82rem;
+  color: #6f7d95;
+  font-size: 0.72rem;
+  font-weight: 900;
   text-transform: uppercase;
 }
 
-h1,
 h2,
-h3,
 p {
   margin: 0;
 }
 
-h1 {
-  font-size: 1.55rem;
-  line-height: 1.2;
-}
-
 h2 {
-  font-size: 1.05rem;
-  line-height: 1.25;
-}
-
-button {
-  border: 1px solid #1f5fbf;
-  background: #2563eb;
-  color: #ffffff;
-  border-radius: 6px;
-  padding: 8px 12px;
-  font-weight: 700;
-  cursor: pointer;
-  min-height: 36px;
-  max-width: 100%;
-  white-space: nowrap;
-}
-
-button:hover:not(:disabled) {
-  filter: brightness(0.98);
-}
-
-button:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-input {
-  border: 1px solid #c9d3e1;
-  border-radius: 6px;
-  padding: 8px 10px;
-  color: #162033;
-  background: #ffffff;
-  max-width: 100%;
-}
-
-.toolbar,
-.sync-row,
-.stock-search,
-.audit-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.toolbar button {
-  flex: 0 0 auto;
-}
-
-.status-grid {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(150px, 1fr));
-  gap: 10px;
-  margin: 14px 0;
-}
-
-.metric {
-  padding: 12px 14px;
-  min-width: 0;
-}
-
-.metric span,
-.panel-head p,
-.issue span,
-label {
-  color: #66758c;
-  font-size: 0.86rem;
-}
-
-.metric strong {
-  display: block;
-  margin-top: 5px;
-  font-size: 1.05rem;
-  line-height: 1.25;
-  overflow-wrap: anywhere;
-}
-
-.metric small {
-  display: block;
-  margin-top: 6px;
-  color: #66758c;
-  line-height: 1.4;
-}
-
-.notice {
-  margin-bottom: 16px;
-  padding: 12px 14px;
-}
-
-.tabbar {
-  position: sticky;
-  top: 12px;
-  z-index: 5;
-  display: grid;
-  grid-template-columns: repeat(4, minmax(128px, 1fr));
-  gap: 8px;
-  padding: 8px;
-  margin-bottom: 16px;
-  box-shadow: 0 8px 22px rgba(22, 32, 51, 0.05);
-}
-
-.tabbar button {
-  display: grid;
-  gap: 2px;
-  min-height: 56px;
-  border-color: transparent;
-  background: transparent;
-  color: #44546a;
-  text-align: left;
-  padding: 9px 12px;
-}
-
-.tabbar button.active {
-  border-color: #bfd1ea;
-  background: #eef6ff;
-  color: #123b74;
-}
-
-.tabbar span {
-  font-size: 0.98rem;
-}
-
-.tabbar small {
-  color: #74839a;
-  font-weight: 600;
-}
-
-.notice.error {
-  border-color: #ef9a9a;
-  background: #fff5f5;
-  color: #b91c1c;
-}
-
-.workbench {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 380px;
-  gap: 16px;
-}
-
-.single-panel {
-  grid-template-columns: minmax(0, 1fr);
-}
-
-.detail-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 380px;
-  gap: 16px;
-  margin-top: 16px;
-}
-
-.pick-panel,
-.shadow-panel,
-.backtest-panel,
-.strategy-panel {
-  margin-top: 16px;
-}
-
-.panel {
-  padding: 16px;
-  min-width: 0;
-  box-shadow: 0 8px 18px rgba(22, 32, 51, 0.04);
-}
-
-.panel-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 14px;
-  min-width: 0;
-}
-
-.panel-head.compact {
-  align-items: center;
-  flex-wrap: wrap;
-}
-
-.panel-head > div {
-  min-width: 0;
-}
-
-.panel-head p {
-  line-height: 1.45;
-  overflow-wrap: anywhere;
-}
-
-.model-state {
-  color: #40516b;
-  font-size: 0.78rem;
-  max-width: 260px;
-  text-align: right;
-  overflow-wrap: anywhere;
-}
-
-.muted-line {
-  color: #66758c;
-}
-
-.empty-state {
-  display: grid;
-  gap: 6px;
-  border: 1px solid #d9e0ea;
-  border-radius: 8px;
-  padding: 14px 16px;
-  margin-bottom: 12px;
-  background: #f8fafc;
-}
-
-.empty-state strong {
+  color: var(--terminal-text);
   font-size: 1rem;
 }
 
-.empty-state span {
-  color: #66758c;
+.message-alert {
+  margin-bottom: 14px;
+}
+
+.empty-panel {
+  display: grid;
+  gap: 6px;
+  border: 1px dashed rgba(255, 255, 255, 0.14);
+  border-radius: 12px;
+  padding: 18px;
+  color: #a8b3c7;
+}
+
+.empty-panel strong {
+  color: var(--terminal-text);
+}
+
+.instruction-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.instruction-card {
+  border: 1px solid var(--terminal-border);
+  border-radius: 12px;
+  padding: 12px;
+  background: var(--terminal-bg);
+}
+
+.instruction-card header {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.instruction-card p {
+  color: var(--terminal-text);
+  font-weight: 900;
+}
+
+.instruction-card small,
+.muted {
+  display: block;
+  margin-top: 6px;
+  color: #7f8aa1;
   line-height: 1.5;
 }
 
-.risk-off {
-  border-color: #fed7aa;
-  background: #fff7ed;
+.pulse-grid,
+.asset-grid,
+.analysis-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
 }
 
-.risk-off strong {
-  color: #b45309;
+.pulse-grid article,
+.asset-grid article,
+.analysis-grid article {
+  border: 1px solid var(--terminal-border);
+  border-radius: 12px;
+  padding: 11px;
+  background: var(--terminal-bg);
 }
 
-.table-wrap {
-  overflow-x: auto;
-  max-width: 100%;
-  -webkit-overflow-scrolling: touch;
+.pulse-grid span,
+.asset-grid span,
+.analysis-grid span,
+.legion-card dt {
+  display: block;
+  color: #6f7d95;
+  font-size: 0.75rem;
+  font-weight: 800;
 }
 
-table {
-  width: 100%;
-  border-collapse: collapse;
-  min-width: 860px;
+.pulse-grid strong,
+.asset-grid strong,
+.analysis-grid strong {
+  display: block;
+  margin-top: 5px;
+  color: var(--terminal-text);
+  font-weight: 900;
+  overflow-wrap: anywhere;
 }
 
-th,
-td {
-  border-bottom: 1px solid #e5eaf1;
-  padding: 9px 8px;
-  text-align: left;
-  font-size: 0.89rem;
-  vertical-align: middle;
+.wide {
+  grid-column: 1 / -1;
 }
 
-th {
-  color: #66758c;
-  font-size: 0.78rem;
-  text-transform: uppercase;
-  background: #f8fafc;
+.legion-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
 }
 
-tbody tr:hover {
-  background: #fbfdff;
+.legion-card :deep(.el-card__body) {
+  display: grid;
+  gap: 10px;
 }
 
-.num {
-  text-align: right;
+.legion-card > strong {
+  font-size: 1.5rem;
+  color: var(--terminal-text);
 }
 
-.metric-stack {
-  display: inline-flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 2px;
-  line-height: 1.2;
-  white-space: nowrap;
-}
-
-.metric-stack small {
+.legion-card dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
   margin: 0;
-  color: #66758c;
-  font-size: 0.7rem;
-  font-weight: 700;
 }
 
-.metric-stack strong {
-  font-size: 0.92rem;
+.legion-card dd {
+  margin: 4px 0 0;
+  color: var(--terminal-text);
+  font-weight: 900;
 }
 
-.mono {
-  font-family: 'SF Mono', Menlo, monospace;
-}
-
-.up,
-.fail,
-.error {
-  color: #c2410c;
-}
-
-.down,
-.pass {
-  color: #15803d;
-}
-
-.pending {
-  color: #b45309;
-}
-
-.score {
-  font-weight: 800;
-}
-
-.pill {
-  display: inline-flex;
+.validation-form {
+  display: flex;
   align-items: center;
-  gap: 4px;
-  min-height: 24px;
-  padding: 3px 8px;
-  border: 1px solid #c9d3e1;
-  border-radius: 999px;
-  background: #f8fafc;
-  color: #334155;
-  font-size: 0.78rem;
-  font-weight: 800;
-  white-space: nowrap;
+  gap: 12px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.dark-desc {
+  --el-fill-color-blank: var(--terminal-bg);
+  --el-border-color-lighter: var(--terminal-border);
+  --el-text-color-primary: var(--terminal-text);
+  --el-text-color-regular: #a8b3c7;
+}
+
+pre {
+  margin: 12px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  border-radius: 10px;
+  padding: 12px;
+  background: #0b0b0f;
+  color: #d7deeb;
 }
 
 .strategy-badge {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  min-height: 22px;
-  margin-left: 6px;
+  min-height: 23px;
+  border-radius: 999px;
   padding: 2px 8px;
-  border: 1px solid transparent;
-  border-radius: 999px;
-  font-size: 0.74rem;
-  font-weight: 800;
-  line-height: 1.2;
-  white-space: nowrap;
-  vertical-align: middle;
-}
-
-.strategy-badge-breakout {
-  border-color: #bfdbfe;
-  background: #dbeafe;
-  color: #1e40af;
-}
-
-.strategy-badge-dipbuy {
-  border-color: #fed7aa;
-  background: #ffedd5;
-  color: #9a3412;
-}
-
-.strategy-badge-reversal {
-  border-color: #fecaca;
-  background: #fee2e2;
-  color: #991b1b;
-}
-
-.strategy-badge-main-wave {
-  border-color: #ddd6fe;
-  background: #f5f3ff;
-  color: #6d28d9;
-}
-
-.shadow-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 12px;
-}
-
-.shadow-card {
-  display: grid;
-  gap: 12px;
-  border: 1px solid #e1e7f0;
-  border-radius: 8px;
-  padding: 12px;
-  background: #fbfcfe;
-  min-width: 0;
-}
-
-.shadow-card header,
-.shadow-card footer {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  align-items: flex-start;
-  min-width: 0;
-  flex-wrap: wrap;
-}
-
-.shadow-card header strong {
-  display: block;
-  line-height: 1.35;
-  overflow-wrap: anywhere;
-}
-
-.shadow-card small,
-.shadow-side span,
-.shadow-card footer span {
-  color: #66758c;
-  font-size: 0.78rem;
-  line-height: 1.35;
-}
-
-.shadow-compare {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.shadow-side {
-  display: grid;
-  gap: 7px;
-  border: 1px solid #e5eaf1;
-  border-radius: 6px;
-  padding: 10px;
-  background: #ffffff;
-  min-width: 0;
-}
-
-.shadow-side strong {
-  font-size: 1.05rem;
-}
-
-.premium-track {
-  position: relative;
-  height: 8px;
-  border-radius: 999px;
-  background: #e5eaf1;
-  overflow: hidden;
-}
-
-.premium-bar {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-}
-
-.premium-bar-up {
-  background: #f97316;
-}
-
-.premium-bar-down {
-  background: #22c55e;
-}
-
-.precision-badge,
-.exit-tag {
-  display: inline-flex;
-  align-items: center;
-  min-height: 24px;
-  padding: 3px 8px;
-  border: 1px solid transparent;
-  border-radius: 999px;
-  font-size: 0.75rem;
-  font-weight: 800;
+  font-size: 0.72rem;
+  font-weight: 900;
   white-space: nowrap;
 }
 
-.precision-good {
-  border-color: #bbf7d0;
-  background: #dcfce7;
-  color: #166534;
+.strategy-breakout {
+  border: 1px solid rgba(24, 144, 255, 0.42);
+  background: rgba(24, 144, 255, 0.15);
+  color: #69b1ff;
 }
 
-.precision-bad,
-.exit-danger {
-  border-color: #fecaca;
-  background: #fee2e2;
-  color: #b91c1c;
+.strategy-reversal {
+  border: 1px solid rgba(245, 34, 45, 0.45);
+  background: rgba(245, 34, 45, 0.15);
+  color: #ff7875;
 }
 
-.precision-pending,
-.exit-pending {
-  border-color: #fde68a;
-  background: #fffbeb;
-  color: #92400e;
+.strategy-main {
+  border: 1px solid rgba(114, 46, 209, 0.48);
+  background: rgba(114, 46, 209, 0.2);
+  color: #b37feb;
 }
 
-.exit-profit {
-  border-color: #bbf7d0;
-  background: #dcfce7;
-  color: #166534;
+.strategy-dip {
+  border: 1px solid rgba(250, 140, 22, 0.45);
+  background: rgba(250, 140, 22, 0.16);
+  color: #ffc069;
 }
 
-.exit-silent {
-  border-color: #bfdbfe;
-  background: #e0f2fe;
-  color: #075985;
+.mono {
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
 }
 
-.exit-strong {
-  border-color: #fed7aa;
-  background: #ffedd5;
-  color: #9a3412;
+.buy {
+  color: var(--quant-rise) !important;
 }
 
-.shadow-instruction {
-  color: #40516b;
-  font-size: 0.86rem;
-  line-height: 1.45;
+.risk {
+  color: var(--quant-fall) !important;
 }
 
-td > .strategy-badge:first-child {
-  margin-left: 0;
+.neutral {
+  color: var(--quant-neutral) !important;
 }
 
-td small {
-  display: block;
-  margin-top: 4px;
-  color: #66758c;
-  line-height: 1.35;
+.radar-empty {
+  border: 1px solid var(--terminal-border);
+  border-radius: 14px;
+  background: var(--terminal-card);
 }
 
-.link-btn {
-  border-color: #c9d3e1;
-  background: #ffffff;
-  color: #1f5fbf;
-  min-width: 56px;
-}
-
-.audit-actions {
-  align-items: flex-end;
-  margin-bottom: 14px;
-}
-
-.audit-actions label,
-.sync-row label {
-  display: grid;
-  gap: 5px;
-}
-
-.sync-detail {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: 12px;
-}
-
-.sync-detail div {
-  border: 1px solid #e1e7f0;
-  border-radius: 6px;
-  padding: 10px;
-  background: #fbfcfe;
-}
-
-.sync-detail span {
-  display: block;
-  color: #66758c;
-  font-size: 0.78rem;
-}
-
-.sync-detail strong {
-  display: block;
-  margin-top: 5px;
-  overflow-wrap: anywhere;
-}
-
-.check-line {
-  display: flex !important;
-  align-items: center;
-  grid-template-columns: none;
-}
-
-.audit-summary,
-.backtest-summary,
-.feature-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.strategy-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
-  gap: 14px;
-}
-
-.panel-subhead {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  margin: 16px 0 10px;
-}
-
-.panel-subhead h3 {
-  margin: 0 0 4px;
-  font-size: 0.98rem;
-}
-
-.panel-subhead p {
-  margin: 0;
-  color: #66758c;
-  line-height: 1.45;
-}
-
-.compact-table table {
-  min-width: 760px;
-}
-
-.compact-table {
-  max-height: 420px;
-  border: 1px solid #e5eaf1;
-  border-radius: 6px;
-  overflow: auto;
-}
-
-.compact-table thead th {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  box-shadow: 0 1px 0 #e5eaf1;
-}
-
-.failure-samples {
-  margin-top: 14px;
-}
-
-.audit-summary div,
-.backtest-summary div,
-.feature-grid div,
-.issue,
-.analysis-box {
-  border: 1px solid #e1e7f0;
-  border-radius: 6px;
-  padding: 10px;
-  background: #fbfcfe;
-  min-width: 0;
-}
-
-.audit-summary span,
-.backtest-summary span,
-.feature-grid span {
-  display: block;
-  color: #66758c;
-  font-size: 0.78rem;
-}
-
-.backtest-summary strong {
-  display: block;
-  margin-top: 5px;
-  overflow-wrap: anywhere;
-}
-
-.issue-list {
-  display: grid;
-  gap: 8px;
-  max-height: 360px;
-  overflow-y: auto;
-}
-
-.issue div {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.issue p {
-  margin-top: 6px;
-  line-height: 1.45;
-  font-size: 0.88rem;
-}
-
-.empty {
-  color: #74839a;
-  text-align: center;
-  padding: 18px;
-}
-
-.chart-box {
-  position: relative;
-  border: 1px solid #e1e7f0;
-  border-radius: 6px;
-  background: #fbfcfe;
-  overflow: hidden;
-}
-
-.chart {
-  width: 100%;
-  height: 320px;
-  display: block;
-}
-
-.axis-label {
-  fill: #66758c;
-  font-size: 11px;
-}
-
-.chart-tooltip {
-  position: absolute;
-  z-index: 3;
-  min-width: 180px;
-  border: 1px solid #bfdbfe;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.96);
-  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.16);
-  padding: 9px 10px;
-  pointer-events: none;
-}
-
-.chart-tooltip strong,
-.chart-tooltip span {
-  display: block;
-  font-size: 0.8rem;
-  line-height: 1.5;
-}
-
-.chart-tooltip strong {
-  color: #1e40af;
-}
-
-pre {
-  margin: 14px 0 0;
-  max-height: 220px;
-  overflow: auto;
-  background: #0f172a;
-  color: #dbeafe;
-  border-radius: 6px;
-  padding: 12px;
-}
-
-.drawer-mask {
-  position: fixed;
-  inset: 0;
-  display: flex;
-  justify-content: flex-end;
-  background: rgba(15, 23, 42, 0.35);
-  z-index: 20;
-}
-
-.drawer {
-  width: min(520px, 100vw);
-  height: 100vh;
-  overflow-y: auto;
-  background: #ffffff;
-  border-left: 1px solid #d9e0ea;
-  padding: 18px;
-}
-
-.drawer header {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 16px;
-  align-items: flex-start;
-}
-
-.feature-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.wide-btn {
-  width: 100%;
-  margin: 8px 0 14px;
-}
-
-.analysis-box {
-  line-height: 1.6;
-}
-
-.compact-analysis {
-  margin-bottom: 12px;
-}
-
-.analysis-box ul {
-  padding-left: 18px;
-}
-
-@media (prefers-color-scheme: dark) {
-  .strategy-badge-breakout {
-    border-color: #60a5fa;
-    background: #172554;
-    color: #bfdbfe;
-  }
-
-  .strategy-badge-dipbuy {
-    border-color: #fb923c;
-    background: #431407;
-    color: #fed7aa;
-  }
-
-  .strategy-badge-reversal {
-    border-color: #f87171;
-    background: #450a0a;
-    color: #fecaca;
-  }
-
-  .strategy-badge-main-wave {
-    border-color: #a78bfa;
-    background: #2e1065;
-    color: #ddd6fe;
-  }
-
-  .precision-good,
-  .exit-profit {
-    border-color: #22c55e;
-    background: #052e16;
-    color: #bbf7d0;
-  }
-
-  .precision-bad,
-  .exit-danger {
-    border-color: #ef4444;
-    background: #450a0a;
-    color: #fecaca;
-  }
-
-  .precision-pending,
-  .exit-pending,
-  .exit-strong {
-    border-color: #fb923c;
-    background: #431407;
-    color: #fed7aa;
-  }
-
-  .exit-silent {
-    border-color: #38bdf8;
-    background: #082f49;
-    color: #bae6fd;
-  }
-}
-
-@media (max-width: 980px) {
-  .status-grid,
-  .tabbar,
-  .workbench,
-  .detail-grid,
-  .strategy-grid {
+@media (max-width: 1180px) {
+  .main-grid,
+  .dashboard-grid,
+  .dual-board,
+  .validation-grid,
+  .legion-grid {
     grid-template-columns: 1fr;
   }
+}
 
-  .topbar {
+@media (max-width: 680px) {
+  .content {
+    padding: 12px;
+  }
+
+  .card-head,
+  .toolbar-panel {
     align-items: flex-start;
     flex-direction: column;
   }
 
-  .toolbar {
-    width: 100%;
-  }
-
-  .toolbar button {
-    flex: 1 1 128px;
-  }
-
-  .model-state {
-    text-align: left;
-    max-width: none;
-  }
-}
-
-@media (max-width: 640px) {
-  .page {
-    padding: 14px;
-  }
-
-  .panel,
-  .topbar {
-    padding: 14px;
-  }
-
-  .panel-head {
-    flex-direction: column;
-  }
-
-  .audit-actions,
-  .stock-search,
-  .sync-row {
-    align-items: stretch;
-  }
-
-  .audit-actions > *,
-  .stock-search > *,
-  .sync-row > *,
-  .toolbar button {
-    width: 100%;
-  }
-
-  .feature-grid {
+  .pulse-grid,
+  .asset-grid,
+  .analysis-grid,
+  .legion-card dl {
     grid-template-columns: 1fr;
-  }
-
-  .shadow-compare {
-    grid-template-columns: 1fr;
-  }
-
-  table {
-    min-width: 760px;
   }
 }
 </style>

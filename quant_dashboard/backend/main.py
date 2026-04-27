@@ -18,13 +18,13 @@ BASE_DIR = Path("/Users/eudis/ths")
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from quant_core.config import OLLAMA_API, OLLAMA_MODEL
-from quant_core.backtest import top_pick_open_backtest
+from quant_core.config import OLLAMA_API, OLLAMA_MODEL, check_push_config
+from quant_core.engine.backtest import top_pick_open_backtest
 from quant_core.cache_utils import read_json_cache, write_json_cache
 from quant_core.daily_pick import list_daily_pick_results, update_pending_open_results
 from quant_core.failure_analysis import analyze_prediction_failures
-from quant_core.market_sync import latest_sync, run_market_close_sync, sync_history
-from quant_core.predictor import scan_market
+from quant_core.data_pipeline.market_sync import latest_sync, run_market_close_sync, sync_history
+from quant_core.engine.predictor import scan_market
 from quant_core.storage import (
     database_overview,
     import_parquet_files,
@@ -32,7 +32,7 @@ from quant_core.storage import (
     list_validation_reports,
     recent_daily_rows,
 )
-from quant_core.strategy_lab import run_strategy_lab
+from quant_core.strategies.labs.strategy_lab import run_strategy_lab
 from quant_core.up_reason_analysis import analyze_next_day_up_reasons
 from quant_core.validation import validate_one_code, validate_repository
 
@@ -69,7 +69,12 @@ def start_daily_pick_scheduler() -> None:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "service": "quant_dashboard"}
+    pushplus = check_push_config(print_warning=False)
+    return {
+        "ok": bool(pushplus.get("ok")),
+        "service": "quant_dashboard",
+        "pushplus": pushplus,
+    }
 
 
 @app.get("/")
@@ -187,7 +192,7 @@ def radar_scan(limit: int = Query(default=10, ge=1, le=50)) -> dict[str, Any]:
 
 
 @app.get("/api/daily-picks")
-def daily_picks(limit: int = Query(default=10, ge=1, le=50)) -> dict[str, Any]:
+def daily_picks(limit: int = Query(default=500, ge=1, le=1000)) -> dict[str, Any]:
     result = list_daily_pick_results(limit=limit)
     for row in result.get("rows", []):
         row.setdefault("t3_max_gain_pct", None)

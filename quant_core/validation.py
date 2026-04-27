@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .config import DATA_DIR
-from .market import fetch_sina_snapshot
+from quant_core.data_pipeline.market import fetch_sina_snapshot
 from .storage import normalize_daily_frame, save_validation_report
 
 
