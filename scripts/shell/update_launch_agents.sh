@@ -7,6 +7,7 @@ DST_DIR="$HOME/Library/LaunchAgents"
 UID_VALUE="$(id -u)"
 
 mkdir -p "$SRC_DIR" "$DST_DIR"
+mkdir -p "$ROOT/logs"
 
 chmod +x \
   "$ROOT/scripts/shell/run_backend_api.sh" \
@@ -14,9 +15,13 @@ chmod +x \
   "$ROOT/scripts/shell/run_exit_sentinel.sh" \
   "$ROOT/scripts/shell/run_snapshot_1430.sh" \
   "$ROOT/scripts/shell/run_swing_patrol.sh" \
+  "$ROOT/scripts/shell/run_v3_sniper_lock.sh" \
   "$ROOT/scripts/shell/run_push_heartbeat.sh" \
   "$ROOT/scripts/shell/run_push_top_pick.sh" \
-  "$ROOT/scripts/shell/run_market_close_sync.sh"
+  "$ROOT/scripts/shell/run_market_close_sync.sh" \
+  "$ROOT/scripts/shell/run_live_sentinel.sh" \
+  "$ROOT/scripts/shell/run_jq_cold_5m.sh" \
+  "$ROOT/scripts/shell/run_daily_ashare_archiver.sh"
 
 /usr/bin/python3 - <<'PY'
 from pathlib import Path
@@ -94,10 +99,17 @@ plists = {
     ),
     "com.eudis.quant.swing-patrol.plist": base(
         "com.eudis.quant.swing-patrol",
-        [str(root / "scripts/shell/run_swing_patrol.sh")],
+        ["/usr/bin/python3", "-m", "quant_core.execution.swing_patrol"],
         "swing_patrol_agent.log",
         "swing_patrol_agent_err.log",
         schedule=(14, 45),
+    ),
+    "com.eudis.quant.v3-sniper-lock.plist": base(
+        "com.eudis.quant.v3-sniper-lock",
+        [str(root / "scripts/shell/run_v3_sniper_lock.sh")],
+        "v3_sniper_lock_agent.log",
+        "v3_sniper_lock_agent_err.log",
+        schedule=(14, 50),
     ),
     "com.eudis.quant.push-top-pick.plist": base(
         "com.eudis.quant.push-top-pick",
@@ -106,12 +118,40 @@ plists = {
         "push_top_pick_agent_err.log",
         schedule=(14, 50),
     ),
+    "com.eudis.quant.live-sentinel.plist": base(
+        "com.eudis.quant.live-sentinel",
+        [str(root / "scripts/shell/run_live_sentinel.sh")],
+        "logs/live_sentinel_agent.log",
+        "logs/live_sentinel_agent_err.log",
+        schedule=(9, 15),
+    ),
     "com.eudis.quant.market-close-sync.plist": base(
         "com.eudis.quant.market-close-sync",
         [str(root / "scripts/shell/run_market_close_sync.sh")],
         "market_close_sync_agent.log",
         "market_close_sync_agent_err.log",
         schedule=(15, 5),
+    ),
+    "com.quant.datasync.plist": base(
+        "com.quant.datasync",
+        ["/usr/bin/python3", str(root / "scripts/utils/data_recorder.py")],
+        "datasync.log",
+        "datasync_err.log",
+        schedule=(15, 8),
+    ),
+    "com.quant.daily_ashare_archiver.plist": base(
+        "com.quant.daily_ashare_archiver",
+        [str(root / "scripts/shell/run_daily_ashare_archiver.sh")],
+        "logs/daily_ashare_archiver_agent.log",
+        "logs/daily_ashare_archiver_agent_err.log",
+        schedule=(15, 15),
+    ),
+    "com.eudis.quant.jq-cold-5m.plist": base(
+        "com.eudis.quant.jq-cold-5m",
+        [str(root / "scripts/shell/run_jq_cold_5m.sh")],
+        "logs/jq_cold_5m_agent.log",
+        "logs/jq_cold_5m_agent_err.log",
+        schedule=(1, 20),
     ),
     "com.eudis.quant.push-heartbeat.plist": base(
         "com.eudis.quant.push-heartbeat",
@@ -122,7 +162,7 @@ plists = {
     ),
     "com.eudis.quant.daily-pick-save.plist": base(
         "com.eudis.quant.daily-pick-save",
-        ["/usr/bin/python3", str(root / "quant_core/execution/daily_pick_cli.py"), "save"],
+        ["/usr/bin/python3", "-m", "quant_core.execution.daily_pick_cli", "save"],
         "daily_pick_save.log",
         "daily_pick_save_err.log",
         schedule=(15, 30),
@@ -147,8 +187,13 @@ labels=(
   com.eudis.quant.exit-sentinel-0925
   com.eudis.quant.snapshot-1430
   com.eudis.quant.swing-patrol
+  com.eudis.quant.v3-sniper-lock
   com.eudis.quant.push-top-pick
+  com.eudis.quant.live-sentinel
   com.eudis.quant.market-close-sync
+  com.quant.datasync
+  com.quant.daily_ashare_archiver
+  com.eudis.quant.jq-cold-5m
   com.eudis.quant.push-heartbeat
   com.eudis.quant.daily-pick-save
 )

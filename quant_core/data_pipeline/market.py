@@ -9,6 +9,8 @@ from typing import Any
 import pandas as pd
 import requests
 
+from quant_core.data_pipeline.tencent_engine import get_tencent_realtime
+
 
 SINA_HS_A_URL = (
     "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
@@ -21,8 +23,6 @@ SINA_INDEX_KLINE_URL = (
     "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
     "CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen=30"
 )
-
-
 def _loads_sina_js(text: str) -> list[dict[str, Any]]:
     if not text or text in {"null", "[]"}:
         return []
@@ -183,7 +183,17 @@ def fetch_sina_quote(code: str, timeout: int = 5) -> dict[str, Any]:
         "amount": amount,
         "date": quote_date,
         "time": quote_time,
+        "source": "sina.hq",
     }
+
+
+def fetch_realtime_quote(code: str, timeout: int = 5, prefer_auction: bool = False) -> dict[str, Any]:
+    """Fetch one stock quote from Tencent realtime API.
+
+    Tencent's current price is also used as call-auction virtual match price
+    when ``prefer_auction`` is true.
+    """
+    return get_tencent_realtime(code)
 
 
 def _attach_index_trends(indices: dict[str, dict[str, float | str]], headers: dict[str, str], timeout: int) -> None:

@@ -25,8 +25,8 @@
       <el-table-column label="股票" min-width="190">
         <template #default="{ row }">
           <div class="stock-cell">
-            <strong class="mono">{{ row.code }}</strong>
-            <span>{{ row.name }}</span>
+            <StockLink :code="row.code" :name="row.name" :label="row.code" mono class="stock-code-link" />
+            <StockLink :code="row.code" :name="row.name" :label="row.name" class="stock-name-link" />
             <Sparkline :row="row" />
           </div>
         </template>
@@ -59,6 +59,17 @@
           {{ exitText(row) }}
         </template>
       </el-table-column>
+      <el-table-column label="结算价 / 收益" align="right" min-width="150">
+        <template #default="{ row }">
+          <div v-if="row.is_closed" class="stacked">
+            <small>{{ row.close_reason || row.close_date || '已结清' }}</small>
+            <strong :class="numberClass(resultValue(row))">
+              {{ money(row.close_price) }} / {{ pct(resultValue(row)) }}
+            </strong>
+          </div>
+          <span v-else class="muted-inline">{{ isSwingStrategy(row) ? '持仓观察' : '待结算' }}</span>
+        </template>
+      </el-table-column>
       <el-table-column label="状态" width="118">
         <template #default="{ row }">
           <span :class="stateClass(row)">{{ stateText(row) }}</span>
@@ -75,6 +86,7 @@
 
 <script setup>
 import { computed, defineComponent, h, ref, watch } from 'vue'
+import StockLink from './StockLink.vue'
 
 const props = defineProps({
   rows: { type: Array, default: () => [] },
@@ -129,9 +141,10 @@ const displayRows = computed(() => {
 const hasOnlySwing = computed(() => displayRows.value.length > 0 && displayRows.value.every((row) => isSwingStrategy(row)))
 const hasOnlyShort = computed(() => displayRows.value.length > 0 && displayRows.value.every((row) => !isSwingStrategy(row)))
 const primaryHeader = computed(() => hasOnlySwing.value ? '预测涨幅' : hasOnlyShort.value ? '置信度' : '置信度 / 预测涨幅')
-const secondaryHeader = computed(() => hasOnlySwing.value ? '波段状态' : hasOnlyShort.value ? '预期溢价' : '预期溢价 / 波段状态')
+const secondaryHeader = computed(() => hasOnlySwing.value ? '结算收益 / 波段状态' : hasOnlyShort.value ? '预期溢价 / 结算收益' : '预期溢价 / 结算收益')
 
 const toNum = (value) => {
+  if (value === null || value === undefined || value === '') return null
   const num = Number(value)
   return Number.isFinite(num) ? num : null
 }
@@ -144,11 +157,21 @@ const money = (value) => {
   return num === null ? '-' : num.toFixed(2)
 }
 const expected = (row) => toNum(row.expected_t3_max_gain_pct ?? row.expected_premium ?? row.predicted_open_premium ?? row.composite_score)
-const resultValue = (row) => toNum(isSwingStrategy(row) ? row.t3_max_gain_pct : row.open_premium)
+const resultValue = (row) => {
+  const closedReturn = toNum(row.close_return_pct)
+  if (row.is_closed && closedReturn !== null) return closedReturn
+  return toNum(isSwingStrategy(row) ? row.t3_max_gain_pct : row.open_premium)
+}
 const primaryValue = (row) => isSwingStrategy(row) ? expected(row) : toNum(row.composite_score ?? row.win_rate)
 const primaryText = (row) => isSwingStrategy(row) ? pct(expected(row)) : `${(primaryValue(row) ?? 0).toFixed(2)} 分`
-const secondaryValue = (row) => isSwingStrategy(row) ? resultValue(row) : toNum(row.expected_premium ?? row.predicted_open_premium)
-const secondaryText = (row) => isSwingStrategy(row) ? (row.is_closed ? pct(resultValue(row)) : 'T+3 持仓观察') : pct(row.expected_premium ?? row.predicted_open_premium)
+const secondaryValue = (row) => {
+  if (row.is_closed) return resultValue(row)
+  return isSwingStrategy(row) ? null : toNum(row.expected_premium ?? row.predicted_open_premium)
+}
+const secondaryText = (row) => {
+  if (row.is_closed) return pct(resultValue(row))
+  return isSwingStrategy(row) ? 'T+3 持仓观察' : pct(row.expected_premium ?? row.predicted_open_premium)
+}
 const numberClass = (value) => {
   const num = toNum(value)
   if (num === null || num === 0) return ''
@@ -276,8 +299,15 @@ h2 {
   min-width: 0;
 }
 
-.stock-cell span {
+.stock-code-link {
+  color: #f2f6ff;
+  font-weight: 900;
+}
+
+.stock-name-link {
   min-width: 0;
+  color: #d7deeb;
+  font-weight: 800;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -368,6 +398,12 @@ h2 {
 .stacked small {
   color: #6f7d95;
   font-size: 0.7rem;
+}
+
+.muted-inline {
+  color: #6f7d95;
+  font-size: 0.78rem;
+  font-weight: 800;
 }
 
 .rise {

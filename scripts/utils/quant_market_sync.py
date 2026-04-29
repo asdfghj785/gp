@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
+
+BASE_DIR = Path("/Users/eudis/ths")
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
 from quant_core.data_pipeline.market_sync import latest_sync, run_market_close_sync, sync_history
 

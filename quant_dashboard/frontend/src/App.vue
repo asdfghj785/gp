@@ -13,7 +13,7 @@
 
       <main class="content">
         <el-alert
-          v-if="message.text"
+          v-if="visibleMessage"
           :title="message.text"
           :type="message.type === 'error' ? 'error' : 'info'"
           show-icon
@@ -21,7 +21,123 @@
           class="message-alert"
         />
 
+        <section v-show="activeSection === 'v3'" class="page-stack">
+          <QuantDashboardV3 />
+        </section>
+
         <section v-show="activeSection === 'dashboard'" class="page-stack">
+          <section class="command-strip">
+            <article>
+              <span>V3.1 Core</span>
+              <strong>三军团并行出票</strong>
+              <small>右侧主升浪 / 中线超跌反转 / 尾盘突破各自独立 Top1</small>
+            </article>
+            <article>
+              <span>Snapshot Anchor</span>
+              <strong>14:50 快照锁定</strong>
+              <small>snapshot_price / snapshot_time 写入后禁止篡改</small>
+            </article>
+            <article>
+              <span>AI Right Brain</span>
+              <strong>{{ aiStatusText }}</strong>
+              <small>Ollama 只做舆情风控，不改写模型分数</small>
+            </article>
+            <article>
+              <span>Minute Factory</span>
+              <strong>JQ 冷数据 + 腾讯热数据</strong>
+              <small>15:15 跟随盘后日线同步后自动合并 5m Parquet</small>
+            </article>
+          </section>
+
+          <section class="cockpit-grid">
+            <el-card class="dark-card strategy-matrix" shadow="never">
+              <template #header>
+                <div class="card-head">
+                  <div>
+                    <p class="eyebrow">Strategy Legion</p>
+                    <h2>三大军团生产态势</h2>
+                  </div>
+                  <span class="terminal-chip">XGBRegressor</span>
+                </div>
+              </template>
+              <div class="matrix-list">
+                <article v-for="stat in strategyStats" :key="`matrix-${stat.strategy}`">
+                  <div class="matrix-title">
+                    <span :class="strategyBadgeClass(stat.strategy)">{{ strategyLabel(stat.strategy) }}</span>
+                    <strong>预测 {{ stat.count }} 次</strong>
+                  </div>
+                  <div class="matrix-meter">
+                    <i :style="{ width: stat.winRateWidth }" />
+                  </div>
+                  <dl>
+                    <div><dt>已结算</dt><dd>{{ stat.settledCount }}</dd></div>
+                    <div><dt>胜率</dt><dd>{{ stat.winRate }}</dd></div>
+                    <div><dt>{{ stat.isSwing ? 'T+3收益' : 'T+1溢价' }}</dt><dd :class="numberClass(stat.avgReturnRaw)">{{ stat.avgReturn }}</dd></div>
+                    <div><dt>未结算</dt><dd>{{ stat.openCount }}</dd></div>
+                  </dl>
+                </article>
+              </div>
+            </el-card>
+
+            <el-card class="dark-card data-pipeline-card" shadow="never">
+              <template #header>
+                <div class="card-head">
+                  <div>
+                    <p class="eyebrow">Data Pipeline</p>
+                    <h2>冷热数据流</h2>
+                  </div>
+                  <span class="terminal-chip">Parquet / SQLite</span>
+                </div>
+              </template>
+              <div class="pipeline-flow">
+                <article v-for="node in dataPipelineNodes" :key="node.name">
+                  <span>{{ node.phase }}</span>
+                  <strong>{{ node.name }}</strong>
+                  <small>{{ node.detail }}</small>
+                </article>
+              </div>
+            </el-card>
+
+            <el-card class="dark-card ai-card" shadow="never">
+              <template #header>
+                <div class="card-head">
+                  <div>
+                    <p class="eyebrow">AI Right Brain</p>
+                    <h2>14:46 舆情风控</h2>
+                  </div>
+                  <span :class="['terminal-chip', ollamaStatus?.ok ? 'chip-hot' : 'chip-warn']">{{ aiStatusText }}</span>
+                </div>
+              </template>
+              <div class="ai-terminal">
+                <p><span>LLM</span><strong>{{ ollamaModelText }}</strong></p>
+                <p><span>News Fetcher</span><strong>百度/新浪轻量线索 + 本地兜底</strong></p>
+                <p><span>Prompt Guard</span><strong>严格 JSON，失败降级为谨慎复核</strong></p>
+                <p><span>Hook</span><strong>14:50 PushPlus Markdown 独立区块</strong></p>
+              </div>
+            </el-card>
+
+            <el-card class="dark-card sentinel-card" shadow="never">
+              <template #header>
+                <div class="card-head">
+                  <div>
+                    <p class="eyebrow">Sentinel Timeline</p>
+                    <h2>自动化哨兵时间轴</h2>
+                  </div>
+                  <span class="terminal-chip">LaunchAgent</span>
+                </div>
+              </template>
+              <ol class="sentinel-timeline">
+                <li v-for="task in sentinelTimeline" :key="task.time">
+                  <time>{{ task.time }}</time>
+                  <div>
+                    <strong>{{ task.name }}</strong>
+                    <small>{{ task.desc }}</small>
+                  </div>
+                </li>
+              </ol>
+            </el-card>
+          </section>
+
           <section class="dashboard-grid">
             <el-card class="dark-card signal-card" shadow="never">
               <template #header>
@@ -45,7 +161,10 @@
                     <span :class="strategyBadgeClass(pick.strategy_type)">{{ strategyLabel(pick.strategy_type) }}</span>
                     <strong :class="instructionClass(pick)">{{ instructionTitle(pick) }}</strong>
                   </header>
-                  <p><span class="mono">{{ pick.code }}</span> {{ pick.name }}</p>
+                  <p>
+                    <StockLink :code="pick.code" :name="pick.name" :label="pick.code" mono class="inline-stock-code" />
+                    <StockLink :code="pick.code" :name="pick.name" :label="pick.name" class="inline-stock-name" />
+                  </p>
                   <small>{{ instructionBody(pick) }}</small>
                 </article>
               </div>
@@ -124,7 +243,10 @@
               <div class="card-head">
                 <div>
                   <p class="eyebrow">Ollama Risk Control</p>
-                  <h2><span class="mono">{{ selectedStock.code }}</span> {{ selectedStock.name }}</h2>
+                  <h2>
+                    <StockLink :code="selectedStock.code" :name="selectedStock.name" :label="selectedStock.code" mono class="heading-stock-code" />
+                    <StockLink :code="selectedStock.code" :name="selectedStock.name" :label="selectedStock.name" class="heading-stock-name" />
+                  </h2>
                 </div>
                 <el-button type="primary" :loading="busy.analyze" @click="analyzeStock">运行风控</el-button>
               </div>
@@ -153,11 +275,12 @@
           <section class="legion-grid">
             <el-card v-for="stat in strategyStats" :key="stat.strategy" class="dark-card legion-card" shadow="never">
               <span :class="strategyBadgeClass(stat.strategy)">{{ strategyLabel(stat.strategy) }}</span>
-              <strong>{{ stat.count }} 次</strong>
+              <strong>预测 {{ stat.count }} 次</strong>
               <dl>
+                <div><dt>已结算</dt><dd>{{ stat.settledCount }}</dd></div>
                 <div><dt>胜率</dt><dd>{{ stat.winRate }}</dd></div>
                 <div><dt>{{ stat.isSwing ? 'T+3均值' : 'T+1均值' }}</dt><dd :class="numberClass(stat.avgReturnRaw)">{{ stat.avgReturn }}</dd></div>
-                <div><dt>持仓</dt><dd>{{ stat.openCount }}</dd></div>
+                <div><dt>未结算</dt><dd>{{ stat.openCount }}</dd></div>
               </dl>
             </el-card>
           </section>
@@ -217,6 +340,46 @@
             </div>
           </el-card>
 
+          <el-card class="dark-card fetch-card" shadow="never">
+            <template #header>
+              <div class="card-head">
+                <div>
+                  <p class="eyebrow">JQDATA COLD 5M</p>
+                  <h2>聚宽每日获取情况</h2>
+                </div>
+                <span :class="['terminal-chip', fetchStatusClass(jqFetch)]">{{ jqFetch.status_label || '-' }}</span>
+              </div>
+            </template>
+            <div class="pulse-grid fetch-summary">
+              <article><span>最后获取</span><strong>{{ jqFetch.last_fetch_at || '-' }}</strong></article>
+              <article><span>今日覆盖</span><strong>{{ fetchCoverage(jqFetch) }}</strong></article>
+              <article><span>失败</span><strong>{{ jqFetch.failed ?? 0 }}</strong></article>
+              <article><span>累计进度</span><strong>{{ jqProgressText }}</strong></article>
+              <article><span>剩余额度</span><strong>{{ jqQuotaText }}</strong></article>
+              <article><span>数据区间</span><strong>{{ jqFetch.range || '-' }}</strong></article>
+            </div>
+          </el-card>
+
+          <el-card class="dark-card fetch-card" shadow="never">
+            <template #header>
+              <div class="card-head">
+                <div>
+                  <p class="eyebrow">ASHARE HOT 5M</p>
+                  <h2>Ashare 每日获取情况</h2>
+                </div>
+                <span :class="['terminal-chip', fetchStatusClass(ashareFetch)]">{{ ashareFetch.status_label || '-' }}</span>
+              </div>
+            </template>
+            <div class="pulse-grid fetch-summary">
+              <article><span>最后获取</span><strong>{{ ashareFetch.last_fetch_at || '-' }}</strong></article>
+              <article><span>今日覆盖</span><strong>{{ fetchCoverage(ashareFetch) }}</strong></article>
+              <article><span>失败</span><strong>{{ ashareFetch.failed ?? 0 }}</strong></article>
+              <article><span>每股拉取</span><strong>{{ ashareFetch.count ? `${ashareFetch.count} 根` : '-' }}</strong></article>
+              <article><span>数据源</span><strong>{{ ashareFetch.source || '-' }}</strong></article>
+              <article><span>运行日期</span><strong>{{ ashareFetch.run_date || '-' }}</strong></article>
+            </div>
+          </el-card>
+
           <el-card class="dark-card full-span" shadow="never">
             <template #header>
               <div class="card-head">
@@ -234,27 +397,43 @@
             </div>
           </el-card>
         </section>
+
+        <section v-if="activeSection === 'minute'" class="page-stack">
+          <MinKlineViewer
+            :key="stockMarketViewerKey"
+            :stock-code="stockMarketCode"
+            :stock-request="stockMarketRequest"
+          />
+        </section>
       </main>
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, provide, reactive, ref } from 'vue'
 import Sidebar from './components/Sidebar.vue'
 import StatsHeader from './components/StatsHeader.vue'
 import SelectionTable from './components/SelectionTable.vue'
+import MinKlineViewer from './components/MinKlineViewer.vue'
+import StockLink from './components/StockLink.vue'
+import QuantDashboardV3 from './views/QuantDashboardV3.vue'
+import { resolveInitialSection } from './router'
 
 const API = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
 
-const activeSection = ref('dashboard')
+const activeSection = ref(resolveInitialSection())
 const overview = ref({})
 const health = ref({})
+const ollamaStatus = ref({})
 const radar = reactive({ rows: [], created_at: '', model_status: '', market_gate: null })
 const dailyPicks = reactive({ rows: [] })
 const validation = reactive({ status: '', summary: null, issues: [] })
-const message = reactive({ text: '', type: 'info' })
+const minuteFetch = ref({})
+const message = reactive({ text: '', type: 'info', scope: 'global' })
 const selectedStock = ref(null)
+const stockMarketCode = ref('')
+const stockMarketRequest = ref(0)
 const analysis = ref(null)
 const syncResult = ref('')
 const validationSample = ref(200)
@@ -262,9 +441,11 @@ const sourceCheck = ref(false)
 const busy = reactive({ refresh: false, scan: false, sync: false, validate: false, analyze: false })
 
 const currentTitle = computed(() => ({
+  v3: 'V3.2 量化指挥中心',
   dashboard: 'Dashboard 总览',
   ledger: 'Shadow Test 影子账本',
   validation: 'Validation 数据校验',
+  minute: '单票行情库',
 })[activeSection.value] || 'Dashboard 总览')
 const latestSync = computed(() => overview.value.latest_sync || null)
 const localDateText = (date = new Date()) => {
@@ -275,10 +456,29 @@ const localDateText = (date = new Date()) => {
 }
 const todayText = computed(() => localDateText())
 const todayLockedCount = computed(() => dailyPicks.rows.filter((row) => row.selection_date === todayText.value).length)
-const operationCards = computed(() => dailyPicks.rows.filter((row) => row.selection_date === todayText.value || row.status === 'pending_open' || !row.is_closed).slice(0, 6))
+const operationCards = computed(() => dailyPicks.rows.filter((row) => row.selection_date === todayText.value).slice(0, 6))
+const jqFetch = computed(() => minuteFetch.value.jq || {})
+const ashareFetch = computed(() => minuteFetch.value.ashare || {})
+const jqProgressText = computed(() => {
+  const codes = Number(jqFetch.value.progress_codes)
+  const segments = Number(jqFetch.value.progress_segments)
+  if (!Number.isFinite(codes) && !Number.isFinite(segments)) return '-'
+  return `${Number.isFinite(codes) ? codes : 0} 股 / ${Number.isFinite(segments) ? segments : 0} 段`
+})
+const jqQuotaText = computed(() => {
+  const spare = Number(jqFetch.value.quota_spare)
+  const total = Number(jqFetch.value.quota_total)
+  if (!Number.isFinite(spare) || !Number.isFinite(total) || total <= 0) return '-'
+  return `${spare} / ${total}`
+})
+const visibleMessage = computed(() => {
+  if (!message.text) return false
+  if (message.scope === 'minute') return activeSection.value === 'minute'
+  return true
+})
 const strategyStats = computed(() => ['右侧主升浪', '中线超跌反转', '尾盘突破'].map((strategy) => {
   const rows = dailyPicks.rows.filter((row) => row.strategy_type === strategy)
-  const settled = rows.filter((row) => resultValue(row) !== null)
+  const settled = rows.filter((row) => row.is_closed && resultValue(row) !== null)
   const wins = settled.filter((row) => resultValue(row) > 0).length
   const avgRaw = settled.length ? settled.reduce((sum, row) => sum + resultValue(row), 0) / settled.length : null
   return {
@@ -286,11 +486,64 @@ const strategyStats = computed(() => ['右侧主升浪', '中线超跌反转', '
     isSwing: isSwingStrategy(strategy),
     count: rows.length,
     openCount: rows.filter((row) => !row.is_closed).length,
+    settledCount: settled.length,
     winRate: settled.length ? pct((wins / settled.length) * 100) : '-',
+    winRateWidth: settled.length ? `${Math.min(100, Math.max(6, (wins / settled.length) * 100)).toFixed(1)}%` : '6%',
     avgReturnRaw: avgRaw,
     avgReturn: avgRaw === null ? '-' : pct(avgRaw),
   }
 }))
+const dataPipelineNodes = computed(() => [
+  {
+    phase: '15:15',
+    name: '5m 热数据归档',
+    detail: '盘后随日线同步节奏，腾讯/Ashare 最近 100 根 5m K 线增量 upsert 到 Parquet',
+  },
+  {
+    phase: '14:30',
+    name: '诱多快照',
+    detail: `尾盘拉升超过 ${latePullTrapText.value} 触发过滤`,
+  },
+  {
+    phase: '14:50',
+    name: '三军团雷达',
+    detail: '实时价平替收盘价，成交量外推，独立选 Top1',
+  },
+  {
+    phase: '15:05',
+    name: '盘后同步校验',
+    detail: `${overview.value.stock_count ?? 0} 股 / ${overview.value.rows_count ?? 0} 行日线资产`,
+  },
+])
+const sentinelTimeline = [
+  { time: '09:16', name: '竞价预热观察', desc: '读取腾讯虚拟匹配价，只推送不写库' },
+  { time: '09:21', name: '撤单关闭审计', desc: '虚拟溢价大偏离时预警或超预期提示' },
+  { time: '09:25', name: '终极开盘审判', desc: 'T+1 回填 open_price / open_premium' },
+  { time: '14:45', name: 'T+3 波段巡逻', desc: '止盈、止损、期满清退并闭环 is_closed' },
+  { time: '14:50', name: '多轨出票推送', desc: 'XGBoost 后接 AI 右脑，再推送 PushPlus' },
+]
+const aiStatusText = computed(() => ollamaStatus.value?.ok ? 'Ollama Online' : 'Ollama Watch')
+const ollamaModelText = computed(() => ollamaStatus.value?.model || radar.model_status?.match(/qwen[^; ]+|deepseek[^; ]+/)?.[0] || 'qwen2.5:14b')
+const latePullTrapText = computed(() => '4.00%')
+const stockMarketViewerKey = computed(() => stockMarketCode.value ? `${stockMarketCode.value}-${stockMarketRequest.value}` : 'default')
+
+const normalizeStockCode = (value) => String(value || '').replace(/\D/g, '').slice(-6)
+const openStockMarket = async (stock) => {
+  const clean = normalizeStockCode(stock?.code)
+  if (clean.length !== 6) {
+    setMessage(`无法跳转行情库：非法股票代码 ${stock?.code || '-'}`, 'error')
+    return
+  }
+  stockMarketCode.value = clean
+  stockMarketRequest.value += 1
+  activeSection.value = 'minute'
+  setMessage(`已跳转到行情库：${stock?.name || clean}(${clean})。`, 'info', 'minute')
+  await nextTick()
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+const handleStockMarketEvent = (event) => openStockMarket(event.detail || {})
+
+provide('openStockMarket', openStockMarket)
 
 const request = async (path, options = {}) => {
   const response = await fetch(`${API}${path}`, options)
@@ -300,14 +553,15 @@ const request = async (path, options = {}) => {
   }
   return response.json()
 }
-const setMessage = (text, type = 'info') => {
+const setMessage = (text, type = 'info', scope = 'global') => {
   message.text = text
   message.type = type
+  message.scope = scope
 }
 const refreshAll = async () => {
   busy.refresh = true
   try {
-    await Promise.all([loadHealth(), loadOverview(), loadRadarCache(), loadDailyPicks()])
+    await Promise.all([loadHealth(), loadOllamaStatus(), loadOverview(), loadRadarCache(), loadDailyPicks(), loadMinuteFetchStatus()])
     setMessage('工作站状态已刷新。')
   } catch (error) {
     setMessage(`刷新失败：${error.message}`, 'error')
@@ -322,8 +576,18 @@ const loadHealth = async () => {
     health.value = { ok: false, pushplus: { ok: false, reason: '后端不可达' } }
   }
 }
+const loadOllamaStatus = async () => {
+  try {
+    ollamaStatus.value = await request('/api/ollama/status')
+  } catch (error) {
+    ollamaStatus.value = { ok: false, error: error.message }
+  }
+}
 const loadOverview = async () => {
   overview.value = await request('/api/overview')
+}
+const loadMinuteFetchStatus = async () => {
+  minuteFetch.value = await request('/api/data/minute-fetch/status')
 }
 const applyRadarPayload = (data) => {
   radar.rows = data.rows || []
@@ -358,6 +622,7 @@ const syncData = async () => {
     syncResult.value = JSON.stringify(data, null, 2)
     setMessage(`同步完成：有效 ${data.valid_rows} 行，新增 ${data.inserted_rows}，更新 ${data.updated_rows}。`)
     await loadOverview()
+    await loadMinuteFetchStatus()
   } catch (error) {
     setMessage(`同步失败：${error.message}`, 'error')
   } finally {
@@ -373,6 +638,7 @@ const runValidation = async () => {
     validation.issues = data.issues || []
     setMessage(`校验完成：${validation.status || '-'}。`, validation.status === 'pass' ? 'info' : 'error')
     await loadOverview()
+    await loadMinuteFetchStatus()
   } catch (error) {
     setMessage(`校验失败：${error.message}`, 'error')
   } finally {
@@ -403,14 +669,30 @@ const isSwingStrategy = (value) => {
   const strategy = typeof value === 'string' ? value : value?.strategy_type
   return strategy === '中线超跌反转' || strategy === '右侧主升浪'
 }
-const resultValue = (row) => {
-  const value = isSwingStrategy(row) ? row.t3_max_gain_pct : row.open_premium
+const toResultNumber = (value) => {
+  if (value === null || value === undefined || value === '') return null
   const num = Number(value)
   return Number.isFinite(num) ? num : null
+}
+const resultValue = (row) => {
+  const closedReturn = toResultNumber(row.close_return_pct)
+  if (row.is_closed && closedReturn !== null) return closedReturn
+  return toResultNumber(isSwingStrategy(row) ? row.t3_max_gain_pct : row.open_premium)
 }
 const pct = (value) => {
   const num = Number(value)
   return Number.isFinite(num) ? `${num.toFixed(2)}%` : '-'
+}
+const fetchCoverage = (item) => {
+  const success = Number(item?.success)
+  const universe = Number(item?.universe)
+  if (!Number.isFinite(success) && !Number.isFinite(universe)) return '-'
+  return `${Number.isFinite(success) ? success : 0} / ${Number.isFinite(universe) ? universe : 0}`
+}
+const fetchStatusClass = (item) => {
+  if (item?.status === 'success' || item?.status === 'quota_exhausted') return 'chip-hot'
+  if (item?.status === 'partial') return 'chip-warn'
+  return ''
 }
 const amountYi = (value) => {
   const num = Number(value)
@@ -453,7 +735,14 @@ const instructionBody = (pick) => {
   return `T+1 开盘溢价 ${pct(actual)}，按极速隔夜规则处理。`
 }
 
-onMounted(refreshAll)
+onMounted(() => {
+  window.addEventListener('quant:open-stock-market', handleStockMarketEvent)
+  refreshAll()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('quant:open-stock-market', handleStockMarketEvent)
+})
 </script>
 
 <style scoped>
@@ -472,6 +761,10 @@ onMounted(refreshAll)
 .content {
   min-width: 0;
   padding: 16px;
+  background:
+    linear-gradient(90deg, rgba(24, 144, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(24, 144, 255, 0.028) 1px, transparent 1px);
+  background-size: 28px 28px;
 }
 
 .page-stack {
@@ -485,6 +778,204 @@ onMounted(refreshAll)
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 14px;
+}
+
+.command-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.command-strip article {
+  min-width: 0;
+  border: 1px solid rgba(24, 144, 255, 0.16);
+  border-radius: 12px;
+  padding: 12px;
+  background:
+    linear-gradient(180deg, rgba(24, 144, 255, 0.08), rgba(24, 144, 255, 0.015)),
+    var(--terminal-card);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.command-strip span,
+.command-strip small {
+  display: block;
+  color: #6f7d95;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.command-strip strong {
+  display: block;
+  margin: 6px 0 4px;
+  color: var(--terminal-text);
+  font-size: 1rem;
+  overflow-wrap: anywhere;
+}
+
+.cockpit-grid {
+  display: grid;
+  grid-template-columns: 1.15fr 1fr;
+  gap: 14px;
+}
+
+.terminal-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border: 1px solid rgba(24, 144, 255, 0.32);
+  border-radius: 999px;
+  padding: 2px 9px;
+  background: rgba(24, 144, 255, 0.12);
+  color: #69b1ff;
+  font-size: 0.72rem;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.chip-hot {
+  border-color: rgba(245, 34, 45, 0.36);
+  background: rgba(245, 34, 45, 0.12);
+  color: #ff7875;
+}
+
+.chip-warn {
+  border-color: rgba(245, 197, 66, 0.4);
+  background: rgba(245, 197, 66, 0.12);
+  color: #f5c542;
+}
+
+.matrix-list,
+.pipeline-flow,
+.ai-terminal {
+  display: grid;
+  gap: 10px;
+}
+
+.matrix-list article,
+.pipeline-flow article,
+.ai-terminal p {
+  margin: 0;
+  min-width: 0;
+  border: 1px solid var(--terminal-border);
+  border-radius: 12px;
+  padding: 11px;
+  background: var(--terminal-bg);
+}
+
+.matrix-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 9px;
+}
+
+.matrix-title strong {
+  color: var(--terminal-text);
+  font-size: 1.05rem;
+}
+
+.matrix-meter {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.matrix-meter i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--quant-neutral), var(--quant-rise));
+  box-shadow: 0 0 16px rgba(245, 34, 45, 0.3);
+}
+
+.matrix-list dl {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 10px 0 0;
+}
+
+.matrix-list dt,
+.pipeline-flow span,
+.pipeline-flow small,
+.ai-terminal span,
+.sentinel-timeline small {
+  display: block;
+  color: #6f7d95;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.matrix-list dd {
+  margin: 4px 0 0;
+  color: var(--terminal-text);
+  font-weight: 900;
+}
+
+.pipeline-flow article {
+  position: relative;
+  padding-left: 15px;
+}
+
+.pipeline-flow article::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 13px;
+  bottom: 13px;
+  width: 3px;
+  border-radius: 999px;
+  background: var(--quant-neutral);
+}
+
+.pipeline-flow strong,
+.ai-terminal strong {
+  display: block;
+  margin: 5px 0 3px;
+  color: var(--terminal-text);
+  font-size: 0.95rem;
+  overflow-wrap: anywhere;
+}
+
+.sentinel-timeline {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sentinel-timeline li {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  border: 1px solid var(--terminal-border);
+  border-radius: 12px;
+  padding: 10px;
+  background: var(--terminal-bg);
+}
+
+.sentinel-timeline time {
+  display: grid;
+  place-items: center;
+  height: 32px;
+  border: 1px solid rgba(24, 144, 255, 0.3);
+  border-radius: 9px;
+  color: #69b1ff;
+  background: rgba(24, 144, 255, 0.1);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  font-weight: 900;
+}
+
+.sentinel-timeline strong {
+  display: block;
+  color: var(--terminal-text);
+  font-size: 0.92rem;
 }
 
 .full-span {
@@ -576,8 +1067,28 @@ h2 {
 }
 
 .instruction-card p {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
   color: var(--terminal-text);
   font-weight: 900;
+}
+
+.inline-stock-code,
+.heading-stock-code {
+  color: #f2f6ff;
+  font-weight: 900;
+}
+
+.inline-stock-name,
+.heading-stock-name {
+  color: var(--terminal-text);
+  font-weight: 900;
+}
+
+.heading-stock-name {
+  margin-left: 8px;
 }
 
 .instruction-card small,
@@ -647,7 +1158,7 @@ h2 {
 
 .legion-card dl {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
   margin: 0;
 }
@@ -745,7 +1256,9 @@ pre {
   .dashboard-grid,
   .dual-board,
   .validation-grid,
-  .legion-grid {
+  .legion-grid,
+  .cockpit-grid,
+  .command-strip {
     grid-template-columns: 1fr;
   }
 }

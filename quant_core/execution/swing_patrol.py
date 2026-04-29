@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
-from quant_core.data_pipeline.market import fetch_sina_quote
+if __package__ in {None, ""}:
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from quant_core.data_pipeline.market import fetch_realtime_quote
 from quant_core.storage import mark_daily_pick_closed, open_position_picks, stock_daily_row
 from quant_core.execution.pushplus_tasks import send_pushplus
 
@@ -24,20 +29,52 @@ def run_swing_patrol(today: str | None = None, send_push: bool = True) -> dict[s
     ]
     if not picks:
         result = {"status": "noop", "reason": "没有需要 14:45 巡逻的 T+3 波段持仓", "date": current_day}
+        if send_push:
+            result["pushplus"] = _send_pushplus(
+                f"14:45波段巡逻：{current_day} 无持仓",
+                f"## 14:45 波段巡逻报告\n\n{current_day} 没有需要巡逻的 T+3 波段持仓。",
+            )
         print(result)
         return result
 
-    results = [_patrol_one_pick(pick, current_day, send_push=send_push) for pick in picks]
-    result = {"status": "checked", "date": current_day, "count": len(results), "results": results}
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for pick in picks:
+        try:
+            results.append(_patrol_one_pick(pick, current_day))
+        except Exception as exc:
+            errors.append(
+                {
+                    "status": "error",
+                    "selection_date": pick.get("selection_date"),
+                    "code": pick.get("code"),
+                    "name": pick.get("name"),
+                    "strategy_type": pick.get("strategy_type"),
+                    "error": str(exc),
+                }
+            )
+
+    title, content = _build_patrol_report(current_day, results, errors)
+    push_status = _send_pushplus(title, content) if send_push else {"status": "dry_run"}
+    result = {
+        "status": "checked",
+        "date": current_day,
+        "count": len(results) + len(errors),
+        "result_count": len(results),
+        "error_count": len(errors),
+        "results": results,
+        "errors": errors,
+        "pushplus": push_status,
+    }
     print(result)
     return result
 
 
-def _patrol_one_pick(pick: dict[str, Any], current_day: str, send_push: bool = True) -> dict[str, Any]:
-    quote = fetch_sina_quote(str(pick["code"]))
+def _patrol_one_pick(pick: dict[str, Any], current_day: str) -> dict[str, Any]:
+    quote = fetch_realtime_quote(str(pick["code"]))
     current_price = _safe_float(quote.get("current_price")) or _safe_float(quote.get("auction_price")) or _safe_float(quote.get("open"))
     if current_price <= 0:
-        raise RuntimeError(f"新浪行情没有返回 {pick['code']} 的有效 14:45 当前价")
+        raise RuntimeError(f"实时行情没有返回 {pick['code']} 的有效 14:45 当前价")
 
     selection_price = _safe_float(pick.get("selection_price"))
     if selection_price <= 0:
@@ -53,10 +90,12 @@ def _patrol_one_pick(pick: dict[str, Any], current_day: str, send_push: bool = T
             "selection_date": pick["selection_date"],
             "code": pick["code"],
             "name": pick["name"],
+            "strategy_type": pick.get("strategy_type"),
             "holding_day": holding_day,
             "current_price": round(current_price, 4),
             "current_gain": round(current_gain, 4),
             "anchor_open": round(anchor_open, 4),
+            "quote_time": f"{quote.get('date') or ''} {quote.get('time') or ''}".strip(),
             "reason": "未触发止盈、止损或 T+3 清退",
         }
 
@@ -86,21 +125,20 @@ def _patrol_one_pick(pick: dict[str, Any], current_day: str, send_push: bool = T
         code=pick.get("code"),
         pick_id=pick.get("id"),
     )
-    if send_push:
-        push_status = _send_pushplus(decision["title"], decision["content"])
-    else:
-        push_status = {"status": "dry_run"}
     return {
         "status": "closed",
         "selection_date": pick["selection_date"],
         "code": pick["code"],
         "name": pick["name"],
+        "strategy_type": pick.get("strategy_type"),
         "holding_day": holding_day,
         "current_price": round(current_price, 4),
         "current_gain": round(current_gain, 4),
         "anchor_open": round(anchor_open, 4),
+        "quote_time": f"{quote.get('date') or ''} {quote.get('time') or ''}".strip(),
         "action": decision["action"],
-        "pushplus": push_status,
+        "level": decision["level"],
+        "instruction": decision["instruction"],
         "pick": updated,
     }
 
@@ -221,6 +259,90 @@ def _anchor_open_price(pick: dict[str, Any]) -> float:
         if value > 0:
             return value
     return _safe_float(pick.get("selection_price"))
+
+
+def _build_patrol_report(
+    current_day: str,
+    results: list[dict[str, Any]],
+    errors: list[dict[str, Any]],
+) -> tuple[str, str]:
+    closed = [item for item in results if item.get("status") == "closed"]
+    holding = [item for item in results if item.get("status") == "holding"]
+    title = f"14:45波段巡逻报告：持仓{len(holding)} / 指令{len(closed)}"
+    lines = [
+        "## 14:45 波段巡逻报告",
+        "",
+        f"- 日期：{current_day}",
+        f"- 巡逻标的：{len(results) + len(errors)} 只",
+        f"- 继续持仓：{len(holding)} 只",
+        f"- 触发指令：{len(closed)} 只",
+        f"- 异常：{len(errors)} 只",
+        "",
+    ]
+
+    for item in closed:
+        lines.extend(
+            [
+                f"### {_action_icon(str(item.get('level') or ''))} {item.get('action')}：{item.get('name')}({item.get('code')})",
+                f"- 命中策略：{item.get('strategy_type') or '波段策略'}",
+                f"- 买入观察日：{item.get('selection_date')}，当前 T+{item.get('holding_day')}",
+                f"- 14:45 当前价：{_fmt_price(item.get('current_price'))}",
+                f"- 累计涨幅：{_fmt_pct(item.get('current_gain'))}",
+                f"- 主力成本线：{_fmt_price(item.get('anchor_open'))}",
+                f"- 行情时间：{item.get('quote_time') or '-'}",
+                f"- 操作指令：{item.get('instruction') or '-'}",
+                "",
+            ]
+        )
+
+    for item in holding:
+        lines.extend(
+            [
+                f"### 🟦 持仓观察：{item.get('name')}({item.get('code')})",
+                f"- 命中策略：{item.get('strategy_type') or '波段策略'}",
+                f"- 买入观察日：{item.get('selection_date')}，当前 T+{item.get('holding_day')}",
+                f"- 14:45 当前价：{_fmt_price(item.get('current_price'))}",
+                f"- 累计涨幅：{_fmt_pct(item.get('current_gain'))}",
+                f"- 主力成本线：{_fmt_price(item.get('anchor_open'))}",
+                f"- 行情时间：{item.get('quote_time') or '-'}",
+                f"- 状态：{item.get('reason') or '继续观察'}",
+                "",
+            ]
+        )
+
+    for item in errors:
+        lines.extend(
+            [
+                f"### ⚠️ 巡逻异常：{item.get('name')}({item.get('code')})",
+                f"- 命中策略：{item.get('strategy_type') or '波段策略'}",
+                f"- 买入观察日：{item.get('selection_date')}",
+                f"- 错误：{item.get('error')}",
+                "",
+            ]
+        )
+
+    if not results and not errors:
+        lines.append("今日无可展示巡逻结果。")
+    return title, "\n".join(lines).strip()
+
+
+def _action_icon(level: str) -> str:
+    if level == "profit":
+        return "💰"
+    if level == "danger":
+        return "🔪"
+    if level == "time":
+        return "⏰"
+    return "📌"
+
+
+def _fmt_price(value: Any) -> str:
+    number = _safe_float(value)
+    return "-" if number <= 0 else f"{number:.2f}"
+
+
+def _fmt_pct(value: Any) -> str:
+    return f"{_safe_float(value):.2f}%"
 
 
 def _holding_trading_day(selection_date: str, current_day: str) -> int:

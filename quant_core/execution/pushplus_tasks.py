@@ -10,6 +10,7 @@ from typing import Any
 import requests
 
 from quant_core.config import PUSHPLUS_TOKEN, check_push_config
+from quant_core.ai_agent.agent_gateway import attach_ai_interview, run_1446_ai_interview
 from quant_core.daily_pick import save_pushed_top_picks
 from quant_core.engine.predictor import scan_market
 from quant_core.storage import (
@@ -156,12 +157,21 @@ def top_pick() -> dict[str, Any]:
         result = send_pushplus("14:50尾盘策略：无强信号空仓", content)
         print({"status": "sent", "task": "top_pick", "time": now, "pushplus": result})
         return result
+    ai_interview = run_1446_ai_interview(
+        [str(row.get("code") or "") for row in rows],
+        [str(row.get("name") or "") for row in rows],
+        rows,
+    )
+    rows = attach_ai_interview(rows, ai_interview)
     saved = save_pushed_top_picks(rows, scan, force=False)
     pick_lines = "\n".join(_pick_line(winner) for winner in rows) or "- 本次扫描无可展示标的。"
+    ai_block = str(ai_interview.get("markdown") or "").strip()
     content = f"""14:50 实时多轨独立候选
 时间: {now}
 标的数量: {len(rows)}
 {pick_lines}
+
+{ai_block}
 
 市场模式: {gate.get('mode')}
 成交额: {gate.get('market_amount_yi', 0):.0f} 亿
@@ -218,12 +228,36 @@ def _pick_line(row: dict[str, Any], exists: bool = False) -> str:
     target_date = row.get("target_date") or "-"
     snapshot_time = row.get("snapshot_time") or "14:50"
     metric_label = "T+3预期最大涨幅" if strategy_type in {"中线超跌反转", "右侧主升浪"} else "预期开盘溢价"
-    return (
+    line = (
         f"- 【{strategy_type}】{name}({code}) "
         f"14:50价 {_fmt(price)} / 涨跌 {_fmt(change)}% / "
         f"{metric_label} {_fmt(expected)}% / 评分 {_fmt(score)} / "
         f"快照 {snapshot_time} / 目标日 {target_date}"
     )
+    ai_summary = _ai_summary(row)
+    if ai_summary:
+        line += f"\n  - AI舆情：{ai_summary}"
+    return line
+
+
+def _ai_summary(row: dict[str, Any]) -> str:
+    ai = row.get("ai_interview")
+    if not isinstance(ai, dict):
+        raw = row.get("raw")
+        if isinstance(raw, dict):
+            winner = raw.get("winner")
+            if isinstance(winner, dict):
+                ai = winner.get("ai_interview")
+    if not isinstance(ai, dict):
+        return ""
+    risk = str(ai.get("risk_level") or "-")
+    hint = str(ai.get("action_hint") or "-")
+    verdict = str(ai.get("verdict") or "").strip()
+    reason = str(ai.get("reason") or "").strip()
+    detail = verdict or reason
+    if len(detail) > 90:
+        detail = detail[:87] + "..."
+    return f"风险{risk} / {hint} / {detail}".strip()
 
 
 def _pushplus_token() -> str:

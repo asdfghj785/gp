@@ -1,13 +1,21 @@
 import os
+import sys
 import requests
 import pandas as pd
 from datetime import datetime
+from pathlib import Path
 import time
 import json
 import re
 import warnings
 
 warnings.filterwarnings('ignore')
+
+BASE_DIR = Path("/Users/eudis/ths")
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from quant_core.data_pipeline.trading_calendar import latest_trading_day_on_or_before
 
 # ================= 配置区 =================
 # 锁定你之前的 Parquet 历史数据目录
@@ -99,6 +107,15 @@ def main():
     os.makedirs(DATA_DIR, exist_ok=True)
 
     try:
+        today = datetime.now().date()
+        latest_trade_day = latest_trading_day_on_or_before(today)
+        if latest_trade_day != today:
+            latest_text = latest_trade_day.isoformat() if latest_trade_day else "未知"
+            skip_msg = f"⏸️ 非交易日跳过: 今日 {today_str} 最新交易日为 {latest_text}，不写入日线 Parquet。"
+            print(skip_msg)
+            notify(skip_msg)
+            return
+
         # 调用新浪引擎抓取数据
         df_today = fetch_all_stock_data_sina()
 

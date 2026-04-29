@@ -23,6 +23,7 @@ _load_local_env()
 
 BASE_DIR = Path(os.getenv("QUANT_BASE_DIR", "/Users/eudis/ths"))
 DATA_DIR = Path(os.getenv("QUANT_DATA_DIR", str(BASE_DIR / "data" / "all_kline")))
+MIN_KLINE_DIR = Path(os.getenv("QUANT_MIN_KLINE_DIR", str(BASE_DIR / "data" / "min_kline")))
 CORE_DB_DIR = Path(os.getenv("QUANT_CORE_DB_DIR", str(BASE_DIR / "data" / "core_db")))
 SQLITE_PATH = Path(os.getenv("QUANT_SQLITE_PATH", str(CORE_DB_DIR / "quant_workstation.sqlite3")))
 MODELS_DIR = Path(os.getenv("QUANT_MODELS_DIR", str(BASE_DIR / "models")))
@@ -78,4 +79,5 @@ def check_push_config(print_warning: bool = True) -> dict[str, Any]:
 def ensure_dirs() -> None:
     CORE_DB_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    MIN_KLINE_DIR.mkdir(parents=True, exist_ok=True)
     MODELS_DIR.mkdir(parents=True, exist_ok=True)

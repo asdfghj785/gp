@@ -7,7 +7,8 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/usr/bin/python3</string>
-		<string>/Users/eudis/ths/quant_core/execution/daily_pick_cli.py</string>
+		<string>-m</string>
+		<string>quant_core.execution.daily_pick_cli</string>
 		<string>save</string>
 	</array>
 	<key>WorkingDirectory</key>

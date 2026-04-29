@@ -10,7 +10,7 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from quant_core.data_pipeline.market import fetch_sina_quote
+from quant_core.data_pipeline.market import fetch_realtime_quote
 from quant_core.storage import connect, init_db
 from quant_core.execution.pushplus_tasks import send_pushplus
 
@@ -143,7 +143,7 @@ def _judge_one_pick(
     dry_run: bool = False,
     use_close_as_open: bool = False,
 ) -> dict[str, Any]:
-    quote = fetch_sina_quote(str(pick["code"]))
+    quote = fetch_realtime_quote(str(pick["code"]), prefer_auction=not use_close_as_open)
     open_price = _close_proxy_price(quote) if use_close_as_open else _valid_open_price(quote)
     base_price = _base_snapshot_price(pick)
     open_premium = (open_price / base_price - 1) * 100
@@ -259,7 +259,7 @@ def _breakout_action(open_premium: float) -> dict[str, str]:
 
 
 def _judge_auction_audit_pick(pick: dict[str, Any], target_day: str, stage: str) -> dict[str, Any]:
-    quote = fetch_sina_quote(str(pick["code"]))
+    quote = fetch_realtime_quote(str(pick["code"]), prefer_auction=True)
     match_price = _auction_match_price(quote)
     base_price = _base_snapshot_price(pick)
     virtual_premium = (match_price / base_price - 1) * 100
@@ -474,21 +474,21 @@ def _decode_pick(row: Any) -> dict[str, Any]:
 def _valid_open_price(quote: dict[str, Any]) -> float:
     open_price = _safe_float(quote.get("auction_price") or quote.get("open") or quote.get("current_price"))
     if open_price <= 0:
-        raise RuntimeError("新浪行情未返回有效 09:25/开盘价")
+        raise RuntimeError("行情接口未返回有效 09:25/开盘价")
     return open_price
 
 
 def _auction_match_price(quote: dict[str, Any]) -> float:
     match_price = _safe_float(quote.get("auction_price") or quote.get("current_price") or quote.get("open"))
     if match_price <= 0:
-        raise RuntimeError("新浪行情未返回有效竞价虚拟匹配价")
+        raise RuntimeError("行情接口未返回有效竞价虚拟匹配价")
     return match_price
 
 
 def _close_proxy_price(quote: dict[str, Any]) -> float:
     close_price = _safe_float(quote.get("current_price") or quote.get("auction_price") or quote.get("open"))
     if close_price <= 0:
-        raise RuntimeError("新浪行情未返回有效收盘/当前价，无法模拟早盘审计")
+        raise RuntimeError("行情接口未返回有效收盘/当前价，无法模拟早盘审计")
     return close_price
 
 
