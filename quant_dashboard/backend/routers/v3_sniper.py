@@ -22,8 +22,11 @@ if str(BASE_DIR) not in sys.path:
 
 from quant_core.ai_agent.agent_gateway import run_1446_ai_interview
 from quant_core.config import MODELS_DIR
+from quant_core.data_pipeline.concept_engine import CONCEPT_CATALOG_PATH, CONCEPT_INDEX_PATH, get_stock_concept_map
 from quant_core.data_pipeline.market import fetch_realtime_quote, fetch_sina_snapshot
-from quant_core.engine.daily_factor_factory import generate_daily_factors
+from quant_core.data_pipeline.sector_engine import get_stock_sector_map
+from quant_core.data_pipeline.trading_calendar import is_trading_day
+from quant_core.engine.daily_factor_factory import THEME_FACTOR_COLUMNS, generate_daily_factors
 from quant_core.engine.daily_model_trainer import discover_daily_data_dir, list_daily_files
 from quant_core.engine.model_evaluator import load_daily_model
 from quant_core.storage import (
@@ -36,6 +39,7 @@ from quant_core.storage import (
 
 
 router = APIRouter(prefix="/api/v3", tags=["v3-sniper"])
+v4_router = APIRouter(prefix="/api/v4", tags=["v4-sniper"])
 
 GLOBAL_MODEL_PATH = MODELS_DIR / "xgboost_daily_swing_global_v1.json"
 GLOBAL_META_PATH = MODELS_DIR / "xgboost_daily_swing_global_v1.meta.json"
@@ -47,6 +51,9 @@ _LOCK_LABEL = f"{_LOCK_HOUR:02d}:{_LOCK_MINUTE:02d}"
 _EXCLUDED_BOARD_PREFIXES = ("300", "301", "688", "689", "4", "8", "92")
 _WORKER_MODEL: Any = None
 _WORKER_FEATURE_COLS: list[str] = []
+_STOCK_CONCEPT_MAP_CACHE: Optional[dict[str, str]] = None
+_STOCK_SECTOR_MAP_CACHE: Optional[dict[str, str]] = None
+_CONCEPT_NAME_MAP_CACHE: Optional[dict[str, str]] = None
 
 
 class AnalyzeStockRequest(BaseModel):
@@ -78,8 +85,23 @@ async def scan_today(
 
 @router.get("/sniper/history")
 async def sniper_history(limit: int = Query(default=20, ge=1, le=120)) -> dict[str, Any]:
-    """Return immutable daily V3 sniper locks with T+1/T+2/T+3 close follow-up."""
+    """Return immutable daily V4 Theme Alpha sniper locks with T+1/T+2/T+3 close follow-up."""
     return await asyncio.to_thread(_sniper_history_sync, limit)
+
+
+@v4_router.get("/sniper/scan_today")
+async def scan_today_v4(
+    threshold: float = Query(0.85, ge=0.0, le=1.0, description="Legacy param; Top-K mode ignores hard threshold."),
+    limit: int = Query(default=0, ge=0, le=10000),
+    max_workers: int = Query(default=8, ge=1, le=16),
+    cache_seconds: int = Query(default=120, ge=0, le=900),
+) -> dict[str, Any]:
+    return await scan_today(threshold=threshold, limit=limit, max_workers=max_workers, cache_seconds=cache_seconds)
+
+
+@v4_router.get("/sniper/history")
+async def sniper_history_v4(limit: int = Query(default=20, ge=1, le=120)) -> dict[str, Any]:
+    return await sniper_history(limit=limit)
 
 
 @router.post("/agent/analyze_stock")
@@ -112,7 +134,7 @@ def _scan_today_sync(threshold: float, limit: int, max_workers: int, cache_secon
         return _payload_from_lock(locked, start_ts)
 
     can_attempt_lock = _can_attempt_daily_lock(limit)
-    cache_key = f"{prediction_date}:{limit}:{max_workers}:top{_TOP_K}:live-v3"
+    cache_key = f"{prediction_date}:{limit}:{max_workers}:top{_TOP_K}:live-v4-theme"
     now_ts = datetime.now().timestamp()
     if (
         not can_attempt_lock
@@ -144,7 +166,10 @@ def _scan_today_sync(threshold: float, limit: int, max_workers: int, cache_secon
     tasks, filter_stats = _build_candidate_tasks(files, quote_pool)
     scored_rows, errors = _score_candidate_tasks(tasks, feature_cols, max_workers=max_workers)
     evaluated_count = len(scored_rows)
-    rows = sorted(scored_rows, key=lambda item: float(item.get("probability") or 0.0), reverse=True)[:_TOP_K]
+    rows = [
+        _ensure_theme_contract(row)
+        for row in sorted(scored_rows, key=lambda item: float(item.get("probability") or 0.0), reverse=True)[:_TOP_K]
+    ]
     if not rows:
         raise RuntimeError(f"没有生成任何有效最新因子。errors={errors[:5]} filter_stats={filter_stats}")
 
@@ -186,7 +211,7 @@ def _scan_today_sync(threshold: float, limit: int, max_workers: int, cache_secon
     payload["lock_status"] = lock_reason
     if should_lock:
         payload["locked_at"] = datetime.now().isoformat(timespec="seconds")
-        locked = save_v3_sniper_lock(payload, created_by="v3_sniper_1450")
+        locked = save_v3_sniper_lock(payload, created_by="v4_theme_alpha_1450")
         payload = _payload_from_lock(locked, start_ts)
         payload["cache"] = {"hit": False, "type": "persistent_lock", "inserted": bool(locked.get("inserted"))}
         if locked.get("inserted"):
@@ -229,6 +254,7 @@ def _sniper_history_sync(limit: int) -> dict[str, Any]:
 
 
 def _history_stock_row(signal: dict[str, Any], selection_date: str) -> dict[str, Any]:
+    signal = _ensure_theme_contract(dict(signal))
     code = str(signal.get("code") or "").zfill(6)[-6:]
     base_close = _safe_float(signal.get("close"), None)
     closes = _future_close_rows(code, selection_date, limit=3)
@@ -258,6 +284,9 @@ def _history_stock_row(signal: dict[str, Any], selection_date: str) -> dict[str,
     return {
         "code": code,
         "name": signal.get("name") or code,
+        "theme_name": signal.get("theme_name") or "-",
+        "theme_source": signal.get("theme_source") or "",
+        "theme_pct_chg_3": signal.get("theme_pct_chg_3"),
         "probability_pct": signal.get("probability_pct"),
         "pct_chg": signal.get("pct_chg"),
         "locked_price": base_close,
@@ -321,7 +350,7 @@ def _future_close_rows_from_parquet(code: str, selection_date: str, limit: int =
 
 def _payload_from_lock(lock: dict[str, Any], start_ts: float) -> dict[str, Any]:
     payload = dict(lock.get("payload") or {})
-    rows = _filter_display_rows(list(payload.get("rows") or []))
+    rows = [_ensure_theme_contract(row) for row in _filter_display_rows(list(payload.get("rows") or []))]
     payload["rows"] = rows
     payload["signal_count"] = len(rows)
     payload.setdefault("universe_filter", "mainboard_only_exclude_chinext_star_bj_st")
@@ -337,7 +366,7 @@ def _payload_from_lock(lock: dict[str, Any], start_ts: float) -> dict[str, Any]:
 
 def _can_attempt_daily_lock(limit: int) -> bool:
     now = datetime.now()
-    return int(limit) == 0 and now.weekday() < 5 and (now.hour, now.minute) >= (_LOCK_HOUR, _LOCK_MINUTE)
+    return int(limit) == 0 and is_trading_day(now.date()) and (now.hour, now.minute) >= (_LOCK_HOUR, _LOCK_MINUTE)
 
 
 def _should_lock_payload(
@@ -349,8 +378,8 @@ def _should_lock_payload(
     now = datetime.now()
     if int(limit) != 0:
         return False, "preview_only_limit"
-    if now.weekday() >= 5:
-        return False, "not_weekday"
+    if not is_trading_day(now.date()):
+        return False, "not_trading_day"
     if (now.hour, now.minute) < (_LOCK_HOUR, _LOCK_MINUTE):
         return False, "waiting_for_1450"
     if str(quote_meta.get("source") or "") != "tencent.qt":
@@ -372,10 +401,6 @@ def _fetch_live_quote_pool(codes: list[str]) -> tuple[dict[str, dict[str, Any]],
     min_usable = max(20, int(len(unique_codes) * 0.5))
     if len(quote_pool) >= min_usable:
         return quote_pool, {"source": "tencent.qt", "mode": "tencent_batch", "requested": len(unique_codes)}
-
-    fallback = _fetch_akshare_quote_pool(unique_codes)
-    if fallback:
-        return fallback, {"source": "akshare.spot", "mode": "akshare_snapshot", "requested": len(unique_codes)}
 
     fallback = _fetch_sina_quote_pool(unique_codes)
     if fallback:
@@ -436,57 +461,6 @@ def _fetch_tencent_quote_chunk(codes: list[str]) -> dict[str, dict[str, Any]]:
             "date": _format_tencent_quote_time(str(_field(fields, 30) or ""))[:10],
             "time": _format_tencent_quote_time(str(_field(fields, 30) or ""))[11:],
             "source": "tencent.qt",
-        }
-    return rows
-
-
-def _fetch_akshare_quote_pool(codes: list[str]) -> dict[str, dict[str, Any]]:
-    try:
-        import akshare as ak
-
-        snapshot = ak.stock_zh_a_spot_em()
-    except Exception:
-        return {}
-    if snapshot is None or snapshot.empty:
-        return {}
-    rename = {
-        "代码": "code",
-        "名称": "name",
-        "最新价": "current_price",
-        "涨跌幅": "change_pct",
-        "今开": "open",
-        "昨收": "pre_close",
-        "最高": "high",
-        "最低": "low",
-        "成交量": "volume",
-        "成交额": "amount",
-    }
-    frame = snapshot.rename(columns={k: v for k, v in rename.items() if k in snapshot.columns}).copy()
-    if "code" not in frame.columns:
-        return {}
-    wanted = set(codes)
-    rows: dict[str, dict[str, Any]] = {}
-    for _, item in frame.iterrows():
-        code = "".join(ch for ch in str(item.get("code") or "") if ch.isdigit())[-6:]
-        if code not in wanted:
-            continue
-        price = _safe_float(item.get("current_price"), 0.0) or 0.0
-        rows[code] = {
-            "code": code,
-            "name": str(item.get("name") or "").strip(),
-            "price": price,
-            "current_price": price,
-            "auction_price": price,
-            "pre_close": _safe_float(item.get("pre_close"), 0.0) or 0.0,
-            "open": _safe_float(item.get("open"), 0.0) or 0.0,
-            "high": _safe_float(item.get("high"), 0.0) or 0.0,
-            "low": _safe_float(item.get("low"), 0.0) or 0.0,
-            "volume": _safe_float(item.get("volume"), 0.0) or 0.0,
-            "amount": _safe_float(item.get("amount"), 0.0) or 0.0,
-            "change_pct": _safe_float(item.get("change_pct"), None),
-            "date": datetime.now().date().isoformat(),
-            "time": datetime.now().strftime("%H:%M:%S"),
-            "source": "akshare.spot",
         }
     return rows
 
@@ -720,6 +694,8 @@ def _format_signal_row(row: pd.Series) -> dict[str, Any]:
         pct_chg = (_safe_float(row.get("close"), 0.0) / max(_safe_float(row.get("open"), 0.0), 1e-9) - 1) * 100
     pressure = _safe_float(row.get("close_location_value"), 0.0)
     probability = _safe_float(row.get("probability"), 0.0)
+    theme_name, theme_source = _theme_name_for_code(code)
+    theme_pct_chg_3 = _safe_float(row.get("theme_pct_chg_3"), None)
     return {
         "code": code,
         "name": name,
@@ -730,6 +706,9 @@ def _format_signal_row(row: pd.Series) -> dict[str, Any]:
         "probability_pct": round(float(probability) * 100, 2),
         "pct_chg": round(float(pct_chg), 2),
         "pressure_factor": round(float(pressure), 4),
+        "theme_name": theme_name,
+        "theme_source": theme_source,
+        "theme_pct_chg_3": round(float(theme_pct_chg_3), 6) if theme_pct_chg_3 is not None else None,
         "close": round(_safe_float(row.get("close"), 0.0), 4),
         "strategy_type": "全局日线XGB",
         "signal": "极品高置信" if probability >= 0.9 else "高置信狙击",
@@ -741,9 +720,112 @@ def _align_features(frame: pd.DataFrame, feature_cols: list[str]) -> pd.DataFram
     out = frame.copy()
     for col in feature_cols:
         if col not in out.columns:
-            out[col] = 0.0
+            out[col] = np.nan if col in THEME_FACTOR_COLUMNS else 0.0
     aligned = out[feature_cols].apply(pd.to_numeric, errors="coerce")
-    return aligned.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0).astype("float32", copy=False)
+    aligned = aligned.replace([np.inf, -np.inf], np.nan)
+    fillable_cols = [col for col in aligned.columns if col not in THEME_FACTOR_COLUMNS]
+    if fillable_cols:
+        aligned[fillable_cols] = aligned[fillable_cols].ffill().fillna(0.0)
+    return aligned.astype("float32", copy=False)
+
+
+def _ensure_theme_contract(row: dict[str, Any]) -> dict[str, Any]:
+    out = dict(row)
+    code = _normalize_code(out.get("code") or out.get("file_symbol"))
+    if code:
+        theme_name, theme_source = _theme_name_for_code(code)
+        out["theme_name"] = out.get("theme_name") or theme_name
+        out["theme_source"] = out.get("theme_source") or theme_source
+    else:
+        out.setdefault("theme_name", "-")
+        out.setdefault("theme_source", "")
+    pct3 = _safe_float(out.get("theme_pct_chg_3"), None)
+    if pct3 is None and code:
+        pct3 = _latest_theme_pct_chg_3(code)
+    out["theme_pct_chg_3"] = round(float(pct3), 6) if pct3 is not None else None
+    return out
+
+
+def ensure_theme_contract(row: dict[str, Any]) -> dict[str, Any]:
+    return _ensure_theme_contract(row)
+
+
+def _theme_name_for_code(code: str) -> tuple[str, str]:
+    clean = _normalize_code(code)
+    concept_code = _stock_concept_map().get(clean, "")
+    if concept_code:
+        return _concept_name_map().get(concept_code, concept_code), "concept"
+    sector_name = _stock_sector_map().get(clean, "")
+    if sector_name:
+        return sector_name, "sector"
+    return "-", ""
+
+
+def _stock_concept_map() -> dict[str, str]:
+    global _STOCK_CONCEPT_MAP_CACHE
+    if _STOCK_CONCEPT_MAP_CACHE is None:
+        _STOCK_CONCEPT_MAP_CACHE = get_stock_concept_map(refresh=False)
+    return _STOCK_CONCEPT_MAP_CACHE
+
+
+def _stock_sector_map() -> dict[str, str]:
+    global _STOCK_SECTOR_MAP_CACHE
+    if _STOCK_SECTOR_MAP_CACHE is None:
+        _STOCK_SECTOR_MAP_CACHE = get_stock_sector_map(refresh=False)
+    return _STOCK_SECTOR_MAP_CACHE
+
+
+def _concept_name_map() -> dict[str, str]:
+    global _CONCEPT_NAME_MAP_CACHE
+    if _CONCEPT_NAME_MAP_CACHE is not None:
+        return _CONCEPT_NAME_MAP_CACHE
+    mapping: dict[str, str] = {}
+    try:
+        if CONCEPT_INDEX_PATH.exists():
+            index = pd.read_parquet(CONCEPT_INDEX_PATH, columns=["concept_code", "concept_name"])
+            mapping.update(
+                {
+                    str(row.get("concept_code") or ""): str(row.get("concept_name") or "")
+                    for row in index.to_dict("records")
+                    if row.get("concept_code") and row.get("concept_name")
+                }
+            )
+        if CONCEPT_CATALOG_PATH.exists():
+            catalog = json.loads(CONCEPT_CATALOG_PATH.read_text(encoding="utf-8"))
+            for item in catalog if isinstance(catalog, list) else []:
+                code = str(item.get("concept_code") or "")
+                name = str(item.get("concept_name") or "")
+                if code and name:
+                    mapping.setdefault(code, name)
+    except Exception:
+        mapping = {}
+    _CONCEPT_NAME_MAP_CACHE = mapping
+    return mapping
+
+
+def _latest_theme_pct_chg_3(code: str) -> Optional[float]:
+    clean = _normalize_code(code)
+    if not clean:
+        return None
+    try:
+        data_dir = discover_daily_data_dir()
+        candidates = [data_dir / f"{clean}_daily.parquet"]
+        candidates.extend(sorted(data_dir.glob(f"*{clean}*_daily.parquet")))
+        path = next((item for item in candidates if item.exists()), None)
+        if path is None:
+            return None
+        raw = pd.read_parquet(path).tail(120)
+        factors = generate_daily_factors(raw)
+        if factors.empty:
+            return None
+        return _safe_float(factors.iloc[-1].get("theme_pct_chg_3"), None)
+    except Exception:
+        return None
+
+
+def _normalize_code(value: Any) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits[-6:] if len(digits) >= 6 else ""
 
 
 def _load_model_meta() -> dict[str, Any]:
@@ -813,15 +895,15 @@ def _is_excluded_board(code: str) -> bool:
 def _send_v3_sniper_pushplus(payload: dict[str, Any]) -> dict[str, Any]:
     rows = _filter_display_rows(list(payload.get("rows") or []))[: int(payload.get("top_k") or _TOP_K)]
     if not rows:
-        return {"status": "skipped_empty", "reason": "V3 锁榜后主板过滤无可推送标的"}
+        return {"status": "skipped_empty", "reason": "V4 锁榜后主板过滤无可推送标的"}
     try:
         from quant_core.execution.pushplus_tasks import send_pushplus
 
-        title = f"{_LOCK_LABEL} V3全局雷达 Top {len(rows)}"
+        title = f"{_LOCK_LABEL} V4全局动量狙击 Top {len(rows)}"
         lines = "\n".join(_v3_push_line(index, row) for index, row in enumerate(rows, start=1))
         live = payload.get("live_data") or {}
         stats = payload.get("filter_stats") or {}
-        content = f"""## {_LOCK_LABEL} V3 全局日线 XGBoost 雷达
+        content = f"""## {_LOCK_LABEL} V4 Theme Alpha 全局动量狙击
 
 预测日期: {payload.get('prediction_date') or '-'}
 锁定时间: {payload.get('locked_at') or '-'}

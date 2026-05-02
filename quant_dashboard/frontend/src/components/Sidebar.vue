@@ -35,7 +35,6 @@ defineProps({
 defineEmits(['update:active'])
 
 const navItems = [
-  { id: 'v3', mark: 'Q', label: 'V3 Command', hint: 'XGBoost 指挥中心' },
   { id: 'dashboard', mark: 'D', label: 'Dashboard', hint: '总览与今日信号' },
   { id: 'ledger', mark: 'S', label: 'Shadow Test', hint: '分月影子账本' },
   { id: 'minute', mark: 'M', label: '单票行情库', hint: '日K、5m 与原始表格' },

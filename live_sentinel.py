@@ -16,13 +16,15 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from quant_core.data_pipeline.tencent_engine import get_tencent_realtime, tencent_symbol
+from quant_core.data_pipeline.trading_calendar import is_trading_day, nth_trading_day, trading_day_count_after
 from quant_core.execution.pushplus_tasks import send_pushplus
-from quant_core.storage import latest_daily_picks, mark_daily_pick_closed
+from quant_core.storage import connect, init_db, latest_daily_picks, mark_daily_pick_closed
 
 
 LEDGER_PATH = BASE_DIR / "shadow_ledger.json"
 DEFAULT_INTERVAL_SECONDS = 30
 MARKET_OPEN = clock_time(9, 15)
+CONTINUOUS_TRADING_START = clock_time(9, 30)
 LUNCH_START = clock_time(11, 30)
 LUNCH_END = clock_time(13, 0)
 MARKET_CLOSE = clock_time(15, 0)
@@ -31,6 +33,11 @@ TENCENT_REALTIME_URL = "http://qt.gtimg.cn/q={symbol}"
 INTRADAY_1M_COUNT = 240
 VOLUME_DIVERGENCE_MULTIPLIER = 3.0
 ORDER_BOOK_IMBALANCE_THRESHOLD = -80.0
+VWAP_FAKE_DUMP_HOLD_RATIO = 0.995
+ANTI_NUCLEAR_CONFIRM_SECONDS = 180
+ANTI_NUCLEAR_MAX_LOSS_PCT = -1.0
+SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪"}
+NON_SWING_STRATEGY_TYPES = {"尾盘突破", "首阴低吸"}
 
 
 def load_ledger(path: Path = LEDGER_PATH) -> dict[str, Any]:
@@ -144,6 +151,9 @@ def add_position(
 
 def seed_from_latest_1450_picks(path: Path = LEDGER_PATH, monitor_date: Optional[str] = None) -> dict[str, Any]:
     current_day = monitor_date or date.today().isoformat()
+    if not is_trading_day(parse_date(current_day) or date.today()):
+        return {"status": "skipped", "reason": "非交易日不重建实时巡逻账本", "monitor_date": current_day}
+
     picks = previous_1450_picks(current_day)
     ledger = load_ledger(path)
     closed_keys = {
@@ -217,7 +227,11 @@ def previous_1450_picks(current_day: str) -> list[dict[str, Any]]:
     if not previous_dates:
         return []
     selection_date = previous_dates[0]
-    return [row for row in rows if str(row.get("selection_date") or "") == selection_date]
+    return [
+        row
+        for row in rows
+        if str(row.get("selection_date") or "") == selection_date and not bool(row.get("is_closed"))
+    ]
 
 
 def run_loop(
@@ -261,6 +275,9 @@ def run_loop(
 
 def check_positions(path: Path = LEDGER_PATH, send_push: bool = True, dry_run: bool = False) -> dict[str, Any]:
     ledger = load_ledger(path)
+    if not is_trading_day(date.today()):
+        return {"status": "skipped", "reason": "非交易日不执行实时巡逻", "count": 0, "events": [], "ledger": ledger}
+
     positions = list(open_positions(ledger))
     events: list[dict[str, Any]] = []
 
@@ -297,6 +314,10 @@ def check_one_position(
     if buy_price <= 0:
         raise RuntimeError(f"{name}({code}) 缺少有效 buy_price")
 
+    external_close_event = retire_if_source_pick_already_closed(position, ledger, path, dry_run=dry_run)
+    if external_close_event:
+        return external_close_event
+
     quote = get_tencent_realtime(code)
     current_price = realtime_price(quote)
     if current_price <= 0:
@@ -314,6 +335,15 @@ def check_one_position(
     current_gain_pct = gain_pct(current_price, buy_price)
     highest_gain_pct = gain_pct(highest_price, buy_price)
     drawdown_pct = gain_pct(current_price, highest_price)
+    anti_nuclear_event = check_anti_nuclear_pool(
+        position=position,
+        ledger=ledger,
+        path=path,
+        current_price=current_price,
+        buy_price=buy_price,
+        send_push=send_push,
+        dry_run=dry_run,
+    )
     try:
         volume_alert_event = check_volume_divergence(
             position=position,
@@ -372,6 +402,8 @@ def check_one_position(
             event["volume_alert"] = volume_alert_event
         if order_book_alert_event:
             event["order_book_alert"] = order_book_alert_event
+        if anti_nuclear_event:
+            event["anti_nuclear"] = anti_nuclear_event
         return event
 
     trailing_active = highest_price >= buy_price * 1.05
@@ -401,6 +433,8 @@ def check_one_position(
             event["volume_alert"] = volume_alert_event
         if order_book_alert_event:
             event["order_book_alert"] = order_book_alert_event
+        if anti_nuclear_event:
+            event["anti_nuclear"] = anti_nuclear_event
         return event
 
     if is_t_plus_3_timeout(position):
@@ -428,6 +462,8 @@ def check_one_position(
             event["volume_alert"] = volume_alert_event
         if order_book_alert_event:
             event["order_book_alert"] = order_book_alert_event
+        if anti_nuclear_event:
+            event["anti_nuclear"] = anti_nuclear_event
         return event
 
     event = {
@@ -447,7 +483,90 @@ def check_one_position(
         event["volume_alert"] = volume_alert_event
     if order_book_alert_event:
         event["order_book_alert"] = order_book_alert_event
+    if anti_nuclear_event:
+        event["anti_nuclear"] = anti_nuclear_event
     return event
+
+
+def retire_if_source_pick_already_closed(
+    position: dict[str, Any],
+    ledger: dict[str, Any],
+    path: Path,
+    dry_run: bool = False,
+) -> Optional[dict[str, Any]]:
+    if str(position.get("source") or "") != "daily_picks_1450":
+        return None
+    pick_id = safe_int(position.get("source_pick_id"))
+    if pick_id <= 0:
+        return None
+
+    closed_pick = closed_daily_pick_snapshot(pick_id)
+    if not closed_pick:
+        return None
+
+    code = normalize_code(position.get("code"))
+    name = str(position.get("name") or code)
+    now = datetime.now().isoformat(timespec="seconds")
+    event = {
+        "status": "already_closed",
+        "code": code,
+        "name": name,
+        "reason": closed_pick.get("close_reason") or "daily_pick_closed",
+        "close_price": round(safe_float(closed_pick.get("close_price")), 4),
+        "close_return_pct": round(safe_float(closed_pick.get("close_return_pct")), 4),
+        "closed_at": closed_pick.get("close_checked_at") or "",
+        "checked_at": now,
+        "dry_run": dry_run,
+    }
+    if dry_run:
+        return event
+
+    positions = open_positions(ledger)
+    positions[:] = [
+        item
+        for item in positions
+        if safe_int(item.get("source_pick_id")) != pick_id
+    ]
+    closed_positions = ledger.setdefault("closed_positions", [])
+    if isinstance(closed_positions, list) and not any(
+        safe_int(item.get("source_pick_id")) == pick_id for item in closed_positions if isinstance(item, dict)
+    ):
+        closed = dict(position)
+        closed.update(
+            {
+                "exit_reason": "external_daily_pick_close",
+                "exit_price": event["close_price"],
+                "exit_gain_pct": event["close_return_pct"],
+                "closed_at": event["closed_at"] or now,
+                "daily_pick_sync": {
+                    "status": "already_closed",
+                    "pick_id": pick_id,
+                    "close_price": event["close_price"],
+                    "close_return_pct": event["close_return_pct"],
+                    "close_reason": event["reason"],
+                },
+            }
+        )
+        closed_positions.append(closed)
+    save_ledger(ledger, path)
+    return event
+
+
+def closed_daily_pick_snapshot(pick_id: int) -> Optional[dict[str, Any]]:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, code, name, strategy_type, is_closed, close_price,
+                   close_return_pct, close_reason, close_checked_at
+            FROM daily_picks
+            WHERE id = ?
+            """,
+            (int(pick_id),),
+        ).fetchone()
+    if not row or not bool(row["is_closed"]):
+        return None
+    return dict(row)
 
 
 def check_volume_divergence(
@@ -527,6 +646,33 @@ def check_order_book_imbalance(
         return None
 
     now = datetime.now()
+    current_price = safe_float(snapshot.get("current_price"))
+    buy_price = safe_float(position.get("buy_price"))
+    if should_verify_fake_dump(position, current_price):
+        vwap_context = vwap_verification_context(code, current_price)
+        verification = verify_fake_dump(
+            {
+                "code": code,
+                "name": name,
+                "current_price": current_price,
+                "vwap": vwap_context.get("vwap"),
+                "trigger": "order_book_imbalance",
+                "weibi": signal["weibi"],
+            }
+        )
+        if verification.get("fake_dump"):
+            return start_anti_nuclear_observation(
+                position=position,
+                ledger=ledger,
+                path=path,
+                snapshot=snapshot,
+                signal=signal,
+                verification=verification,
+                buy_price=buy_price,
+                checked_at=now,
+                dry_run=dry_run,
+            )
+
     title = f"【盘口抢跑预警】{name}({code}) 委比极限反转"
     message = (
         f"【盘口抢跑预警】{name} ({code}) 卖一至卖五突然涌现巨量抛单，"
@@ -570,6 +716,253 @@ def check_order_book_imbalance(
     }
 
 
+def should_verify_fake_dump(position: dict[str, Any], current_price: float) -> bool:
+    buy_price = safe_float(position.get("buy_price"))
+    if buy_price > 0 and current_price <= buy_price * 0.97:
+        return False
+    return current_price > 0
+
+
+def vwap_verification_context(code: str, current_price: float) -> dict[str, Any]:
+    try:
+        df = fetch_intraday_1m_df(code)
+        vwap = calculate_realtime_vwap(df)
+    except Exception as exc:
+        return {"vwap": 0.0, "error": str(exc)}
+    return {
+        "vwap": vwap,
+        "current_price": current_price,
+        "row_count": int(len(df)),
+    }
+
+
+def calculate_realtime_vwap(df: pd.DataFrame) -> float:
+    if df.empty or "volume" not in df.columns:
+        return 0.0
+    frame = df.copy()
+    price_col = "close" if "close" in frame.columns else "price" if "price" in frame.columns else ""
+    if not price_col:
+        return 0.0
+    prices = pd.to_numeric(frame[price_col], errors="coerce").fillna(0.0)
+    volumes = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0)
+    valid = (prices > 0) & (volumes > 0)
+    total_volume = float(volumes[valid].sum())
+    if total_volume <= 0:
+        return 0.0
+    return float((prices[valid] * volumes[valid]).sum() / total_volume)
+
+
+def verify_fake_dump(stock_data: dict[str, Any]) -> dict[str, Any]:
+    current_price = safe_float(stock_data.get("current_price") or stock_data.get("price"))
+    vwap = safe_float(stock_data.get("vwap"))
+    threshold_price = vwap * VWAP_FAKE_DUMP_HOLD_RATIO if vwap > 0 else 0.0
+    fake_dump = current_price > 0 and threshold_price > 0 and current_price >= threshold_price
+    return {
+        "fake_dump": bool(fake_dump),
+        "status": "FAKE_DUMP" if fake_dump else "REAL_DUMP",
+        "reason": "price_holds_vwap" if fake_dump else "vwap_breakdown_or_missing",
+        "current_price": round(current_price, 4),
+        "vwap": round(vwap, 4),
+        "vwap_threshold": round(threshold_price, 4),
+        "vwap_deviation_pct": round(gain_pct(current_price, vwap), 4) if vwap > 0 else 0.0,
+        "trigger": stock_data.get("trigger") or "",
+        "weibi": round(safe_float(stock_data.get("weibi")), 4),
+    }
+
+
+def start_anti_nuclear_observation(
+    position: dict[str, Any],
+    ledger: dict[str, Any],
+    path: Path,
+    snapshot: dict[str, Any],
+    signal: dict[str, Any],
+    verification: dict[str, Any],
+    buy_price: float,
+    checked_at: datetime,
+    dry_run: bool,
+) -> dict[str, Any]:
+    code = normalize_code(position.get("code"))
+    current_price = safe_float(verification.get("current_price")) or safe_float(snapshot.get("current_price"))
+    current_gain = gain_pct(current_price, buy_price)
+    deadline = checked_at + timedelta(seconds=ANTI_NUCLEAR_CONFIRM_SECONDS)
+    observation = {
+        "status": "FAKE_DUMP",
+        "started_at": checked_at.isoformat(timespec="seconds"),
+        "deadline_at": deadline.isoformat(timespec="seconds"),
+        "initial_price": round(current_price, 4),
+        "initial_gain_pct": round(current_gain, 4),
+        "vwap": verification.get("vwap"),
+        "vwap_threshold": verification.get("vwap_threshold"),
+        "vwap_deviation_pct": verification.get("vwap_deviation_pct"),
+        "weibi": round(signal["weibi"], 4),
+        "total_buy_vol": round(signal["total_buy_vol"], 4),
+        "total_sell_vol": round(signal["total_sell_vol"], 4),
+        "quote_time": snapshot.get("quote_time") or "",
+        "push_sent": False,
+    }
+
+    if not dry_run:
+        position["anti_nuclear_status"] = "FAKE_DUMP"
+        position["anti_nuclear_date"] = checked_at.date().isoformat()
+        position["anti_nuclear_observation"] = observation
+        position["order_book_alert_triggered"] = True
+        position["order_book_alert_date"] = checked_at.date().isoformat()
+        position["order_book_alert_at"] = checked_at.isoformat(timespec="seconds")
+        position["order_book_alert_type"] = "FAKE_DUMP_INTERCEPTED"
+        position["order_book_alert_snapshot"] = {
+            "total_buy_vol": round(signal["total_buy_vol"], 4),
+            "total_sell_vol": round(signal["total_sell_vol"], 4),
+            "weibi": round(signal["weibi"], 4),
+            "buy_volumes": [round(item, 4) for item in snapshot["buy_volumes"]],
+            "sell_volumes": [round(item, 4) for item in snapshot["sell_volumes"]],
+            "quote_time": snapshot.get("quote_time") or "",
+            "vwap_verification": verification,
+        }
+        save_ledger(ledger, path)
+
+    return {
+        "status": "fake_dump_intercepted",
+        "code": code,
+        "name": position.get("name") or code,
+        "current_price": round(current_price, 4),
+        "current_gain_pct": round(current_gain, 4),
+        "vwap": verification.get("vwap"),
+        "vwap_threshold": verification.get("vwap_threshold"),
+        "weibi": round(signal["weibi"], 4),
+        "deadline_at": observation["deadline_at"],
+        "dry_run": dry_run,
+    }
+
+
+def check_anti_nuclear_pool(
+    position: dict[str, Any],
+    ledger: dict[str, Any],
+    path: Path,
+    current_price: float,
+    buy_price: float,
+    send_push: bool,
+    dry_run: bool,
+) -> Optional[dict[str, Any]]:
+    if str(position.get("anti_nuclear_status") or "") != "FAKE_DUMP":
+        return None
+    observation = position.get("anti_nuclear_observation")
+    if not isinstance(observation, dict):
+        return None
+    if bool(observation.get("push_sent")):
+        return None
+
+    now = datetime.now()
+    deadline = parse_datetime(observation.get("deadline_at"))
+    if deadline and now < deadline:
+        return {
+            "status": "anti_nuclear_monitoring",
+            "code": normalize_code(position.get("code")),
+            "deadline_at": observation.get("deadline_at"),
+            "current_price": round(current_price, 4),
+            "current_gain_pct": round(gain_pct(current_price, buy_price), 4),
+        }
+
+    current_gain = gain_pct(current_price, buy_price)
+    if current_gain <= -3.0:
+        return finish_anti_nuclear_observation(
+            position=position,
+            ledger=ledger,
+            path=path,
+            status="FAILED_HARD_STOP_ZONE",
+            current_price=current_price,
+            current_gain_pct=current_gain,
+            push_result={"status": "skipped_hard_stop_zone"},
+            dry_run=dry_run,
+        )
+    if current_gain < ANTI_NUCLEAR_MAX_LOSS_PCT:
+        return finish_anti_nuclear_observation(
+            position=position,
+            ledger=ledger,
+            path=path,
+            status="FAILED_PRICE_WEAK",
+            current_price=current_price,
+            current_gain_pct=current_gain,
+            push_result={"status": "skipped_price_weak"},
+            dry_run=dry_run,
+        )
+
+    title, content = build_anti_nuclear_push(position, observation, current_price, current_gain, now)
+    push_result = send_pushplus(title, content) if send_push and not dry_run else {"status": "dry_run"}
+    return finish_anti_nuclear_observation(
+        position=position,
+        ledger=ledger,
+        path=path,
+        status="CONFIRMED_FAKE_DUMP",
+        current_price=current_price,
+        current_gain_pct=current_gain,
+        push_result=push_result,
+        dry_run=dry_run,
+    )
+
+
+def finish_anti_nuclear_observation(
+    position: dict[str, Any],
+    ledger: dict[str, Any],
+    path: Path,
+    status: str,
+    current_price: float,
+    current_gain_pct: float,
+    push_result: dict[str, Any],
+    dry_run: bool,
+) -> dict[str, Any]:
+    now = datetime.now().isoformat(timespec="seconds")
+    if not dry_run:
+        observation = position.get("anti_nuclear_observation")
+        if isinstance(observation, dict):
+            observation["confirmed_at"] = now
+            observation["confirmed_price"] = round(current_price, 4)
+            observation["confirmed_gain_pct"] = round(current_gain_pct, 4)
+            observation["final_status"] = status
+            observation["push_sent"] = status == "CONFIRMED_FAKE_DUMP"
+            observation["push_status"] = push_result
+        position["anti_nuclear_status"] = status
+        save_ledger(ledger, path)
+
+    return {
+        "status": status.lower(),
+        "code": normalize_code(position.get("code")),
+        "name": position.get("name") or normalize_code(position.get("code")),
+        "current_price": round(current_price, 4),
+        "current_gain_pct": round(current_gain_pct, 4),
+        "pushplus": push_result,
+        "dry_run": dry_run,
+    }
+
+
+def build_anti_nuclear_push(
+    position: dict[str, Any],
+    observation: dict[str, Any],
+    current_price: float,
+    current_gain_pct: float,
+    checked_at: datetime,
+) -> tuple[str, str]:
+    code = normalize_code(position.get("code"))
+    name = str(position.get("name") or code)
+    title = f"【反推捕捉：极强承接！】{name}({code})"
+    content = f"""## 【反推捕捉：极强承接！】{name} ({code}) 刚刚遭遇盘口核按钮，但股价死守 VWAP！
+
+识别为[虚假出货/主力洗盘]。系统已拦截卖出指令，该股洗盘后存在极大反包概率，建议死拿！
+
+- 标的：{name}({code})
+- 命中策略：{position.get("strategy_type") or "-"}
+- 盘口委比：{safe_float(observation.get("weibi")):.2f}%
+- 触发价：{safe_float(observation.get("initial_price")):.2f}
+- 当前价：{current_price:.2f}
+- 当前盈亏：{current_gain_pct:.2f}%
+- 实时 VWAP：{safe_float(observation.get("vwap")):.2f}
+- VWAP 防线：{safe_float(observation.get("vwap_threshold")):.2f}
+- VWAP 偏离：{safe_float(observation.get("vwap_deviation_pct")):.2f}%
+- 观察开始：{observation.get("started_at") or "-"}
+- 确认时间：{checked_at.isoformat(timespec="seconds")}
+"""
+    return title, content
+
+
 def close_position(
     ledger: dict[str, Any],
     position: dict[str, Any],
@@ -589,11 +982,29 @@ def close_position(
 ) -> dict[str, Any]:
     code = normalize_code(position.get("code"))
     now = datetime.now().isoformat(timespec="seconds")
+    settlement = close_settlement_context(
+        quote=quote,
+        checked_at=now,
+        trigger_price=current_price,
+        buy_price=buy_price,
+    )
+    settlement_price = safe_float(settlement.get("settlement_price")) or current_price
+    settlement_gain_pct = safe_float(settlement.get("settlement_gain_pct"))
+    settlement_basis = str(settlement.get("settlement_basis") or "realtime")
+    display_message = message
+    if settlement_basis == "morning_auction_open":
+        display_message = (
+            f"{message}\n\n早盘竞价触发，影子账本按当日开盘价 "
+            f"{settlement_price:.2f} 结算，结算盈亏 {settlement_gain_pct:.2f}%。"
+        )
     content = build_push_content(
         position=position,
         reason=reason,
-        message=message,
+        message=display_message,
         current_price=current_price,
+        settlement_price=settlement_price,
+        settlement_gain_pct=settlement_gain_pct,
+        settlement_basis=settlement_basis,
         highest_price=highest_price,
         buy_price=buy_price,
         current_gain_pct=current_gain_pct,
@@ -607,8 +1018,11 @@ def close_position(
         position=position,
         reason=reason,
         title=title,
-        message=message,
+        message=display_message,
         current_price=current_price,
+        settlement_price=settlement_price,
+        settlement_gain_pct=settlement_gain_pct,
+        settlement_basis=settlement_basis,
         highest_price=highest_price,
         buy_price=buy_price,
         current_gain_pct=current_gain_pct,
@@ -623,8 +1037,11 @@ def close_position(
     closed.update(
         {
             "exit_reason": reason,
-            "exit_price": round(current_price, 4),
-            "exit_gain_pct": round(current_gain_pct, 4),
+            "exit_price": round(settlement_price, 4),
+            "exit_gain_pct": round(settlement_gain_pct, 4),
+            "trigger_price": round(current_price, 4),
+            "trigger_gain_pct": round(current_gain_pct, 4),
+            "settlement_basis": settlement_basis,
             "highest_price": round(highest_price, 4),
             "highest_gain_pct": round(highest_gain_pct, 4),
             "drawdown_pct": round(drawdown_pct, 4),
@@ -648,6 +1065,9 @@ def close_position(
         "name": position.get("name") or code,
         "reason": reason,
         "current_price": round(current_price, 4),
+        "settlement_price": round(settlement_price, 4),
+        "settlement_gain_pct": round(settlement_gain_pct, 4),
+        "settlement_basis": settlement_basis,
         "buy_price": round(buy_price, 4),
         "highest_price": round(highest_price, 4),
         "current_gain_pct": round(current_gain_pct, 4),
@@ -665,6 +1085,9 @@ def sync_daily_pick_close(
     title: str,
     message: str,
     current_price: float,
+    settlement_price: float,
+    settlement_gain_pct: float,
+    settlement_basis: str,
     highest_price: float,
     buy_price: float,
     current_gain_pct: float,
@@ -687,6 +1110,9 @@ def sync_daily_pick_close(
         "title": title,
         "instruction": message,
         "current_price": round(current_price, 4),
+        "settlement_price": round(settlement_price, 4),
+        "settlement_gain_pct": round(settlement_gain_pct, 4),
+        "settlement_basis": settlement_basis,
         "buy_price": round(buy_price, 4),
         "highest_price": round(highest_price, 4),
         "current_gain_pct": round(current_gain_pct, 4),
@@ -701,15 +1127,15 @@ def sync_daily_pick_close(
             "status": "dry_run",
             "selection_date": selection_date,
             "code": code,
-            "close_price": round(current_price, 4),
-            "close_return_pct": round(current_gain_pct, 4),
+            "close_price": round(settlement_price, 4),
+            "close_return_pct": round(settlement_gain_pct, 4),
         }
 
     try:
         updated = mark_daily_pick_closed(
             selection_date,
-            current_price,
-            current_gain_pct,
+            settlement_price,
+            settlement_gain_pct,
             reason,
             checked_at=checked_at,
             close_signal=close_signal,
@@ -745,21 +1171,34 @@ def build_push_content(
     drawdown_pct: float,
     quote: dict[str, Any],
     checked_at: str,
+    settlement_price: Optional[float] = None,
+    settlement_gain_pct: Optional[float] = None,
+    settlement_basis: str = "realtime",
 ) -> str:
     code = normalize_code(position.get("code"))
     name = str(position.get("name") or code)
+    strategy_type = str(position.get("strategy_type") or "").strip()
+    target_label = "T+3 日期" if supports_t_plus_3_timeout(position) else "目标日期"
+    settlement_lines = ""
+    close_price = safe_float(settlement_price)
+    close_gain = safe_float(settlement_gain_pct)
+    if close_price > 0 and settlement_basis != "realtime":
+        settlement_label = "结算价（开盘价）" if settlement_basis == "morning_auction_open" else "结算价"
+        settlement_lines = f"- {settlement_label}：{close_price:.2f}\n- 结算盈亏：{close_gain:.2f}%\n"
     return f"""## {message}
 
 - 标的：{name}({code})
+- 命中策略：{strategy_type or "-"}
 - 触发规则：{reason}
 - 买入价：{buy_price:.2f}
 - 盘中最高价：{highest_price:.2f}
-- 当前价：{current_price:.2f}
+- 触发价：{current_price:.2f}
+{settlement_lines}
 - 最高盈利：{highest_gain_pct:.2f}%
 - 当前盈利：{current_gain_pct:.2f}%
 - 较最高点回撤：{abs(drawdown_pct):.2f}%
 - 买入日期：{position.get("buy_date") or "-"}
-- T+3 日期：{position.get("target_date") or "-"}
+- {target_label}：{position.get("target_date") or "-"}
 - 行情时间：{quote.get("date") or "-"} {quote.get("time") or "-"}
 - 检查时间：{checked_at}
 """
@@ -771,6 +1210,61 @@ def realtime_price(quote: dict[str, Any]) -> float:
         if value > 0:
             return value
     return 0.0
+
+
+def close_settlement_context(
+    quote: dict[str, Any],
+    checked_at: str,
+    trigger_price: float,
+    buy_price: float,
+) -> dict[str, Any]:
+    settlement_price = safe_float(trigger_price)
+    settlement_basis = "realtime"
+    if is_morning_auction_quote(quote, checked_at):
+        open_price = quote_open_price(quote)
+        if open_price > 0:
+            settlement_price = open_price
+            settlement_basis = "morning_auction_open"
+        else:
+            settlement_basis = "morning_auction_open_unavailable"
+
+    return {
+        "settlement_price": settlement_price,
+        "settlement_gain_pct": gain_pct(settlement_price, buy_price),
+        "settlement_basis": settlement_basis,
+    }
+
+
+def quote_open_price(quote: dict[str, Any]) -> float:
+    for key in ("open", "open_price"):
+        value = safe_float(quote.get(key))
+        if value > 0:
+            return value
+    return 0.0
+
+
+def is_morning_auction_quote(quote: dict[str, Any], checked_at: str) -> bool:
+    quote_time = parse_quote_clock_time(quote) or parse_iso_clock_time(checked_at)
+    if not quote_time:
+        return False
+    return quote_time < CONTINUOUS_TRADING_START
+
+
+def parse_quote_clock_time(quote: dict[str, Any]) -> Optional[clock_time]:
+    value = str(quote.get("time") or "").strip()
+    if not value:
+        return None
+    try:
+        return clock_time.fromisoformat(value[:8])
+    except ValueError:
+        return None
+
+
+def parse_iso_clock_time(value: str) -> Optional[clock_time]:
+    try:
+        return datetime.fromisoformat(str(value)).time()
+    except ValueError:
+        return None
 
 
 def fetch_intraday_1m_df(code: str, count: int = INTRADAY_1M_COUNT) -> pd.DataFrame:
@@ -924,6 +1418,9 @@ def scan_pause_reason(now: Optional[datetime] = None) -> str:
 
 
 def is_t_plus_3_timeout(position: dict[str, Any], today: Optional[date] = None) -> bool:
+    if not supports_t_plus_3_timeout(position):
+        return False
+
     current_day = today or date.today()
     target_date = parse_date(position.get("target_date"))
     if target_date:
@@ -935,27 +1432,23 @@ def is_t_plus_3_timeout(position: dict[str, Any], today: Optional[date] = None) 
     return weekday_count_after(buy_date, current_day) >= 3
 
 
+def supports_t_plus_3_timeout(position: dict[str, Any]) -> bool:
+    strategy_type = str(position.get("strategy_type") or "").strip()
+    if strategy_type:
+        if strategy_type in NON_SWING_STRATEGY_TYPES:
+            return False
+        return strategy_type in SWING_STRATEGY_TYPES
+    # Legacy manually added positions had no strategy_type; their target_date was T+3.
+    return str(position.get("source") or "") != "daily_picks_1450"
+
+
 def t_plus_3_date(buy_date: str) -> str:
     start = parse_date(buy_date) or date.today()
-    day = start
-    count = 0
-    while count < 3:
-        day += timedelta(days=1)
-        if day.weekday() < 5:
-            count += 1
-    return day.isoformat()
+    return nth_trading_day(start, 3).isoformat()
 
 
 def weekday_count_after(start: date, end: date) -> int:
-    if end <= start:
-        return 0
-    count = 0
-    day = start
-    while day < end:
-        day += timedelta(days=1)
-        if day.weekday() < 5:
-            count += 1
-    return count
+    return trading_day_count_after(start, end)
 
 
 def parse_date(value: Any) -> Optional[date]:
@@ -964,6 +1457,15 @@ def parse_date(value: Any) -> Optional[date]:
     text = str(value)[:10]
     try:
         return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def parse_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
     except ValueError:
         return None
 

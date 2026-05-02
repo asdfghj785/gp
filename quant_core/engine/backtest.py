@@ -14,7 +14,7 @@ from quant_core.engine.predictor import PROFIT_TARGET_PCT, apply_production_filt
 from quant_core.storage import connect, init_db
 
 
-SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪"}
+SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪", "全局动量狙击"}
 
 
 def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, Any]:
@@ -94,7 +94,7 @@ def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, 
         "repaired_volume_ratio_count": prepared["repaired_volume_ratio_count"],
         "rule": f"生产策略复盘：排除周末、节假日、非完整交易日、创业板、北交所、科创板、ST/退市；大盘风控采用晴天/震荡/阴天/雷暴分级，尾盘突破综合评分>={BREAKOUT_MIN_SCORE:.1f}，首阴低吸综合评分>={DIPBUY_MIN_SCORE:.1f}，中线超跌反转预期T+3最大涨幅>={REVERSAL_MIN_SCORE:.1f}%，右侧主升浪预期T+3最大涨幅>={MAIN_WAVE_MIN_SCORE:.1f}%；雷暴或大盘下跌且缩量时空仓；过滤高位爆量、尾盘诱多，突破额外过滤涨幅>=7%、上影>=2%、近3日断头铡刀。每个交易日按策略分组独立选 Top1，短线策略按次日开盘卖出，波段策略统计T+3最大区间涨幅。",
         "trading_day_filter": "weekday<5 且全市场有效样本>=1000 且成交额>0。",
-        "rank_rule": "XGBRegressor 分策略预测收益；生产复盘已废除全局唯一 Top1，改为右侧主升浪 / 中线超跌反转 / 尾盘突破三大策略各自独立出票；同一策略内按排序评分、预期收益和综合评分择优。",
+        "rank_rule": "XGBRegressor 分策略预测收益；全局日线模型已收编为全局动量狙击，四大核心军团各自独立出票；同一策略内按排序评分、预期收益和综合评分择优。",
     }
     return {"created_at": datetime.now().isoformat(timespec="seconds"), "summary": summary, "rows": results[::-1], "strategy_rows": strategy_rows}
 
@@ -132,7 +132,7 @@ def _backtest_row(pick: pd.Series, current_close: float, next_open: float | None
 
 
 def _strategy_performance_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    order = ["右侧主升浪", "中线超跌反转", "尾盘突破"]
+    order = ["全局动量狙击", "右侧主升浪", "中线超跌反转", "尾盘突破"]
     rows: list[dict[str, Any]] = []
     for strategy_type in order:
         items = [row for row in results if row.get("strategy_type", "尾盘突破") == strategy_type]

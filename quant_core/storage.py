@@ -193,10 +193,11 @@ def init_db() -> None:
             WHERE json_extract(raw_json, '$.source') = 'historical_production_replay'
             """
         )
+        conn.execute("DROP INDEX IF EXISTS uidx_daily_picks_date_strategy")
         conn.execute(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS uidx_daily_picks_date_strategy
-            ON daily_picks(selection_date, strategy_type)
+            CREATE UNIQUE INDEX IF NOT EXISTS uidx_daily_picks_date_strategy_code
+            ON daily_picks(selection_date, strategy_type, code)
             """
         )
         conn.executescript(
@@ -726,7 +727,7 @@ def save_daily_pick(pick: dict[str, Any]) -> int:
                 is_shadow_test, model_status, status, t3_max_gain_pct, raw_json
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(selection_date, strategy_type) DO NOTHING
+            ON CONFLICT(selection_date, strategy_type, code) DO NOTHING
             """,
             (
                 pick["selection_date"],
@@ -959,7 +960,7 @@ def open_position_picks(today: str | None = None) -> list[dict[str, Any]]:
                         AND target_date <= ?
                     )
                     OR (
-                        strategy_type IN ('中线超跌反转', '右侧主升浪')
+                        strategy_type IN ('中线超跌反转', '右侧主升浪', '全局动量狙击')
                         AND target_date >= ?
                     )
                   )
@@ -1060,6 +1061,11 @@ def _attach_pick_display_fields(item: dict[str, Any]) -> None:
     item["composite_score"] = _optional_float(winner.get("composite_score"))
     item["sort_score"] = _optional_float(winner.get("sort_score"))
     item["score_threshold"] = _optional_float(winner.get("score_threshold"))
+    item["score_floor"] = _optional_float(winner.get("score_floor"))
+    item["selection_tier"] = winner.get("selection_tier") or "base"
+    item["risk_warning"] = winner.get("risk_warning") or ""
+    item["position_probability"] = _optional_float(winner.get("position_probability"))
+    item["suggested_position"] = _optional_float(winner.get("suggested_position"))
     item["sentiment_bonus"] = _optional_float(winner.get("sentiment_bonus"))
     item["market_gate_mode"] = winner.get("market_gate_mode") or ""
 

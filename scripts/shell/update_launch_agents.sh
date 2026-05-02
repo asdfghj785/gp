@@ -21,7 +21,8 @@ chmod +x \
   "$ROOT/scripts/shell/run_market_close_sync.sh" \
   "$ROOT/scripts/shell/run_live_sentinel.sh" \
   "$ROOT/scripts/shell/run_jq_cold_5m.sh" \
-  "$ROOT/scripts/shell/run_daily_ashare_archiver.sh"
+  "$ROOT/scripts/shell/run_daily_ashare_archiver.sh" \
+  "$ROOT/scripts/shell/trading_day_guard.sh"
 
 /usr/bin/python3 - <<'PY'
 from pathlib import Path
@@ -99,7 +100,7 @@ plists = {
     ),
     "com.eudis.quant.swing-patrol.plist": base(
         "com.eudis.quant.swing-patrol",
-        ["/usr/bin/python3", "-m", "quant_core.execution.swing_patrol"],
+        [str(root / "scripts/shell/run_swing_patrol.sh")],
         "swing_patrol_agent.log",
         "swing_patrol_agent_err.log",
         schedule=(14, 45),

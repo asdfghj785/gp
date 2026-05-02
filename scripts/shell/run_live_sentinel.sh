@@ -7,6 +7,8 @@ LOCK_DIR="$ROOT/logs/live_sentinel.lock"
 cd "$ROOT"
 mkdir -p logs
 export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
+source "$ROOT/scripts/shell/trading_day_guard.sh"
+skip_if_not_trading_day "live_sentinel" "$ROOT/logs/live_sentinel.log"
 
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] live_sentinel already running, skip this trigger." >> logs/live_sentinel.log

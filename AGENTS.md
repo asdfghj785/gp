@@ -1,6 +1,6 @@
 # AGENTS.md - A 股量化工作站开发上下文
 
-更新时间：2026-04-29
+更新时间：2026-05-03
 
 本文件给后续接手本项目的 Codex/Agent 使用。进入项目后先读本文件，再读 `TECHNICAL_DOC.md`、`PROJECT_STRUCTURE_GUIDE.md` 和相关源码。项目根目录固定为 `/Users/eudis/ths`。
 
@@ -8,18 +8,21 @@
 
 这是运行在本地 macOS/M4 上的 A 股量化工作站。核心目标是采集本地日线/分钟线/实时快照数据，训练 XGBoost 结构化模型，执行 14:50 多策略影子出票，使用 PushPlus 推送交易指令，并通过 FastAPI + Vue 深色金融终端展示结果。
 
-当前系统同时包含两条主线：
+当前系统版本：V4.4 "Theme Alpha"。
 
-1. 生产影子测试主线：`quant_core/engine/predictor.py` 驱动三大策略独立出票，每天最多 3 只票。
-2. V3.2 全局 AI 雷达主线：`quant_dashboard/backend/routers/v3_sniper.py` 使用全市场日线 XGBoost 分类模型，实时拼接当日腾讯行情后输出高置信候选。
+当前系统同时包含三条主线：
+
+1. 生产影子测试主线：`quant_core/engine/predictor.py` 驱动四大核心军团独立分档出票，每个策略基准线最多 Top 3；若无达标票，则按当日合规池 99 分位动态下探 1 只并提示风偏。
+2. V4.4 Theme Alpha 全局日线模型主线：`quant_dashboard/backend/routers/v3_sniper.py` 同时挂载 `/api/v4/sniper/*`，使用带 `theme_*` 因子的全市场 XGBoost 分类模型，实时拼接当日腾讯行情后输出高置信候选。
 3. 09:15 实时巡逻兵主线：`live_sentinel.py` 从上一交易日 14:50 标的重建 `shadow_ledger.json`，盘中执行止损、追踪止盈、分钟级爆量滞涨和五档盘口委比反转预警。
 
 重要原则：
 
 - LLM/Ollama 只做舆情、公告、新闻风控，不直接预测价格，也不覆盖 XGBoost 排序。
 - 实盘影子测试买入锚点是 14:50 的 `snapshot_price` 与 `snapshot_time`，这些字段必须不可篡改。
+- 生产出票必须保留 V4.4 风控契约：`selection_tier`、`risk_warning`、`dynamic_floor`/`score_floor`、`suggested_position` 必须随 `raw_json.winner` 落库，并在 PushPlus 与前端展示。
 - 禁止把 `.env`、PushPlus token、聚宽账号密码等密钥写入文档、日志或提交。
-- 当前东方财富/AkShare 在本机环境曾触发封禁或代理问题；实时快照优先使用腾讯接口。
+- 禁止新增或恢复 AkShare/东方财富 行情与板块数据接入；实时快照优先使用腾讯，行业/板块日线只走 mpquant/Ashare `get_price` + 本地缓存。
 - 可以存在脏工作区。不要回滚或覆盖用户已有修改，除非用户明确要求。
 
 ## 技术栈
@@ -59,6 +62,9 @@
 ├── data/
 │   ├── all_kline/                 # 全市场日线 Parquet，约 5515 只股票
 │   ├── min_kline/5m/              # 5 分钟线 Parquet
+│   ├── concept_kline/             # 细分概念指数日线 Parquet，Theme Pipeline 优先引擎
+│   ├── sector_kline/              # 一级行业指数日线 Parquet，Theme Pipeline 兜底引擎
+│   ├── concept_stock_map.json     # 个股 -> 主概念映射
 │   ├── core_db/quant_workstation.sqlite3
 │   └── intraday/price_1430.json   # 14:30 快照
 ├── models/                        # XGBoost 模型与 meta
@@ -90,6 +96,7 @@
 - `QUANT_DIPBUY_MIN_SCORE=99.00`，首阴低吸保留但生产冻结
 - `QUANT_REVERSAL_MIN_SCORE=3.00`
 - `QUANT_MAIN_WAVE_MIN_SCORE=3.00`
+- `QUANT_GLOBAL_MIN_SCORE=0.85`
 
 推送配置：
 
@@ -109,13 +116,18 @@ Ollama：
 
 - 主库是 `data/all_kline/*_daily.parquet`。
 - 常见字段：`symbol,date,open,high,low,close,volume,amount,turn,pctChg,MA5,MA10,MA20,量比,MACD_DIF` 等。
-- V3.2 全局模型会读取本地历史日线尾部约 80 天，再拼接今天实时行情行。
+- V4.4 全局模型会读取本地历史日线尾部约 80 天，再拼接今天实时行情行。
 
 分钟线：
 
 - 路径：`data/min_kline/5m/{code}.parquet`。
-- 冷数据：聚宽，脚本 `scripts/data_pipeline/batch_fetch_jq_history.py`。
+- 冷数据：聚宽，定时入口 `scripts/shell/run_jq_cold_5m.sh`，主脚本 `scripts/data_pipeline/batch_fetch_historical_min.py`；`scripts/data_pipeline/batch_fetch_jq_history.py` 为旧手工入口。
+- 聚宽账号历史权限窗口会随自然日滚动，冷数据脚本会用 `JQ_ROLLING_START_LOOKBACK_DAYS=465` 自动把请求起点夹到当前允许窗口内，避免固定早期日期越界。
+- 聚宽断点文件是 `data/min_kline/5m/jq_cold_5m_progress.json`，汇总文件是 `data/min_kline/5m/jq_summary_*.json`。
 - 热数据：腾讯/Ashare 风格，脚本 `scripts/data_pipeline/daily_ashare_archiver.py`、`fast_fetch_today_m5.py`。
+- Theme Pipeline：`quant_core/data_pipeline/concept_engine.py` 负责细分概念指数日线缓存与 `data/concept_stock_map.json` 主概念映射，`quant_core/data_pipeline/sector_engine.py` 负责一级行业指数日线与 `stock_sector_map.parquet/csv` 兜底映射。
+- `daily_factor_factory.py` 的 `theme_*` 特征固定按“细分概念优先，一级行业兜底，无数据释放 NaN”级联计算；禁止把缺失主题数据填 0，XGBoost 原生学习 NaN 分裂。
+- 板块/主题日线只允许 mpquant/Ashare `get_price`、腾讯/新浪底层或本地合成缓存；禁止新增或恢复 AkShare/东方财富 行情与板块数据接入。
 
 实时行情：
 
@@ -161,6 +173,10 @@ SQLite 主库：`/Users/eudis/ths/data/core_db/quant_workstation.sqlite3`。
 - `close_date`
 - `close_return_pct`
 - push 状态字段
+- `raw_json.winner.selection_tier`
+- `raw_json.winner.risk_warning`
+- `raw_json.winner.dynamic_floor` / `score_floor`
+- `raw_json.winner.suggested_position`
 
 安全边界：
 
@@ -194,6 +210,24 @@ SQLite 主库：`/Users/eudis/ths/data/core_db/quant_workstation.sqlite3`。
 - 结果字段：`t3_max_gain_pct`
 - 物理过滤：20 日线 > 60 日线、强势区间、高位缩量蓄势、平台突破、实体攻击、温和放量。
 
+### 全局动量狙击
+
+- 策略名：`全局动量狙击`
+- 模型：`models/xgboost_daily_swing_global_v1.json`
+- 生命周期：T 日 14:50 锁定，T+1 到 T+3 波段观察。
+- 结果字段：`t3_max_gain_pct`
+- 核心因子：`theme_pct_chg_1`、`theme_pct_chg_3`、`theme_volatility_5`、`rs_stock_vs_theme`、`rs_theme_ema_5`。
+- Theme Pipeline：细分概念优先，一级行业兜底，无数据保持 NaN。
+- 实盘硬过滤：只保留 `00/60` 主板，剔除 ST / *ST，剔除 14:50 实时涨幅 `>= 9.0%` 的涨停或准涨停票。
+
+### V4.4 分档与仓位
+
+- `ABSOLUTE_BOTTOM_PROBA=0.55` 是全策略通用绝对安全底线，禁止恢复人工 `_FLOOR_SCORE` 静态配置。
+- `select_strategy_top_picks()` 对每个策略先找 `score >= MIN_SCORE` 的 `base` 档，最多取 Top 3。
+- 若 `base` 档为空，计算 `dynamic_floor=max(ABSOLUTE_BOTTOM_PROBA, legal_pool['score'].quantile(0.99))`，只有 Top 1 分数达到动态底线才以 `selection_tier=dynamic_floor` 出票。
+- `base` 档仓位使用 Half-Kelly，限制在 10% 到 30%；`dynamic_floor` 档固定 5% 试错轻仓。
+- 终端日志必须打印 `[AdaptiveFloor] ... dynamic_floor=...`，便于复盘当天动态及格线。
+
 ### 首阴低吸
 
 - 策略名：`首阴低吸`
@@ -201,13 +235,15 @@ SQLite 主库：`/Users/eudis/ths/data/core_db/quant_workstation.sqlite3`。
 - 当前默认 `QUANT_DIPBUY_MIN_SCORE=99.00`，等价生产冻结。
 - 保留代码、模型和可视化兼容，不要随意删除。
 
-## V3.2 全局日线 XGBoost 雷达
+## V4.4 Theme Alpha 全局日线 XGBoost 雷达
 
-新增模块：
+核心模块：
 
 - `quant_core/engine/daily_factor_factory.py`
 - `quant_core/engine/daily_model_trainer.py`
 - `quant_core/engine/model_evaluator.py`
+- `quant_core/data_pipeline/concept_engine.py`
+- `quant_core/data_pipeline/sector_engine.py`
 - 模型：`models/xgboost_daily_swing_global_v1.json`
 - 元数据：`models/xgboost_daily_swing_global_v1.meta.json`
 
@@ -223,9 +259,11 @@ SQLite 主库：`/Users/eudis/ths/data/core_db/quant_workstation.sqlite3`。
 
 FastAPI 实盘推理入口：
 
+- `GET /api/v4/sniper/scan_today`
 - `GET /api/v3/sniper/scan_today`
 - 逻辑：本地历史日线尾部 + 腾讯今日实时行 -> `generate_daily_factors()` -> 按 meta 的 `feature_columns` 对齐 -> `predict_proba()`。
-- 响应应包含 `prediction_date`、`live_data`、`live_source=tencent.qt`。
+- 响应应包含 `prediction_date`、`live_data`、`live_source=tencent.qt`，每只股票必须带 `theme_name`、`theme_source`、`theme_pct_chg_3`。
+- `/api/v3/sniper/*` 是兼容入口；新前端和新 Agent 优先使用 `/api/v4/sniper/*`。
 
 注意：
 
@@ -255,7 +293,7 @@ FastAPI 实盘推理入口：
 
 常见任务：
 
-- `01:20` 聚宽历史 5m 冷数据额度任务，逐日/逐月补齐，不重复抓取已有 Parquet。
+- `01:20` 聚宽历史 5m 冷数据额度任务，按月切片补齐，使用断点文件跳过已完成切片，额度耗尽后正常停止并等待次日继续。
 - `09:00` PushPlus 心跳。
 - `09:15` 实时巡逻兵启动，监控上一交易日 14:50 推送标的。
 - `09:16` 早盘预观察。
@@ -263,8 +301,8 @@ FastAPI 实盘推理入口：
 - `09:25` 终极开盘哨兵，只此阶段允许回填 `open_price`。
 - `14:30` 保存全市场快照。
 - `14:45` 波段巡逻兵，处理 T+3 策略止盈/止损/清退。
-- `14:50` 多策略出票与 PushPlus 推送。
-- `14:50` V3.2 全局雷达锁定。
+- `14:50` 四大核心军团出票与 PushPlus 推送。
+- `14:50` V4.4 全局动量狙击雷达锁定。
 - `15:05` 盘后日线同步。
 - `15:15` Ashare/腾讯 5m 热数据归档。
 
@@ -335,9 +373,11 @@ LaunchAgent 启动脚本：
 - `GET /api/data/market-sync/latest`
 - `GET /api/data/history/{code}`
 - `GET /api/data/history_min/{code}?period=5`
+- `GET /api/data/minute-fetch/status`
 - `GET /api/v3/system/status`
 - `GET /api/v3/sniper/signals`
 - `GET /api/v3/sniper/scan_today`
+- `GET /api/v4/sniper/scan_today`
 - `POST /api/v3/agent/analyze`
 - `POST /api/v3/agent/analyze_stock`
 
@@ -366,14 +406,20 @@ npm run build
 
 核心文件：
 
-- `src/App.vue`：主工作站入口。
-- `src/views/QuantDashboardV3.vue`：V3.2 双脑控制台。
+- `src/App.vue`：V4.4 Theme Alpha 主工作站入口，Dashboard 统一承载四大军团。
 - `src/components/Sidebar.vue`：左侧导航。
 - `src/components/StatsHeader.vue`：顶部状态条。
 - `src/components/SelectionTable.vue`：影子账本/策略表格。
 - `src/components/MinKlineViewer.vue`：5m 分时观测。
 - `src/router/index.js`：轻量路由解析，不是完整 vue-router。
 - `src/style.css`：暗夜金融终端样式。
+
+数据状态卡口径：
+
+- Validation 页的 JQDATA COLD 5M 卡片读取 `GET /api/data/minute-fetch/status`。
+- 聚宽卡片的“本次新增”是最近一次 `jq_summary_*.json` 中的 `success / universe`，不包含本次因断点已完成而跳过的股票。
+- 聚宽卡片的“断点进度”来自 `jq_cold_5m_progress.json`，格式为 `progress_codes 股 / progress_segments 段`；一只股票完整冷数据大约对应 13 个自然月切片。
+- Ashare/Tencent 热数据卡片的“今日覆盖”仍表示当天热数据归档成功数。
 
 设计约束：
 
@@ -436,10 +482,10 @@ curl -s http://127.0.0.1:8000/health
 curl -s http://127.0.0.1:8000/api/v3/system/status
 ```
 
-V3 实时拼接推理：
+V4 实时拼接推理：
 
 ```bash
-curl -s 'http://127.0.0.1:8000/api/v3/sniper/scan_today?limit=3&threshold=0&cache_seconds=0'
+curl -s 'http://127.0.0.1:8000/api/v4/sniper/scan_today?limit=3&threshold=0&cache_seconds=0'
 ```
 
 早盘哨兵干跑：
@@ -509,19 +555,22 @@ bash scripts/shell/update_launch_agents.sh
 - 新增模型路径要写入 `quant_core/config.py`，不要散落硬编码。
 - 新增生产字段必须在 `quant_core/storage.py` 做自动迁移。
 - 写入 `daily_picks` 时必须支持多标的并行，唯一性应考虑 `selection_date + strategy_type + code`。
+- 旧全局狙击页的历史锁定记录保存在 `v3_sniper_locks`，不会自动出现在影子账本；如需补录到 `daily_picks`，必须保留原始快照价/时间并写入历史导入风险提示。
 - 推送逻辑必须能处理空策略、列表结果、网络失败和重试。
-- V3 接口如果报 502，先看模型文件、meta 特征列、腾讯实时行情、Python 3.9 类型注解。
+- V4 sniper 接口如果报 502，先看模型文件、meta 特征列、Theme Pipeline 缓存、腾讯实时行情、Python 3.9 类型注解。
 - 前端如果打不开，先检查 Vite 端口 5173、后端 8000、`npm run build`。
 - 后端如果拒绝连接，检查 LaunchAgent、`scripts/shell/run_backend_api.sh`、`quant_dashboard/backend/backend_server.log`。
 - `quant_core/predictor.py`、`quant_core/market.py` 等根文件多为兼容入口，新代码优先放在 DDD 后的新目录。
 - 实验脚本可放 `scripts/utils` 或 `tests`，不要污染根目录。
-- 访问外部实时数据前确认数据源：东财/AkShare 可能失败，腾讯接口是当前优先路径。
+- 访问外部实时数据前确认数据源：不得新增 AkShare/东财链路；实时快照优先腾讯，行业/板块日线只允许 mpquant/Ashare + 本地缓存。
 
 ## 最近验证过的状态
 
 - `quant_dashboard/frontend` 的 `npm run build` 最近已通过。
+- `bash scripts/shell/run_jq_cold_5m.sh` 最近可正常登录聚宽并按断点继续，`2026-05-01` 实测结果为 `success=177`、`failed=0`、`stopped_by_quota=true`，额度自然耗尽后退出码为 0。
+- `GET /api/data/minute-fetch/status` 最近返回 JQ 状态 `quota_exhausted`，并能读取最新全量摘要 `jq_summary_20260501_185555.json`。
 - `GET /api/v3/system/status` 最近返回模型 ready、Ollama ready。
-- `GET /api/v3/sniper/scan_today?limit=3&threshold=0&cache_seconds=0` 最近返回 `prediction_date=2026-04-28`，`live_source=tencent.qt`。
+- `GET /api/v4/sniper/scan_today?limit=3&threshold=0&cache_seconds=0` 最近返回 `prediction_date=2026-05-02`，每行包含 `theme_name` 与 `theme_pct_chg_3`。
 - 后端 LaunchAgent `com.eudis.quant.backend-api` 可通过 `launchctl kickstart` 重启。
 - `live_sentinel.py --once --dry-run --no-push` 最近通过；腾讯五档盘口字段可解析，合成委比 `-98%` 样本可触发盘口抢跑预警。
 

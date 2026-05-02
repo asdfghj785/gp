@@ -21,7 +21,7 @@ trap cleanup EXIT
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] start jq cold 5m quota run" >> logs/jq_cold_5m.log
 /usr/bin/python3 /Users/eudis/ths/scripts/data_pipeline/batch_fetch_historical_min.py \
   --period 5 \
-  --start-date "2025-01-19 09:30:00" \
+  --start-date "2025-01-21 09:30:00" \
   --end-date "2026-01-23 15:00:00" \
   --segment month \
   --quota-buffer 0 \

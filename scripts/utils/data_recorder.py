@@ -113,7 +113,6 @@ def main():
             latest_text = latest_trade_day.isoformat() if latest_trade_day else "未知"
             skip_msg = f"⏸️ 非交易日跳过: 今日 {today_str} 最新交易日为 {latest_text}，不写入日线 Parquet。"
             print(skip_msg)
-            notify(skip_msg)
             return
 
         # 调用新浪引擎抓取数据
@@ -156,7 +155,6 @@ def main():
         if "空数据" in error_str:
             holiday_msg = f"⏸️ 休市提醒: 今日 ({today_str}) 未获取到有效数据。请安心享受假期！"
             print(holiday_msg)
-            notify(holiday_msg)
         else:
             error_msg = f"❌ Parquet 数据同步严重异常: {error_str}"
             print(error_msg)

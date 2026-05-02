@@ -6,9 +6,7 @@
 	<string>com.eudis.quant.swing-patrol</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/bin/python3</string>
-		<string>-m</string>
-		<string>quant_core.execution.swing_patrol</string>
+		<string>/Users/eudis/ths/scripts/shell/run_swing_patrol.sh</string>
 	</array>
 	<key>WorkingDirectory</key>
 	<string>/Users/eudis/ths</string>

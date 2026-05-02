@@ -1,21 +1,40 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
+
+from quant_core.data_pipeline.concept_engine import (
+    get_stock_concept_map,
+    load_concept_daily,
+)
+from quant_core.data_pipeline.sector_engine import (
+    get_stock_sector_map,
+    load_sector_daily,
+)
 
 
 PRICE_COLS = ["open", "high", "low", "close"]
 BASE_COLS = ["datetime", "date", "symbol", "code", "name", "open", "high", "low", "close", "volume", "amount"]
 FACTOR_WINDOWS = [3, 5, 10, 20, 30, 60]
 MOMENTUM_WINDOWS = [3, 5, 10]
+THEME_FACTOR_COLUMNS = [
+    "theme_pct_chg_1",
+    "theme_pct_chg_3",
+    "theme_volatility_5",
+    "rs_stock_vs_theme",
+    "rs_theme_ema_5",
+]
+_STOCK_CONCEPT_MAP_CACHE: Optional[dict[str, str]] = None
+_STOCK_SECTOR_MAP_CACHE: Optional[dict[str, str]] = None
 
 
 def build_daily_factors(
     source: str | Path | pd.DataFrame,
     *,
-    symbol: str | None = None,
+    symbol: Optional[str] = None,
     target_horizon: int = 3,
 ) -> pd.DataFrame:
     """Build daily cross-sectional factors and labels for one stock.
@@ -30,7 +49,7 @@ def build_daily_factors(
     return clean_daily_dataset(dataset)
 
 
-def normalize_daily_frame(df: pd.DataFrame, *, symbol: str | None = None) -> pd.DataFrame:
+def normalize_daily_frame(df: pd.DataFrame, *, symbol: Optional[str] = None) -> pd.DataFrame:
     out = df.copy()
     if "datetime" not in out.columns:
         if "date" not in out.columns:
@@ -126,7 +145,17 @@ def generate_daily_factors(df: pd.DataFrame) -> pd.DataFrame:
     factors["amount_per_volume"] = safe_div(amount, volume)
     factors["obv"] = obv_value
     factors["obv_delta_5"] = obv_value.diff(5)
-    return pd.concat([frame, pd.DataFrame(factors, index=frame.index)], axis=1).copy()
+
+    theme_factors = theme_relative_factor_frame(
+        frame,
+        code=_frame_code(frame),
+        concept_map=_stock_concept_map(),
+        sector_map=_stock_sector_map(),
+    )
+    for col in THEME_FACTOR_COLUMNS:
+        if col not in theme_factors.columns:
+            theme_factors[col] = np.nan
+    return pd.concat([frame, pd.DataFrame(factors, index=frame.index), theme_factors[THEME_FACTOR_COLUMNS]], axis=1).copy()
 
 
 def add_daily_labels(df: pd.DataFrame, *, target_horizon: int = 3) -> pd.DataFrame:
@@ -149,7 +178,12 @@ def clean_daily_dataset(df: pd.DataFrame) -> pd.DataFrame:
     out[numeric_cols] = out[numeric_cols].replace([np.inf, -np.inf], np.nan)
     protected = {"label", "future_max_return"}
     feature_cols = [col for col in numeric_cols if col not in protected]
-    out[feature_cols] = out[feature_cols].ffill().fillna(0.0)
+    fillable_cols = [col for col in feature_cols if col not in THEME_FACTOR_COLUMNS]
+    if fillable_cols:
+        out[fillable_cols] = out[fillable_cols].ffill().fillna(0.0)
+    for col in THEME_FACTOR_COLUMNS:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
     out[feature_cols] = winsorize(out[feature_cols])
     out = out.dropna(subset=["label", "future_max_return"])
     out["label"] = out["label"].astype(int)
@@ -192,6 +226,124 @@ def winsorize(features: pd.DataFrame, lower: float = 0.01, upper: float = 0.99) 
 def feature_columns(df: pd.DataFrame) -> list[str]:
     excluded = set(BASE_COLS + ["future_max_return", "label"])
     return [col for col in df.columns if col not in excluded and pd.api.types.is_numeric_dtype(df[col])]
+
+
+def _stock_concept_map() -> dict[str, str]:
+    global _STOCK_CONCEPT_MAP_CACHE
+    if _STOCK_CONCEPT_MAP_CACHE is None:
+        _STOCK_CONCEPT_MAP_CACHE = get_stock_concept_map(refresh=False)
+    return _STOCK_CONCEPT_MAP_CACHE
+
+
+def _stock_sector_map() -> dict[str, str]:
+    global _STOCK_SECTOR_MAP_CACHE
+    if _STOCK_SECTOR_MAP_CACHE is None:
+        _STOCK_SECTOR_MAP_CACHE = get_stock_sector_map(refresh=False)
+    return _STOCK_SECTOR_MAP_CACHE
+
+
+def theme_relative_factor_frame(
+    stock_frame: pd.DataFrame,
+    *,
+    code: Optional[str] = None,
+    concept_map: Optional[dict[str, str]] = None,
+    sector_map: Optional[dict[str, str]] = None,
+) -> pd.DataFrame:
+    """Build cascaded theme factors: concept first, sector as fallback.
+
+    Missing concept+sector mapping or missing theme K-line intentionally
+    returns NaN, not 0, so XGBoost can learn missing-value branches.
+    """
+    missing = pd.DataFrame(np.nan, index=stock_frame.index, columns=THEME_FACTOR_COLUMNS)
+    if stock_frame.empty or "datetime" not in stock_frame.columns or "close" not in stock_frame.columns:
+        return missing
+
+    stock_code = _normalize_stock_code(code or _first_frame_value(stock_frame, "code") or _first_frame_value(stock_frame, "symbol"))
+    if not stock_code:
+        return missing
+
+    concepts = concept_map if concept_map is not None else _stock_concept_map()
+    sectors = sector_map if sector_map is not None else _stock_sector_map()
+    concept_code = concepts.get(stock_code, "")
+    if concept_code:
+        theme = load_concept_daily(concept_code)
+    else:
+        sector_name = sectors.get(stock_code, "")
+        theme = load_sector_daily(sector_name) if sector_name else pd.DataFrame()
+    if theme.empty:
+        return missing
+
+    stock_dates = pd.to_datetime(stock_frame["datetime"], errors="coerce").dt.normalize()
+    stock_close = pd.to_numeric(stock_frame["close"], errors="coerce")
+    stock_ret = stock_close.pct_change(fill_method=None)
+
+    theme = theme.copy()
+    theme["datetime"] = pd.to_datetime(theme["datetime"], errors="coerce").dt.normalize()
+    theme = theme.dropna(subset=["datetime"]).drop_duplicates(subset=["datetime"], keep="last").sort_values("datetime")
+    theme_close = pd.to_numeric(theme["close"], errors="coerce")
+    if "pct_chg" in theme.columns:
+        theme_ret = _normalize_pct_series(theme["pct_chg"])
+    else:
+        theme_ret = theme_close.pct_change(fill_method=None)
+    theme["theme_pct_chg_1"] = theme_ret
+    theme["theme_pct_chg_3"] = (1 + theme_ret).rolling(3, min_periods=1).apply(np.prod, raw=True) - 1
+    theme["theme_volatility_5"] = _theme_true_range_pct(theme).rolling(5, min_periods=1).mean()
+
+    aligned = pd.DataFrame({"datetime": stock_dates}, index=stock_frame.index).merge(
+        theme[["datetime", "theme_pct_chg_1", "theme_pct_chg_3", "theme_volatility_5"]],
+        on="datetime",
+        how="left",
+    )
+    out = pd.DataFrame(index=stock_frame.index)
+    out["theme_pct_chg_1"] = pd.to_numeric(aligned["theme_pct_chg_1"], errors="coerce")
+    out["theme_pct_chg_3"] = pd.to_numeric(aligned["theme_pct_chg_3"], errors="coerce")
+    out["theme_volatility_5"] = pd.to_numeric(aligned["theme_volatility_5"], errors="coerce")
+    out["rs_stock_vs_theme"] = stock_ret.reset_index(drop=True) - out["theme_pct_chg_1"].reset_index(drop=True)
+    out["rs_theme_ema_5"] = out["rs_stock_vs_theme"].ewm(span=5, adjust=False, min_periods=1).mean()
+    out.index = stock_frame.index
+    return out.replace([np.inf, -np.inf], np.nan)[THEME_FACTOR_COLUMNS]
+
+
+def _normalize_pct_series(value) -> pd.Series:
+    series = pd.to_numeric(value, errors="coerce") if not isinstance(value, pd.Series) else pd.to_numeric(value, errors="coerce")
+    finite = series.replace([np.inf, -np.inf], np.nan).dropna()
+    if not finite.empty and finite.abs().quantile(0.95) > 1.5:
+        series = series / 100.0
+    return series
+
+
+def _theme_true_range_pct(theme: pd.DataFrame) -> pd.Series:
+    high = pd.to_numeric(theme["high"], errors="coerce")
+    low = pd.to_numeric(theme["low"], errors="coerce")
+    close = pd.to_numeric(theme["close"], errors="coerce")
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr / close.replace(0, np.nan)
+
+
+def _normalize_stock_code(value) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits[-6:] if len(digits) >= 6 else ""
+
+
+def _first_frame_value(frame: pd.DataFrame, col: str) -> str:
+    if col not in frame.columns:
+        return ""
+    for value in frame[col].dropna().astype(str):
+        if value:
+            return value
+    return ""
+
+
+def _frame_code(frame: pd.DataFrame) -> str:
+    for col in ("code", "symbol"):
+        if col not in frame.columns:
+            continue
+        for value in frame[col].dropna().astype(str):
+            digits = "".join(ch for ch in value if ch.isdigit())
+            if len(digits) >= 6:
+                return digits[-6:]
+    return ""
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
     <div class="header-brand">
       <span class="logo">Q</span>
       <div>
-        <strong>V3.1 量化工作站</strong>
+        <strong>V4.0 Theme Alpha</strong>
         <small>{{ title }}</small>
       </div>
     </div>

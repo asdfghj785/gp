@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Any
 
 from quant_core.data_pipeline.market import fetch_sina_snapshot
+from quant_core.data_pipeline.trading_calendar import is_trading_day, next_trading_day, nth_trading_day
 from quant_core.engine.predictor import scan_market
 from .storage import (
     get_daily_picks,
@@ -15,30 +16,22 @@ from .storage import (
 )
 
 
-SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪"}
+SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪", "全局动量狙击"}
 
 
 def is_weekday(day: date | None = None) -> bool:
-    current = day or date.today()
-    return current.weekday() < 5
+    return is_trading_day(day or date.today())
 
 
 def next_weekday(day: date | None = None) -> date:
-    current = day or date.today()
-    target = current + timedelta(days=1)
-    while target.weekday() >= 5:
-        target += timedelta(days=1)
-    return target
+    return next_trading_day(day or date.today())
 
 
 def nth_weekday(day: date, n: int) -> date:
-    target = day
-    for _ in range(max(1, int(n))):
-        target = next_weekday(target)
-    return target
+    return nth_trading_day(day, n)
 
 
-def save_today_top_pick(limit: int = 10, force: bool = False) -> dict[str, Any]:
+def save_today_top_pick(limit: int = 12, force: bool = False) -> dict[str, Any]:
     today = date.today()
     if not force and not is_weekday(today):
         return {"status": "skipped", "reason": "非工作日不保存 14:50 推送标的", "selection_date": today.isoformat()}
@@ -100,7 +93,7 @@ def save_pushed_top_picks(winners: list[dict[str, Any]], scan: dict[str, Any], f
 def _pick_from_winner(winner: dict[str, Any], scan: dict[str, Any], selected_at: str) -> dict[str, Any]:
     today = date.today()
     strategy_type = winner.get("strategy_type", "尾盘突破")
-    target_date = nth_weekday(today, 3) if strategy_type in SWING_STRATEGY_TYPES else next_weekday(today)
+    target_date = nth_trading_day(today, 3) if strategy_type in SWING_STRATEGY_TYPES else next_trading_day(today)
     return {
         "selection_date": today.isoformat(),
         "target_date": target_date.isoformat(),

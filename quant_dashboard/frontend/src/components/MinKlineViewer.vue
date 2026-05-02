@@ -53,6 +53,30 @@
         class="minute-alert"
       />
 
+      <div class="quote-strip" :class="quoteToneClass">
+        <div class="quote-main">
+          <div class="quote-title-line">
+            <strong>{{ quoteHeader.name }}</strong>
+            <span class="mono">{{ quoteHeader.code }}</span>
+          </div>
+          <div class="quote-price-line">
+            <strong>{{ price(quoteHeader.price) }}</strong>
+            <span>{{ signedPrice(quoteHeader.change) }}</span>
+            <span>{{ signedPct(quoteHeader.changePct) }}</span>
+          </div>
+        </div>
+        <div class="quote-metrics" aria-label="股票当日行情摘要">
+          <article><span>高</span><strong>{{ price(quoteHeader.high) }}</strong></article>
+          <article><span>低</span><strong>{{ price(quoteHeader.low) }}</strong></article>
+          <article><span>开</span><strong>{{ price(quoteHeader.open) }}</strong></article>
+          <article><span>昨收</span><strong>{{ price(quoteHeader.preClose) }}</strong></article>
+          <article><span>换手</span><strong>{{ pct(quoteHeader.turnover) }}</strong></article>
+          <article><span>量比</span><strong>{{ ratio(quoteHeader.volumeRatio) }}</strong></article>
+          <article><span>额</span><strong>{{ formatAmount(quoteHeader.amount) }}</strong></article>
+          <article class="quote-time"><span>时间</span><strong>{{ quoteHeader.timeLabel }}</strong></article>
+        </div>
+      </div>
+
       <div class="minute-summary">
         <article><span>股票代码</span><strong class="mono">{{ cleanCode || '-' }}</strong></article>
         <article><span>日 K 最新</span><strong>{{ latestDailyDate }}</strong></article>
@@ -134,9 +158,9 @@ const props = defineProps({
 const normalizeCode = (value) => String(value || '').replace(/\D/g, '').slice(-6)
 const code = ref(normalizeCode(props.stockCode) || '600000')
 const period = ref('5')
-const viewMode = ref('minute')
+const viewMode = ref(normalizeCode(props.stockCode) ? 'daily' : 'minute')
 const minuteRange = ref('day')
-const dailyRange = ref('month')
+const dailyRange = ref(normalizeCode(props.stockCode) ? 'all' : 'month')
 const minuteRows = ref([])
 const dailyRows = ref([])
 const minuteMeta = ref({})
@@ -202,6 +226,71 @@ const activeSourceText = computed(() => {
   const counts = minuteMeta.value.source_counts || {}
   const items = Object.entries(counts).map(([name, count]) => `${name}:${count}`)
   return items.length ? items.join(' / ') : '-'
+})
+const latestDailyRow = computed(() => lastRow(dailyRows.value) || {})
+const previousDailyRow = computed(() => dailyRows.value.length >= 2 ? dailyRows.value[dailyRows.value.length - 2] : {})
+const latestMinuteRow = computed(() => lastRow(minuteRows.value) || {})
+const latestMinuteDayRows = computed(() => {
+  const latestDay = normalizeDateKey(latestMinuteRow.value.datetime)
+  if (!latestDay) return []
+  return minuteRows.value.filter((row) => normalizeDateKey(row.datetime) === latestDay)
+})
+const intradayQuote = computed(() => {
+  const rows = latestMinuteDayRows.value
+  if (!rows.length) return {}
+  const first = rows[0]
+  const last = rows[rows.length - 1]
+  const highs = rows.map((row) => finiteNumber(row.high)).filter((value) => value !== null)
+  const lows = rows.map((row) => finiteNumber(row.low)).filter((value) => value !== null)
+  const volume = rows.reduce((sum, row) => sum + (finiteNumber(row.volume) || 0), 0)
+  const amount = rows.reduce((sum, row) => sum + (finiteNumber(row.amount) || finiteNumber(row.money) || 0), 0)
+  return {
+    date: normalizeDateKey(last.datetime),
+    datetime: last.datetime || '',
+    open: finiteNumber(first.open),
+    high: highs.length ? Math.max(...highs) : null,
+    low: lows.length ? Math.min(...lows) : null,
+    close: finiteNumber(last.close),
+    volume,
+    amount,
+  }
+})
+const quoteHeader = computed(() => {
+  const daily = latestDailyRow.value
+  const previousDaily = previousDailyRow.value
+  const intraday = intradayQuote.value
+  const dailyDay = normalizeDateKey(daily.date)
+  const intradayDay = normalizeDateKey(intraday.date || intraday.datetime)
+  const useIntraday = intraday.close !== null && (!dailyDay || (intradayDay && intradayDay >= dailyDay))
+  const quoteDay = useIntraday ? intradayDay : dailyDay
+  const dailyMatchesQuoteDay = dailyDay && quoteDay && dailyDay === quoteDay
+  const quotePrice = useIntraday ? finiteNumber(intraday.close) : finiteNumber(daily.close)
+  const preClose = dailyMatchesQuoteDay
+    ? coalesceNumber(daily.pre_close, previousDaily.close)
+    : coalesceNumber(daily.close, daily.pre_close, previousDaily.close)
+  const computedChange = quotePrice !== null && preClose !== null ? quotePrice - preClose : null
+  const computedChangePct = computedChange !== null && preClose ? (computedChange / preClose) * 100 : null
+  return {
+    code: cleanCode.value || '-',
+    name: String(daily.name || cleanCode.value || '-'),
+    date: quoteDay || dailyDay || '',
+    price: quotePrice,
+    change: computedChange,
+    changePct: coalesceNumber(computedChangePct, daily.change_pct),
+    open: coalesceNumber(dailyMatchesQuoteDay ? daily.open : null, useIntraday ? intraday.open : null, daily.open),
+    high: coalesceNumber(dailyMatchesQuoteDay ? daily.high : null, useIntraday ? intraday.high : null, daily.high),
+    low: coalesceNumber(dailyMatchesQuoteDay ? daily.low : null, useIntraday ? intraday.low : null, daily.low),
+    preClose,
+    turnover: dailyMatchesQuoteDay ? finiteNumber(daily.turnover) : null,
+    volumeRatio: dailyMatchesQuoteDay ? finiteNumber(daily.volume_ratio) : null,
+    amount: dailyMatchesQuoteDay ? coalesceNumber(daily.amount, intraday.amount) : (useIntraday ? finiteNumber(intraday.amount) : finiteNumber(daily.amount)),
+    timeLabel: useIntraday ? (intraday.datetime || quoteDay || '-') : (daily.date || '-'),
+  }
+})
+const quoteToneClass = computed(() => {
+  const changePct = Number(quoteHeader.value.changePct)
+  if (!Number.isFinite(changePct) || changePct === 0) return ''
+  return changePct > 0 ? 'quote-rise' : 'quote-fall'
 })
 
 const requestJson = async (path) => {
@@ -302,6 +391,10 @@ const renderChart = () => {
   const ma5 = movingAverage(rows, 5)
   const ma10 = movingAverage(rows, 10)
   const ma20 = movingAverage(rows, 20)
+  const minZoomSpan = viewMode.value === 'daily' && times.length
+    ? Math.min(100, (5 / times.length) * 100)
+    : undefined
+  const zoomLimit = minZoomSpan ? { minSpan: minZoomSpan } : {}
   chart.setOption({
     backgroundColor: '#0f1117',
     animation: false,
@@ -366,7 +459,16 @@ const renderChart = () => {
       },
     ],
     dataZoom: [
-      { type: 'inside', xAxisIndex: [0, 1], start: Math.max(0, 100 - (140 / Math.max(times.length, 140)) * 100), end: 100 },
+      {
+        type: 'inside',
+        xAxisIndex: [0, 1],
+        start: Math.max(0, 100 - (140 / Math.max(times.length, 140)) * 100),
+        end: 100,
+        zoomOnMouseWheel: true,
+        moveOnMouseWheel: false,
+        moveOnMouseMove: true,
+        ...zoomLimit,
+      },
       {
         show: true,
         xAxisIndex: [0, 1],
@@ -378,6 +480,7 @@ const renderChart = () => {
         fillerColor: 'rgba(24,144,255,0.22)',
         handleStyle: { color: '#69b1ff', borderColor: '#69b1ff' },
         textStyle: { color: '#7f8aa1' },
+        ...zoomLimit,
       },
     ],
     series: [
@@ -413,8 +516,42 @@ const resizeChart = () => {
   chart?.resize()
   scheduleRenderChart()
 }
+const finiteNumber = (value) => {
+  const num = Number(value)
+  return Number.isFinite(num) ? num : null
+}
+const coalesceNumber = (...values) => {
+  for (const value of values) {
+    const num = finiteNumber(value)
+    if (num !== null) return num
+  }
+  return null
+}
+const lastRow = (rows) => rows.length ? rows[rows.length - 1] : null
 const price = (value) => Number.isFinite(Number(value)) ? Number(value).toFixed(2) : '-'
 const pct = (value) => Number.isFinite(Number(value)) ? `${Number(value).toFixed(2)}%` : '-'
+const signedPrice = (value) => {
+  const num = Number(value)
+  if (!Number.isFinite(num)) return '-'
+  return `${num > 0 ? '+' : ''}${num.toFixed(2)}`
+}
+const signedPct = (value) => {
+  const num = Number(value)
+  if (!Number.isFinite(num)) return '-'
+  return `${num > 0 ? '+' : ''}${num.toFixed(2)}%`
+}
+const ratio = (value) => {
+  const num = Number(value)
+  if (!Number.isFinite(num) || num <= 0) return '-'
+  return num.toFixed(2)
+}
+const formatAmount = (value) => {
+  const num = Number(value)
+  if (!Number.isFinite(num) || num <= 0) return '-'
+  if (num >= 100000000) return `${(num / 100000000).toFixed(2)}亿`
+  if (num >= 10000) return `${(num / 10000).toFixed(2)}万`
+  return num.toFixed(0)
+}
 const formatVolume = (value) => {
   const num = Number(value)
   if (!Number.isFinite(num)) return '-'
@@ -435,6 +572,16 @@ const numberClass = (value) => {
 }
 const rowTime = (row) => row.datetime || row.date || '-'
 const lastValue = (rows, key) => rows.length ? rows[rows.length - 1]?.[key] : ''
+const normalizeDateKey = (value) => {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  const compact = raw.match(/^(\d{4})(\d{2})(\d{2})/)
+  if (compact) return `${compact[1]}-${compact[2]}-${compact[3]}`
+  const dashed = raw.match(/^(\d{4})[-/](\d{2})[-/](\d{2})/)
+  if (dashed) return `${dashed[1]}-${dashed[2]}-${dashed[3]}`
+  const parsed = new Date(raw.replace(' ', 'T'))
+  return Number.isNaN(parsed.getTime()) ? '' : dayKey(parsed)
+}
 const parseRowDate = (row) => {
   const raw = rowTime(row)
   if (!raw || raw === '-') return null
@@ -515,7 +662,8 @@ watch(() => [props.stockCode, props.stockRequest], async ([value]) => {
   if (clean.length !== 6) return
   const sameCode = clean === cleanCode.value
   code.value = clean
-  viewMode.value = 'minute'
+  viewMode.value = 'daily'
+  dailyRange.value = 'all'
   if (!sameCode) {
     clearStockData()
     showMessage(`正在查询 ${clean} 行情数据...`)
@@ -616,6 +764,120 @@ h2 {
   margin-bottom: 12px;
 }
 
+.quote-strip {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 22px;
+  align-items: center;
+  min-height: 112px;
+  padding: 12px 16px;
+  margin-bottom: 12px;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  background: #11131a;
+}
+
+.quote-main {
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  gap: 7px;
+  padding-right: 18px;
+  border-right: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.quote-title-line {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.quote-title-line strong {
+  min-width: 0;
+  color: var(--terminal-text);
+  font-size: 1.18rem;
+  line-height: 1.22;
+  font-weight: 900;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quote-title-line span {
+  color: #8fa3c1;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.quote-price-line {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: #cbd5e1;
+  font-variant-numeric: tabular-nums;
+}
+
+.quote-price-line strong {
+  color: inherit;
+  font-size: 2.45rem;
+  line-height: 1;
+  font-weight: 900;
+  letter-spacing: 0;
+}
+
+.quote-price-line span {
+  color: inherit;
+  font-size: 0.98rem;
+  font-weight: 900;
+}
+
+.quote-rise .quote-price-line {
+  color: var(--quant-rise);
+}
+
+.quote-fall .quote-price-line {
+  color: var(--quant-fall);
+}
+
+.quote-metrics {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(132px, 1fr));
+  gap: 10px 18px;
+  align-content: center;
+}
+
+.quote-metrics article {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 9px;
+  align-items: baseline;
+}
+
+.quote-metrics span {
+  color: #7f8aa1;
+  font-size: 0.76rem;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.quote-metrics strong {
+  color: var(--terminal-text);
+  font-size: 1rem;
+  line-height: 1.25;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quote-time strong {
+  font-size: 0.94rem;
+}
+
 .minute-summary {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -699,12 +961,28 @@ h2 {
 }
 
 @media (max-width: 1180px) {
+  .quote-strip {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .quote-main {
+    padding-right: 0;
+    padding-bottom: 12px;
+    border-right: 0;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  }
+
   .minute-summary {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 
 @media (max-width: 820px) {
+  .quote-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .minute-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -715,6 +993,19 @@ h2 {
 }
 
 @media (max-width: 680px) {
+  .quote-strip {
+    padding: 12px;
+  }
+
+  .quote-title-line,
+  .quote-price-line {
+    flex-wrap: wrap;
+  }
+
+  .quote-metrics {
+    grid-template-columns: 1fr;
+  }
+
   .minute-summary {
     grid-template-columns: 1fr;
   }

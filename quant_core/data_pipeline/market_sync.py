@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
+from .concept_engine import sync_concept_daily
 from .market import fetch_sina_snapshot
 from .trading_calendar import latest_trading_day_on_or_before
 from quant_core.storage import (
@@ -60,6 +61,7 @@ def run_market_close_sync() -> dict[str, Any]:
         existing_rows = count_existing_daily_keys(keys)
         upsert_daily_rows(normalized, source="sina_close_sync")
         followup_result = upsert_v3_sniper_followups()
+        concept_sync_result = _run_concept_sync_best_effort()
         report["inserted_rows"] = max(0, int(len(keys) - existing_rows))
         report["updated_rows"] = int(existing_rows)
         report["status"] = "success"
@@ -68,6 +70,7 @@ def run_market_close_sync() -> dict[str, Any]:
             "stock_count": int(normalized["code"].nunique()),
             "latest_date": report["sync_date"],
             "v3_followups": followup_result,
+            "concept_sync": concept_sync_result,
             "note": "按 code/date 主键幂等入库；重复运行会覆盖同日最新行情。",
         }
     except Exception as exc:
@@ -83,9 +86,20 @@ def run_market_close_sync() -> dict[str, Any]:
     return report
 
 
-def latest_sync() -> dict[str, Any] | None:
+def latest_sync() -> Optional[dict[str, Any]]:
     return latest_market_sync_run()
 
 
 def sync_history(limit: int = 20) -> dict[str, Any]:
     return {"rows": list_market_sync_runs(limit=limit)}
+
+
+def _run_concept_sync_best_effort() -> dict[str, Any]:
+    try:
+        return sync_concept_daily()
+    except Exception as exc:
+        return {
+            "status": "fail",
+            "error": str(exc),
+            "note": "概念板块同步失败；股票日线同步不受影响，因子工厂会对缺失概念特征填 0。",
+        }

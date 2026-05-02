@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime
+from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Sequence
 
@@ -19,8 +19,9 @@ from quant_core.data_pipeline.fetch_minute_data import init_jq, normalize_code
 from quant_core.utils.stock_filter import get_core_universe
 
 
-START_DATE = "2025-01-18 09:30:00"
+START_DATE = "2025-01-21 09:30:00"
 END_DATE = "2026-01-23 15:00:00"
+JQ_ROLLING_START_LOOKBACK_DAYS = 465
 QUOTA_SPARE_FUSE = 20_000
 MIN_COMPLETE_ROWS = 10_000
 FIELDS = ["open", "close", "high", "low", "volume", "money"]
@@ -36,6 +37,9 @@ def batch_fetch_jq_history(limit: int | None = None, force: bool = False, one: b
 
     output_dir = MIN_KLINE_DIR / "5m"
     output_dir.mkdir(parents=True, exist_ok=True)
+    effective_start = _jq_rolling_start_date()
+    if effective_start != START_DATE:
+        print(f"[系统提示] 聚宽滚动窗口限制：起点从 {START_DATE} 调整为 {effective_start}")
     success = 0
     skipped = 0
     errors: list[dict[str, str]] = []
@@ -71,7 +75,7 @@ def batch_fetch_jq_history(limit: int | None = None, force: bool = False, one: b
         "skipped": skipped,
         "failed": len(errors),
         "errors": errors[:50],
-        "range": f"{START_DATE} -> {END_DATE}",
+        "range": f"{effective_start} -> {END_DATE}",
     }
 
 
@@ -79,7 +83,7 @@ def _fetch_one_jq(code: str) -> pd.DataFrame:
     jq_code = normalize_code(code)
     raw = get_price(
         jq_code,
-        start_date=START_DATE,
+        start_date=_jq_rolling_start_date(),
         end_date=END_DATE,
         frequency="5m",
         fields=FIELDS,
@@ -87,6 +91,15 @@ def _fetch_one_jq(code: str) -> pd.DataFrame:
         panel=False,
     )
     return _normalize_jq_frame(raw, code, jq_code)
+
+
+def _jq_rolling_start_date(today: date | None = None) -> str:
+    requested = datetime.fromisoformat(START_DATE)
+    rolling_floor = datetime.combine(
+        (today or date.today()) - timedelta(days=JQ_ROLLING_START_LOOKBACK_DAYS),
+        requested.time() or dt_time(9, 30),
+    )
+    return max(requested, rolling_floor).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _normalize_jq_frame(df: pd.DataFrame, code: str, jq_code: str) -> pd.DataFrame:
@@ -159,7 +172,7 @@ def _symbol(code: str) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="聚宽历史冷数据采集车间：核心主板 2025-01-18 至 2026-01-25 5m 前复权")
+    parser = argparse.ArgumentParser(description="聚宽历史冷数据采集车间：核心主板 2025-01-21 至 2026-01-23 5m 前复权")
     parser.add_argument("--limit", type=int, help="只抓前 N 只，用于测试")
     parser.add_argument("--one", action="store_true", help="只抓核心票池第一只，用于验收")
     parser.add_argument("--force", action="store_true", help="忽略断点续传，强制覆盖")

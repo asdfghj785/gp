@@ -10,17 +10,24 @@ if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from quant_core.data_pipeline.market import fetch_realtime_quote
+from quant_core.data_pipeline.trading_calendar import is_trading_day, trading_day_count_after
 from quant_core.storage import mark_daily_pick_closed, open_position_picks, stock_daily_row
 from quant_core.execution.pushplus_tasks import send_pushplus
 
 
 REVERSAL_STRATEGY = "中线超跌反转"
 MAIN_WAVE_STRATEGY = "右侧主升浪"
-SWING_STRATEGY_TYPES = {REVERSAL_STRATEGY, MAIN_WAVE_STRATEGY}
+GLOBAL_MOMENTUM_STRATEGY = "全局动量狙击"
+SWING_STRATEGY_TYPES = {REVERSAL_STRATEGY, MAIN_WAVE_STRATEGY, GLOBAL_MOMENTUM_STRATEGY}
 
 
 def run_swing_patrol(today: str | None = None, send_push: bool = True) -> dict[str, Any]:
     current_day = today or date.today().isoformat()
+    if not is_trading_day(datetime.fromisoformat(current_day[:10]).date()):
+        result = {"status": "skipped", "reason": "非交易日不执行 14:45 波段巡逻", "date": current_day}
+        print(result)
+        return result
+
     picks = [
         pick
         for pick in open_position_picks(today=current_day)
@@ -348,15 +355,7 @@ def _fmt_pct(value: Any) -> str:
 def _holding_trading_day(selection_date: str, current_day: str) -> int:
     start = datetime.fromisoformat(selection_date[:10]).date()
     end = datetime.fromisoformat(current_day[:10]).date()
-    if end <= start:
-        return 0
-    day_count = 0
-    cursor = start
-    while cursor < end:
-        cursor = cursor.fromordinal(cursor.toordinal() + 1)
-        if cursor.weekday() < 5:
-            day_count += 1
-    return day_count
+    return trading_day_count_after(start, end)
 
 
 def _send_pushplus(title: str, content: str) -> dict[str, Any]:

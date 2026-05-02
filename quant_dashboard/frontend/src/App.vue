@@ -21,16 +21,12 @@
           class="message-alert"
         />
 
-        <section v-show="activeSection === 'v3'" class="page-stack">
-          <QuantDashboardV3 />
-        </section>
-
         <section v-show="activeSection === 'dashboard'" class="page-stack">
           <section class="command-strip">
             <article>
-              <span>V3.1 Core</span>
-              <strong>三军团并行出票</strong>
-              <small>右侧主升浪 / 中线超跌反转 / 尾盘突破各自独立 Top1</small>
+              <span>V4.0 Theme Alpha</span>
+              <strong>四大核心军团并行出票</strong>
+              <small>全局动量狙击 / 右侧主升浪 / 中线超跌反转 / 尾盘突破各自独立 Top1</small>
             </article>
             <article>
               <span>Snapshot Anchor</span>
@@ -55,7 +51,7 @@
                 <div class="card-head">
                   <div>
                     <p class="eyebrow">Strategy Legion</p>
-                    <h2>三大军团生产态势</h2>
+                    <h2>四大核心军团并行出票</h2>
                   </div>
                   <span class="terminal-chip">XGBRegressor</span>
                 </div>
@@ -215,13 +211,13 @@
             </div>
           </section>
 
-          <el-empty v-if="radar.rows.length === 0" class="radar-empty" description="空仓避险：当前没有达到生产门槛的候选股" />
+          <el-empty v-if="dashboardSignalRows.length === 0" class="radar-empty" description="空仓避险：当前没有达到动态底线的候选股" />
 
           <section v-else class="dual-board">
             <SelectionTable
               title="短线极速看板"
               eyebrow="T+1 Breakout"
-              :rows="radar.rows"
+              :rows="dashboardSignalRows"
               mode="short"
               :table-height="360"
               show-inspect
@@ -230,7 +226,7 @@
             <SelectionTable
               title="波段策略看板"
               eyebrow="T+3 Swing"
-              :rows="radar.rows"
+              :rows="dashboardSignalRows"
               mode="swing"
               :table-height="360"
               show-inspect
@@ -352,9 +348,9 @@
             </template>
             <div class="pulse-grid fetch-summary">
               <article><span>最后获取</span><strong>{{ jqFetch.last_fetch_at || '-' }}</strong></article>
-              <article><span>今日覆盖</span><strong>{{ fetchCoverage(jqFetch) }}</strong></article>
+              <article><span>本次新增</span><strong>{{ fetchCoverage(jqFetch) }}</strong></article>
               <article><span>失败</span><strong>{{ jqFetch.failed ?? 0 }}</strong></article>
-              <article><span>累计进度</span><strong>{{ jqProgressText }}</strong></article>
+              <article><span>断点进度</span><strong>{{ jqProgressText }}</strong></article>
               <article><span>剩余额度</span><strong>{{ jqQuotaText }}</strong></article>
               <article><span>数据区间</span><strong>{{ jqFetch.range || '-' }}</strong></article>
             </div>
@@ -411,16 +407,16 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, provide, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, provide, reactive, ref, watch } from 'vue'
 import Sidebar from './components/Sidebar.vue'
 import StatsHeader from './components/StatsHeader.vue'
 import SelectionTable from './components/SelectionTable.vue'
 import MinKlineViewer from './components/MinKlineViewer.vue'
 import StockLink from './components/StockLink.vue'
-import QuantDashboardV3 from './views/QuantDashboardV3.vue'
 import { resolveInitialSection } from './router'
 
 const API = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
+const VALID_SECTIONS = new Set(['dashboard', 'ledger', 'validation', 'minute'])
 
 const activeSection = ref(resolveInitialSection())
 const overview = ref({})
@@ -441,12 +437,15 @@ const sourceCheck = ref(false)
 const busy = reactive({ refresh: false, scan: false, sync: false, validate: false, analyze: false })
 
 const currentTitle = computed(() => ({
-  v3: 'V3.2 量化指挥中心',
-  dashboard: 'Dashboard 总览',
+  dashboard: '四大军团统一总览',
   ledger: 'Shadow Test 影子账本',
   validation: 'Validation 数据校验',
   minute: '单票行情库',
-})[activeSection.value] || 'Dashboard 总览')
+})[activeSection.value] || '四大军团统一总览')
+
+watch(activeSection, (section) => {
+  if (!VALID_SECTIONS.has(section)) activeSection.value = 'dashboard'
+}, { immediate: true })
 const latestSync = computed(() => overview.value.latest_sync || null)
 const localDateText = (date = new Date()) => {
   const y = date.getFullYear()
@@ -476,7 +475,45 @@ const visibleMessage = computed(() => {
   if (message.scope === 'minute') return activeSection.value === 'minute'
   return true
 })
-const strategyStats = computed(() => ['右侧主升浪', '中线超跌反转', '尾盘突破'].map((strategy) => {
+const LEGION_STRATEGIES = ['全局动量狙击', '右侧主升浪', '中线超跌反转', '尾盘突破']
+
+const normalizedRadarRows = computed(() => radar.rows.map((row) => {
+  const winner = row?.raw?.winner || {}
+  return {
+    ...row,
+    id: row?.id || `radar-${row?.strategy_type || '全局动量狙击'}-${row?.code || winner.code || ''}`,
+    selection_date: row?.selection_date || row?.date || todayText.value,
+    strategy_type: row?.strategy_type || winner.strategy_type || '全局动量狙击',
+    snapshot_price: row?.snapshot_price ?? row?.selection_price ?? row?.price ?? row?.close ?? winner.price,
+    selection_price: row?.selection_price ?? row?.price ?? row?.close ?? winner.price,
+    selection_change: row?.selection_change ?? row?.change ?? row?.pct_chg ?? winner.change,
+    composite_score: row?.composite_score ?? row?.global_probability_pct ?? row?.probability_pct ?? winner.composite_score,
+    sort_score: row?.sort_score ?? row?.global_probability_pct ?? row?.probability_pct ?? winner.sort_score,
+    expected_t3_max_gain_pct: row?.expected_t3_max_gain_pct ?? row?.expected_premium ?? winner.expected_t3_max_gain_pct ?? winner.expected_premium,
+    theme_name: row?.theme_name ?? winner.theme_name ?? '-',
+    theme_pct_chg_3: row?.theme_pct_chg_3 ?? winner.theme_pct_chg_3 ?? null,
+    suggested_position: row?.suggested_position ?? winner.suggested_position ?? null,
+    selection_tier: row?.selection_tier ?? winner.selection_tier ?? 'base',
+    risk_warning: row?.risk_warning ?? winner.risk_warning ?? '',
+    status: row?.status || 'radar_preview',
+  }
+}))
+
+const dashboardSignalRows = computed(() => {
+  const merged = []
+  const seen = new Set()
+  const pushRow = (row) => {
+    const key = `${row.selection_date || row.date || todayText.value}-${row.strategy_type || ''}-${row.code || ''}`
+    if (seen.has(key)) return
+    seen.add(key)
+    merged.push(row)
+  }
+  dailyPicks.rows.filter((row) => row.selection_date === todayText.value).forEach(pushRow)
+  normalizedRadarRows.value.forEach(pushRow)
+  return merged
+})
+
+const strategyStats = computed(() => LEGION_STRATEGIES.map((strategy) => {
   const rows = dailyPicks.rows.filter((row) => row.strategy_type === strategy)
   const settled = rows.filter((row) => row.is_closed && resultValue(row) !== null)
   const wins = settled.filter((row) => resultValue(row) > 0).length
@@ -506,8 +543,8 @@ const dataPipelineNodes = computed(() => [
   },
   {
     phase: '14:50',
-    name: '三军团雷达',
-    detail: '实时价平替收盘价，成交量外推，独立选 Top1',
+    name: '四军团雷达',
+    detail: '四大核心军团同台竞技，统一 14:50 快照价',
   },
   {
     phase: '15:05',
@@ -606,7 +643,7 @@ const loadDailyPicks = async () => {
 const scanRadar = async () => {
   busy.scan = true
   try {
-    const data = await request('/api/radar/scan?limit=10')
+    const data = await request('/api/radar/scan?limit=12')
     applyRadarPayload(data)
     setMessage(radar.rows.length ? `扫描完成：${radar.rows.length} 条候选。` : '扫描完成：当前空仓避险。')
   } catch (error) {
@@ -667,7 +704,7 @@ const inspectStock = (row) => {
 
 const isSwingStrategy = (value) => {
   const strategy = typeof value === 'string' ? value : value?.strategy_type
-  return strategy === '中线超跌反转' || strategy === '右侧主升浪'
+  return strategy === '中线超跌反转' || strategy === '右侧主升浪' || strategy === '全局动量狙击'
 }
 const toResultNumber = (value) => {
   if (value === null || value === undefined || value === '') return null
@@ -704,6 +741,7 @@ const numberClass = (value) => {
   return num > 0 ? 'buy' : 'risk'
 }
 const strategyLabel = (strategy) => {
+  if (strategy === '全局动量狙击') return '全局狙击'
   if (strategy === '右侧主升浪') return '顺势主升浪'
   if (strategy === '中线超跌反转') return '中线超跌反转'
   if (strategy === '首阴低吸') return '低吸影子'
@@ -711,7 +749,15 @@ const strategyLabel = (strategy) => {
 }
 const strategyBadgeClass = (strategy) => [
   'strategy-badge',
-  strategy === '右侧主升浪' ? 'strategy-main' : strategy === '中线超跌反转' ? 'strategy-reversal' : strategy === '首阴低吸' ? 'strategy-dip' : 'strategy-breakout',
+  strategy === '全局动量狙击'
+    ? 'strategy-global'
+    : strategy === '右侧主升浪'
+      ? 'strategy-main'
+      : strategy === '中线超跌反转'
+        ? 'strategy-reversal'
+        : strategy === '首阴低吸'
+          ? 'strategy-dip'
+          : 'strategy-breakout',
 ]
 const instructionTitle = (pick) => {
   const actual = Number(pick.open_premium)
@@ -1221,6 +1267,12 @@ pre {
   border: 1px solid rgba(114, 46, 209, 0.48);
   background: rgba(114, 46, 209, 0.2);
   color: #b37feb;
+}
+
+.strategy-global {
+  border: 1px solid rgba(245, 34, 45, 0.48);
+  background: rgba(245, 34, 45, 0.18);
+  color: #ff7875;
 }
 
 .strategy-dip {

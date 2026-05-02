@@ -20,7 +20,7 @@ if str(BASE_DIR) not in sys.path:
 from quant_core.ai_agent.agent_gateway import run_1446_ai_interview
 from quant_core.ai_agent.llm_engine import ollama_config
 from quant_core.config import DATA_DIR, MODELS_DIR
-from quant_core.engine.daily_factor_factory import generate_daily_factors
+from quant_core.engine.daily_factor_factory import THEME_FACTOR_COLUMNS, generate_daily_factors
 from quant_core.engine.daily_model_trainer import discover_daily_data_dir, list_daily_files
 from quant_core.engine.model_evaluator import load_daily_model
 
@@ -181,9 +181,13 @@ def _align_features(frame: pd.DataFrame, feature_cols: list[str]) -> pd.DataFram
     out = frame.copy()
     for col in feature_cols:
         if col not in out.columns:
-            out[col] = 0.0
+            out[col] = np.nan if col in THEME_FACTOR_COLUMNS else 0.0
     aligned = out[feature_cols].apply(pd.to_numeric, errors="coerce")
-    return aligned.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0).astype("float32", copy=False)
+    aligned = aligned.replace([np.inf, -np.inf], np.nan)
+    fillable_cols = [col for col in aligned.columns if col not in THEME_FACTOR_COLUMNS]
+    if fillable_cols:
+        aligned[fillable_cols] = aligned[fillable_cols].ffill().fillna(0.0)
+    return aligned.astype("float32", copy=False)
 
 
 def _load_model_meta() -> dict[str, Any]:

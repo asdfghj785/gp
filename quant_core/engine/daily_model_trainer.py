@@ -19,7 +19,7 @@ else:
     XGBOOST_IMPORT_ERROR = None
 
 from quant_core.config import BASE_DIR, DATA_DIR, MODELS_DIR
-from quant_core.engine.daily_factor_factory import build_daily_factors, feature_columns
+from quant_core.engine.daily_factor_factory import THEME_FACTOR_COLUMNS, build_daily_factors, feature_columns
 
 
 MODEL_PATH = MODELS_DIR / "xgboost_daily_swing_global_v1.json"
@@ -90,14 +90,31 @@ def build_panel_dataset(
             errors.append(f"{path.name}: {exc}")
     if not frames:
         raise RuntimeError(f"没有成功构建任何日线因子表，错误样例: {errors[:5]}")
+    frames = [frame.dropna(axis=1, how="all") for frame in frames if not frame.empty]
     panel = pd.concat(frames, ignore_index=True)
     panel["datetime"] = pd.to_datetime(panel["datetime"], errors="coerce")
     panel = panel.replace([np.inf, -np.inf], np.nan)
     panel = panel.dropna(subset=["datetime", "label", "future_max_return"])
+    panel = ensure_theme_factor_columns(panel)
     numeric_cols = panel.select_dtypes(include=[np.number]).columns
-    panel[numeric_cols] = panel[numeric_cols].ffill().fillna(0.0)
+    panel[numeric_cols] = panel[numeric_cols].replace([np.inf, -np.inf], np.nan)
+    for col in THEME_FACTOR_COLUMNS:
+        if col in panel.columns:
+            panel[col] = pd.to_numeric(panel[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    fillable_cols = [col for col in numeric_cols if col not in THEME_FACTOR_COLUMNS]
+    if fillable_cols:
+        panel[fillable_cols] = panel[fillable_cols].ffill().fillna(0.0)
     panel = reduce_panel_memory(panel)
     return panel.sort_values(["datetime", "symbol"]).reset_index(drop=True)
+
+
+def ensure_theme_factor_columns(panel: pd.DataFrame) -> pd.DataFrame:
+    out = panel.copy()
+    for col in THEME_FACTOR_COLUMNS:
+        if col not in out.columns:
+            out[col] = np.nan
+        out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return out
 
 
 def reduce_panel_memory(panel: pd.DataFrame) -> pd.DataFrame:
@@ -267,7 +284,10 @@ def _symbol_from_path(path: Path) -> str:
 
 def _clean_features(features: pd.DataFrame) -> pd.DataFrame:
     out = features.apply(pd.to_numeric, errors="coerce")
-    out = out.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
+    out = out.replace([np.inf, -np.inf], np.nan)
+    fillable_cols = [col for col in out.columns if col not in THEME_FACTOR_COLUMNS]
+    if fillable_cols:
+        out[fillable_cols] = out[fillable_cols].ffill().fillna(0.0)
     return out.astype("float32", copy=False)
 
 
@@ -292,9 +312,14 @@ def main() -> None:
     print(f"Selected Symbols   : {len(files)}")
     print(f"First File         : {files[0].name}")
     panel = build_panel_dataset(files, target_horizon=args.target_horizon)
+    cols_preview = feature_columns(panel)
+    theme_cols = [col for col in THEME_FACTOR_COLUMNS if col in cols_preview]
     print(f"Panel Shape        : {panel.shape}")
     print(f"Date Range         : {panel['datetime'].min().date()} -> {panel['datetime'].max().date()}")
     print(f"Positive Rate      : {panel['label'].mean():.4f}")
+    print(f"Feature Count      : {len(cols_preview)}")
+    print(f"Theme Factors      : {theme_cols}")
+    print(f"Feature Columns    : {cols_preview}")
 
     result = train_daily_global_model(
         panel,

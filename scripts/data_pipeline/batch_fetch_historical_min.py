@@ -27,10 +27,20 @@ from quant_core.data_pipeline.fetch_minute_data import (
 
 DEFAULT_MIN_FILE_SIZE_BYTES = 10 * 1024
 QUOTA_STOP_BUFFER_ROWS = 3000
-DEFAULT_COLD_START_DATE = "2025-01-19 09:30:00"
+DEFAULT_COLD_START_DATE = "2025-01-21 09:30:00"
 DEFAULT_COLD_END_DATE = "2026-01-23 15:00:00"
+JQ_ROLLING_START_LOOKBACK_DAYS = 465
 PROGRESS_FILENAME = "jq_cold_5m_progress.json"
 MIN_EXISTING_JQ_ROWS_PER_SEGMENT = 20
+
+
+def clamp_jq_rolling_start_date(start_date: str, today: date | None = None) -> str:
+    requested = parse_cli_datetime(start_date, is_end=False)
+    rolling_floor = datetime.combine(
+        (today or date.today()) - timedelta(days=JQ_ROLLING_START_LOOKBACK_DAYS),
+        requested.time(),
+    )
+    return max(requested, rolling_floor).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def load_universe(codes: Sequence[str] | None = None, code_file: str | Path | None = None) -> list[str]:
@@ -55,6 +65,7 @@ def existing_good_codes(
     period_dir = output_root / f"{normalize_period(period)}m"
     if not period_dir.exists():
         return set()
+    start_date = clamp_jq_rolling_start_date(start_date)
     progress = load_progress(progress_path(output_root, period))
     segments = split_segments(start_date, end_date, mode=segment_mode)
     codes = {
@@ -185,8 +196,11 @@ def batch_fetch_historical_min(
     init_jq()
     safe_period = normalize_period(period)
     output_path = Path(output_root)
-    start = start_date or DEFAULT_COLD_START_DATE
+    requested_start = start_date or DEFAULT_COLD_START_DATE
+    start = clamp_jq_rolling_start_date(requested_start)
     end = end_date or DEFAULT_COLD_END_DATE
+    if start != requested_start:
+        print(f"[jq-min-batch] 聚宽滚动窗口限制：起点从 {requested_start} 调整为 {start}")
     universe = load_universe(codes=codes, code_file=code_file)
     if limit:
         universe = universe[: max(0, int(limit))]

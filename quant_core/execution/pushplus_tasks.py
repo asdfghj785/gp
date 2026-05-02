@@ -11,6 +11,7 @@ import requests
 
 from quant_core.config import PUSHPLUS_TOKEN, check_push_config
 from quant_core.ai_agent.agent_gateway import attach_ai_interview, run_1446_ai_interview
+from quant_core.data_pipeline.trading_calendar import is_trading_day
 from quant_core.daily_pick import save_pushed_top_picks
 from quant_core.engine.predictor import scan_market
 from quant_core.storage import (
@@ -112,6 +113,12 @@ def heartbeat() -> dict[str, Any]:
 
 def top_pick() -> dict[str, Any]:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    today = date.today()
+    if not is_trading_day(today):
+        result = {"status": "skipped", "reason": "非交易日不执行 14:50 推送", "selection_date": today.isoformat()}
+        print(result)
+        return result
+
     locked_rows = get_daily_picks(date.today().isoformat())
     if locked_rows:
         locked_lines = "\n".join(_pick_line(row, exists=True) for row in locked_rows) or "- 今日记录存在，但没有可展示标的。"
@@ -127,7 +134,7 @@ def top_pick() -> dict[str, Any]:
         print(_compact_task_result("sent_locked", "top_pick", now, locked_rows, result))
         return {"pushplus": result, "daily_pick": {"status": "exists", "picks": locked_rows}}
 
-    scan = scan_market(limit=10, persist_snapshot=False, cache_prediction=False, async_persist=False)
+    scan = scan_market(limit=12, persist_snapshot=False, cache_prediction=False, async_persist=False)
     rows = scan.get("rows", [])
     gate = scan.get("market_gate") or {}
     intraday = scan.get("intraday_snapshot") or {}
@@ -151,7 +158,7 @@ def top_pick() -> dict[str, Any]:
 状态: 空仓
 模式: {gate.get('mode')}
 14:30快照: {intraday.get('status')} | 拦截: {intraday.get('trapped_count', 0)}
-原因: 没有达到回归预期溢价、综合评分门槛且预期溢价为正的候选股。
+原因: 没有达到四大军团动态底线且通过物理风控的候选股。
 模型状态: {scan.get('model_status')}
 """
         result = send_pushplus("14:50尾盘策略：无强信号空仓", content)
@@ -178,7 +185,7 @@ def top_pick() -> dict[str, Any]:
 14:30快照: {intraday.get('status')} | 匹配: {intraday.get('matched_count', 0)} | 拦截: {intraday.get('trapped_count', 0)}
 模型状态: {scan.get('model_status')}
 
-过滤规则: 已排除创业板、北交所、科创板、ST/退市；三大军团各自独立选 Top1；雷暴或下跌缩量空仓；14:30后尾盘拉升超过阈值、近3日断头铡刀按策略风控剔除。
+过滤规则: 已排除创业板、北交所、科创板、ST/退市；四大核心军团按基准线最多 Top3，未达基准时按当日合规池 99 分位动态下探 1 只并标红风偏；雷暴或下跌缩量空仓；14:30后尾盘拉升超过阈值、近3日断头铡刀按策略风控剔除。
 """
     result = send_pushplus(f"14:50多轨候选: {len(rows)}只", content)
     day_rows = get_daily_picks(date.today().isoformat())
@@ -217,9 +224,10 @@ def _pick_line(row: dict[str, Any], exists: bool = False) -> str:
     code = str(row.get("code") or "-")
     price = _safe_float(row.get("snapshot_price") or row.get("selection_price") or row.get("price"))
     change = _safe_float(row.get("selection_change") if exists else row.get("change"))
+    is_swing = strategy_type in {"中线超跌反转", "右侧主升浪", "全局动量狙击"}
     expected = _safe_float(
         row.get("expected_t3_max_gain_pct")
-        if strategy_type in {"中线超跌反转", "右侧主升浪"}
+        if is_swing
         else row.get("expected_premium")
     )
     if expected == 0:
@@ -227,17 +235,64 @@ def _pick_line(row: dict[str, Any], exists: bool = False) -> str:
     score = _safe_float(row.get("composite_score"))
     target_date = row.get("target_date") or "-"
     snapshot_time = row.get("snapshot_time") or "14:50"
-    metric_label = "T+3预期最大涨幅" if strategy_type in {"中线超跌反转", "右侧主升浪"} else "预期开盘溢价"
+    metric_label = "T+3预期最大涨幅" if is_swing else "预期开盘溢价"
+    position_line = _position_line(row, strategy_type, name, code)
     line = (
-        f"- 【{strategy_type}】{name}({code}) "
-        f"14:50价 {_fmt(price)} / 涨跌 {_fmt(change)}% / "
+        f"- {position_line}\n"
+        f"  - 14:50价 {_fmt(price)} / 涨跌 {_fmt(change)}% / "
         f"{metric_label} {_fmt(expected)}% / 评分 {_fmt(score)} / "
         f"快照 {snapshot_time} / 目标日 {target_date}"
     )
     ai_summary = _ai_summary(row)
     if ai_summary:
         line += f"\n  - AI舆情：{ai_summary}"
+    risk_warning = _risk_warning(row)
+    if risk_warning:
+        line += f"\n  - ‼️ 风偏提示：{risk_warning}"
     return line
+
+
+def _position_line(row: dict[str, Any], strategy_type: str, name: str, code: str) -> str:
+    suggested = _suggested_position(row)
+    tier = str(row.get("selection_tier") or "").strip()
+    if not tier:
+        raw = row.get("raw")
+        if isinstance(raw, dict) and isinstance(raw.get("winner"), dict):
+            tier = str(raw["winner"].get("selection_tier") or "").strip()
+    is_probe = tier == "dynamic_floor"
+    icon = "🔴" if is_probe else "🟢"
+    note = "试错轻仓" if is_probe else "凯利优选"
+    position_pct = f"{suggested * 100:.0f}%" if suggested is not None else "-"
+    return f"{icon} {strategy_type} | {name} ({code}) | 💰 建议仓位: {position_pct} ({note})"
+
+
+def _suggested_position(row: dict[str, Any]):
+    value = row.get("suggested_position")
+    if value is None:
+        raw = row.get("raw")
+        if isinstance(raw, dict):
+            winner = raw.get("winner")
+            if isinstance(winner, dict):
+                value = winner.get("suggested_position")
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, value))
+
+
+def _risk_warning(row: dict[str, Any]) -> str:
+    warning = str(row.get("risk_warning") or "").strip()
+    if warning:
+        return warning
+    raw = row.get("raw")
+    if isinstance(raw, dict):
+        winner = raw.get("winner")
+        if isinstance(winner, dict):
+            return str(winner.get("risk_warning") or "").strip()
+    return ""
 
 
 def _ai_summary(row: dict[str, Any]) -> str:
@@ -333,6 +388,7 @@ def _compact_task_result(
                 "name": row.get("name"),
                 "strategy_type": row.get("strategy_type"),
                 "snapshot_price": row.get("snapshot_price") or row.get("selection_price") or row.get("price"),
+                "suggested_position": row.get("suggested_position"),
             }
             for row in rows
         ],

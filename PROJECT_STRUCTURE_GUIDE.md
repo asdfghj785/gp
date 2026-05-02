@@ -1,6 +1,6 @@
 # A 股量化工作站项目结构与二次开发指南
 
-更新时间：2026-04-27
+更新时间：2026-05-03
 
 本文档用于让新的开发者快速理解 `/Users/eudis/ths` 项目结构、运行方式、关键数据流和每个主要文件的职责。当前代码已经不是早期的单一尾盘策略，而是本地 macOS/M4 上运行的多策略 A 股量化工作站。
 
@@ -17,13 +17,22 @@
 - 用 SQLite 保存预测、实盘影子测试记录、回测记录和同步记录。
 - 通过 FastAPI + Vue 前端展示雷达、复盘、数据校验和单票 K 线。
 
-当前生产核心是三大策略并行出票：
+当前生产核心是四大策略并行分档出票：
 
-1. `右侧主升浪`：T+3 波段策略，预测未来 3 个交易日最大涨幅。
-2. `中线超跌反转`：T+3 波段策略，预测未来 3 个交易日最大涨幅。
-3. `尾盘突破`：T+1 短线隔夜策略，预测次日开盘溢价。
+1. `全局动量狙击`：V4 Theme Alpha 全市场 T+3 概率策略，带 `theme_*` 主题因子。
+2. `右侧主升浪`：T+3 波段策略，预测未来 3 个交易日最大涨幅。
+3. `中线超跌反转`：T+3 波段策略，预测未来 3 个交易日最大涨幅。
+4. `尾盘突破`：T+1 短线隔夜策略，预测次日开盘溢价。
 
 `首阴低吸` 仍保留模型与代码，但默认门槛 `QUANT_DIPBUY_MIN_SCORE=99.00`，相当于影子保留，不参与正常生产出票。
+
+V4.4 关键口径：
+
+- 四大策略先过物理风控和买得到过滤，再按各自分数降序排序。
+- 达到 `MIN_SCORE` 的 `base` 档，每个策略最多取 Top3。
+- 若某策略没有基准线票，则计算 `dynamic_floor=max(0.55, legal_pool.score.quantile(0.99))`，只允许 Top1 以 `dynamic_floor` 档下探出票。
+- `dynamic_floor` 档必须写入 `risk_warning`，建议仓位固定为 `5%`；`base` 档使用 Half-Kelly，仓位限制在 `10%` 到 `30%`。
+- `daily_picks` 当前唯一约束为 `(selection_date, strategy_type, code)`，支持同策略同日多标的。
 
 ## 2. 技术栈
 
@@ -53,8 +62,10 @@
 外部数据源：
 
 - 新浪实时行情接口
+- 腾讯实时行情与 5m 热数据接口
+- 聚宽 SDK，提供账号授权滚动窗口内的历史 5m 冷数据
 - 本地 Parquet 日线库
-- 东方财富股吧页面，用于 Ollama 舆情风控辅助
+- 新闻/搜索线索与本地兜底文本，用于 Ollama 舆情风控辅助
 - Ollama 本地大模型接口，仅用于舆情/公告风控，不直接预测价格
 
 ## 3. 当前关键运行地址
@@ -134,7 +145,7 @@
 - 保存全市场 `代码 -> 14:30 最新价` 到 `data/intraday/price_1430.json`。
 - 给 14:50 预测端做“尾盘诱多”识别。
 
-### 6.2 14:50 三策略雷达与 PushPlus 推送
+### 6.2 14:50 四策略雷达与 PushPlus 推送
 
 入口：
 
@@ -152,17 +163,18 @@ quant_pushplus_tasks.top_pick()
   -> market_risk_gate()
   -> apply_production_filters()
   -> apply_strategy_score_gate()
-  -> select_strategy_top_picks(limit_per_strategy=1)
+  -> select_strategy_top_picks(limit_per_strategy=3)
   -> save_prediction_snapshot()
   -> save_pushed_top_picks()
   -> PushPlus 推送
 ```
 
-当前生产逻辑是“每个策略独立选 Top1”，一天最多可写入 3 只不同股票：
+当前生产逻辑是“每个策略独立分档出票”，一天最多可写入多只不同股票：
 
-- `右侧主升浪` Top1
-- `中线超跌反转` Top1
-- `尾盘突破` Top1
+- `全局动量狙击`：基准线 Top3 或动态下探 Top1。
+- `右侧主升浪`：基准线 Top3 或动态下探 Top1。
+- `中线超跌反转`：基准线 Top3 或动态下探 Top1。
+- `尾盘突破`：基准线 Top3 或动态下探 Top1。
 
 写入 `daily_picks` 时会封存：
 
@@ -313,7 +325,34 @@ quant_pushplus_tasks.top_pick()
 - 紫/金色策略标签：`🚀 顺势主升浪`。
 - 同中线反转一样走 T+3 波段展示。
 
-### 7.4 首阴低吸
+### 7.4 全局动量狙击
+
+文件：
+
+- `quant_core/engine/daily_factor_factory.py`
+- `quant_core/engine/daily_model_trainer.py`
+- `quant_core/strategies/global_momentum.py`
+- `models/xgboost_daily_swing_global_v1.json`
+- `models/xgboost_daily_swing_global_v1.meta.json`
+
+目标：
+
+- 使用带 `theme_pct_chg_1`、`theme_pct_chg_3`、`theme_volatility_5`、`rs_stock_vs_theme`、`rs_theme_ema_5` 的全市场 XGBoost 概率模型。
+- 预测未来 3 个交易日最高收益率是否超过目标阈值。
+- 生产口径归属 T+3 波段观察。
+
+生产硬风控：
+
+- 只保留 `00`、`60` 开头主板股票。
+- 剔除名称包含 `ST` / `*ST` 的股票。
+- 剔除 14:50 实时涨幅 `>= 9.0%` 的准涨停/涨停票。
+
+前端展示：
+
+- 策略标签：`全局狙击`。
+- 展示 `核心主题`、`主题3日动量`、`凯利仓位`、风偏提示和 T+3 观察结果。
+
+### 7.5 首阴低吸
 
 文件：
 
@@ -360,7 +399,7 @@ data/core_db/quant_workstation.sqlite3
 
 ### 8.2 `daily_picks`
 
-生产/影子测试核心表。当前唯一约束是 `(selection_date, strategy_type)`，允许同一天三个策略各写入一条。
+生产/影子测试核心表。当前唯一约束是 `(selection_date, strategy_type, code)`，允许同一天同一策略写入多只不同股票。
 
 关键字段：
 
@@ -380,6 +419,16 @@ data/core_db/quant_workstation.sqlite3
 - `is_closed`：是否完结。
 - `close_date` / `close_price` / `close_return_pct` / `close_reason`：哨兵关闭结果。
 - `raw_json`：原始候选 JSON。
+
+V4.4 关键展示字段存于 `raw_json.winner`，并由 `quant_core/storage.py` 解码后透出给 `/api/daily-picks`：
+
+- `theme_name` / `theme_pct_chg_3`：核心主题与主题 3 日动量。
+- `selection_tier`：`base` 或 `dynamic_floor`。
+- `risk_warning`：下探、历史导入等风偏提示。
+- `dynamic_floor` / `score_floor`：当日合规池自适应底线。
+- `suggested_position`：建议仓位比例。
+
+旧全局狙击页面的锁定记录保存在 `v3_sniper_locks`。如果未进入新影子账本，原因通常是旧页面只写了锁表而没有写 `daily_picks`；迁移时必须保留原始 `snapshot_price` / `snapshot_time`，并在 `risk_warning` 中标记该记录未经过当前 V4.4 风控重筛。
 
 ### 8.3 `prediction_snapshots`
 
@@ -423,6 +472,8 @@ quant_dashboard/backend/main.py
 | `POST` | `/api/data/validate` | 数据完整性/真实性校验 |
 | `GET` | `/api/data/reports` | 历史校验报告 |
 | `GET` | `/api/data/history/{code}` | 单票 K 线数据 |
+| `GET` | `/api/data/history_min/{code}?period=5` | 单票分钟 K 线数据 |
+| `GET` | `/api/data/minute-fetch/status` | 聚宽冷数据与 Ashare/Tencent 热数据采集状态 |
 | `GET` | `/api/radar/cache` | 读取最近雷达缓存 |
 | `GET` | `/api/radar/scan?limit=10` | 实时扫描并更新缓存 |
 | `GET` | `/api/daily-picks?limit=20` | 前向影子测试记录 |
@@ -469,13 +520,18 @@ quant_dashboard/frontend
 
 1. `预测`：实时雷达、影子测试记录、09:25/14:45 哨兵观测。
 2. `策略`：近十二个月生产策略复盘、月度 Tabs、策略军团卡片、失败归因。
-3. `数据`：数据同步、数据校验、同步历史。
-4. `单票`：K 线验算、鼠标悬停查看日期/开盘/收盘/成交量等。
+3. `数据` / `Validation`：数据同步、数据校验、同步历史，并展示聚宽冷数据和 Ashare/Tencent 热数据采集状态。
+4. `单票行情库`：日 K、5m K 线验算，股票名称跳转默认展示日 K，鼠标悬停查看日期/开盘/收盘/成交量等。
 
 前端展示口径：
 
 - `尾盘突破` 显示 T+1 开盘溢价。
-- `右侧主升浪` 和 `中线超跌反转` 显示 T+3 最大涨幅，不与 T+1 开盘溢价混用。
+- `全局动量狙击`、`右侧主升浪` 和 `中线超跌反转` 显示 T+3 最大涨幅，不与 T+1 开盘溢价混用。
+- 影子账本表格必须展示 `核心主题`、`主题3日动量`、`凯利仓位`。主题 3 日动量超过 `3%` 时高亮，仓位低于 `10%` 时用警告色，仓位 `>=15%` 时用重仓高亮。
+- `risk_warning` 不为空时必须直接在股票名下方或警告区域显示；`selection_tier=dynamic_floor` 时策略标签旁显示下探/逆势标记。
+- T+3 波段票的“卖出/观察”单元格支持鼠标悬浮，展示买入日至 T+3 目标日每天收盘收益路径。
+- 聚宽冷数据卡片中“本次新增”是最近一次任务新增成功股票数 / 全市场股票池；“断点进度”来自 `jq_cold_5m_progress.json`，表示累计有断点记录的股票数和已完成的月切片数。
+- Ashare/Tencent 热数据卡片的“今日覆盖”表示当日热数据归档成功数。
 - 前端不能手动保存或修改 14:50 标的。
 
 ## 11. 文件逐项说明
@@ -486,7 +542,7 @@ quant_dashboard/frontend
 |---|---|
 | `__init__.py` | Python 包标记。 |
 | `config.py` | 全局路径、模型路径、策略门槛、PushPlus/Ollama 配置。 |
-| `predictor.py` | 生产预测核心：实时快照清洗、特征工程、四策略评分、风控过滤、每策略 Top1 输出、API 行格式化。 |
+| `engine/predictor.py` | 生产预测核心：实时快照清洗、特征工程、四策略评分、物理风控、动态底线、仓位计算、分档出票、API 行格式化。 |
 | `storage.py` | SQLite 连接、建表、迁移、预测缓存、日线入库、daily_picks 写入/回填/关闭。 |
 | `market.py` | 新浪行情与大盘指数数据抓取。 |
 | `market_sync.py` | 收盘后市场数据同步和同步记录入库。 |
@@ -494,7 +550,7 @@ quant_dashboard/frontend
 | `daily_pick.py` | 14:50 推送标的批量锁定、T+1 开盘回填逻辑。 |
 | `exit_sentinel.py` | 09:26 开盘哨兵，处理短线开盘指令和波段极端低开预警。 |
 | `swing_patrol.py` | 14:45 波段巡逻兵，处理 T+3 策略止盈、止损和到期清退。 |
-| `backtest.py` | 生产复盘接口计算：按交易日和策略分组独立 Top1，输出前端复盘统计。 |
+| `engine/backtest.py` | 生产复盘接口计算：按交易日和策略分组输出前端复盘统计，波段策略使用 T+3 口径。 |
 | `strategy_lab.py` | 策略实验室，对不同规则、阈值、过滤条件做历史对比。 |
 | `failure_analysis.py` | 失败样本归因、按策略分组统计、反转弱样本尸检。 |
 | `up_reason_analysis.py` | 统计次日上涨股票，分析技术/情绪因素对上涨的影响。 |
@@ -634,6 +690,7 @@ launch_agents/
 |---|---:|---|---|
 | `com.eudis.quant.backend-api` | 开机/登录常驻 | `run_backend_api.sh` | 后端 API 常驻 |
 | `com.eudis.quant.frontend-dev` | 开机/登录常驻 | `run_frontend_dev.sh` | 前端 Vite 常驻 |
+| `com.eudis.quant.jq-cold-5m` | 01:20 | `run_jq_cold_5m.sh` | 聚宽 5m 冷数据额度任务，按断点和滚动授权窗口继续 |
 | `com.eudis.quant.push-heartbeat` | 09:00 | `run_push_heartbeat.sh` | PushPlus 心跳 |
 | `com.eudis.quant.exit-sentinel` | 09:26 | `run_exit_sentinel.sh` | 早盘哨兵 |
 | `com.eudis.quant.daily-pick-open` | 09:31 | `quant_daily_pick.py update-open` | 兼容开盘回填 |
@@ -800,20 +857,21 @@ npm run build
 
 ## 15. 当前容易踩坑的地方
 
-1. `README.md` 和 `TECHNICAL_DOC.md` 有历史描述，不完全等于当前生产状态。
+1. `README.md` 仍可能有历史描述；当前生产口径以 `TECHNICAL_DOC.md`、`PROJECT_STRUCTURE_GUIDE.md` 和源码为准。
 2. 波段策略不能用 T+1 开盘溢价判断成败，要看 `t3_max_gain_pct` 或哨兵最终关闭结果。
 3. `win_rate` 字段对波段策略是兼容字段，前端不应展示为“收益信号”。
-4. `daily_picks` 允许同一天多策略多记录，不能再假设 `selection_date` 唯一。
+4. `daily_picks` 允许同一天同策略多标的，不能再假设 `selection_date` 或 `(selection_date, strategy_type)` 唯一。
 5. 前端 `5173` 需要 LaunchAgent 常驻，否则临时终端退出后页面会访问不了。
 6. macOS LaunchAgent 默认 PATH 很短，NVM 下的 Node/npm 必须用绝对路径或显式 PATH。
 7. `data/all_kline` 很大，不要在 Git 或文档中逐个列出每只股票文件。
 8. 修改 `predictor.py` 后，需要同步检查：
-   - `backtest.py`
+   - `quant_core/engine/backtest.py`
    - `rebuild_historical_picks.py`
-   - `quant_pushplus_tasks.py`
-   - `exit_sentinel.py`
-   - `swing_patrol.py`
-   - `App.vue`
+   - `quant_core/execution/pushplus_tasks.py`
+   - `quant_core/execution/exit_sentinel.py`
+   - `quant_core/execution/swing_patrol.py`
+   - `quant_dashboard/frontend/src/App.vue`
+   - `quant_dashboard/frontend/src/components/SelectionTable.vue`
 9. 重建历史账本会清空并重写 `daily_picks`，不要在真实前向影子测试阶段随意执行。
 10. Ollama 风控失败时系统会红灯降级，这是正确行为，不应让不可解析 JSON 参与交易判断。
 

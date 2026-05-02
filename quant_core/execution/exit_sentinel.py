@@ -11,12 +11,13 @@ if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from quant_core.data_pipeline.market import fetch_realtime_quote
+from quant_core.data_pipeline.trading_calendar import is_trading_day
 from quant_core.storage import connect, init_db
 from quant_core.execution.pushplus_tasks import send_pushplus
 
 
 BREAKOUT_STRATEGY = "尾盘突破"
-SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪"}
+SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪", "全局动量狙击"}
 SWING_BREAKDOWN_THRESHOLD_PCT = -4.0
 AUCTION_WARNING_LOW_PCT = -5.0
 AUCTION_WARNING_HIGH_PCT = 5.0
@@ -40,6 +41,11 @@ def run_exit_sentinel(
     stage = _normalize_stage(stage)
     target_day = today or date.today().isoformat()
     checked_at = datetime.now().isoformat(timespec="seconds")
+    if not is_trading_day(date.fromisoformat(target_day[:10])):
+        result = {"status": "skipped", "reason": "非交易日不执行开盘哨兵", "stage": stage, "target_date": target_day}
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return result
+
     should_persist = (not dry_run) if persist is None else bool(persist)
     if stage != "final":
         should_persist = False
@@ -472,7 +478,7 @@ def _decode_pick(row: Any) -> dict[str, Any]:
 
 
 def _valid_open_price(quote: dict[str, Any]) -> float:
-    open_price = _safe_float(quote.get("auction_price") or quote.get("open") or quote.get("current_price"))
+    open_price = _safe_float(quote.get("open") or quote.get("auction_price") or quote.get("current_price"))
     if open_price <= 0:
         raise RuntimeError("行情接口未返回有效 09:25/开盘价")
     return open_price

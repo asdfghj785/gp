@@ -43,19 +43,20 @@ from quant_core.strategies.labs.strategy_lab import run_strategy_lab
 from quant_core.up_reason_analysis import analyze_next_day_up_reasons
 from quant_core.validation import validate_one_code, validate_repository
 from routers.v3_dashboard import router as v3_dashboard_router
-from routers.v3_sniper import router as v3_sniper_router
+from routers.v3_sniper import ensure_theme_contract, router as v3_sniper_router, v4_router as v4_sniper_router
 
 
-app = FastAPI(title="离岸量化工作站 API", version="2.0")
+app = FastAPI(title="离岸量化工作站 API", version="4.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173", "http://127.0.0.1:5174", "http://localhost:5174"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 app.include_router(v3_dashboard_router)
 app.include_router(v3_sniper_router)
+app.include_router(v4_sniper_router)
 
 
 class AnalyzeRequest(BaseModel):
@@ -100,6 +101,7 @@ def root() -> dict[str, Any]:
             "overview": "/api/overview",
             "radar_cached": "/api/radar/cache",
             "radar_scan": "/api/radar/scan?limit=10",
+            "v4_sniper_scan": "/api/v4/sniper/scan_today?limit=3&cache_seconds=0",
             "validate": "/api/data/validate?sample=200",
             "history": "/api/data/history/600519?limit=120",
             "daily_picks": "/api/daily-picks",
@@ -278,14 +280,14 @@ def radar_cache() -> dict[str, Any]:
     cached = latest_prediction_snapshot()
     if cached is None:
         return {"id": None, "created_at": "", "model_status": "no_cache", "rows": []}
-    cached["rows"] = cached.get("rows", [])[:10]
-    return cached
+    cached["rows"] = cached.get("rows", [])[:12]
+    return _attach_theme_contract(cached)
 
 
 @app.get("/api/radar/scan")
-def radar_scan(limit: int = Query(default=10, ge=1, le=50)) -> dict[str, Any]:
+def radar_scan(limit: int = Query(default=12, ge=1, le=50)) -> dict[str, Any]:
     try:
-        return scan_market(limit=limit, persist_snapshot=True, cache_prediction=True, async_persist=True)
+        return _attach_theme_contract(scan_market(limit=limit, persist_snapshot=True, cache_prediction=True, async_persist=True))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -296,6 +298,22 @@ def daily_picks(limit: int = Query(default=500, ge=1, le=1000)) -> dict[str, Any
     for row in result.get("rows", []):
         row.setdefault("t3_max_gain_pct", None)
     return result
+
+
+def _attach_theme_contract(payload: dict[str, Any]) -> dict[str, Any]:
+    out = dict(payload)
+    rows = []
+    for row in out.get("rows") or []:
+        try:
+            rows.append(ensure_theme_contract(dict(row)))
+        except Exception:
+            fallback = dict(row)
+            fallback.setdefault("theme_name", "-")
+            fallback.setdefault("theme_source", "")
+            fallback.setdefault("theme_pct_chg_3", None)
+            rows.append(fallback)
+    out["rows"] = rows
+    return out
 
 
 @app.get("/api/backtest/top-pick-open")
@@ -528,13 +546,13 @@ def _normalize_analysis(value: Any) -> dict[str, Any]:
 
 def _jq_minute_fetch_status() -> dict[str, Any]:
     data_dir = MIN_KLINE_DIR / "5m"
-    summary_path = _latest_file(data_dir, "jq_summary_*.json")
+    summary_path = _latest_full_jq_summary_file(data_dir) or _latest_file(data_dir, "jq_summary_*.json")
     summary = _read_json_object(summary_path)
     progress_path = data_dir / "jq_cold_5m_progress.json"
     progress = _read_json_object(progress_path)
     progress_stats = _jq_progress_stats(progress)
     quota = _latest_jq_quota()
-    last_fetch_at = progress_stats.get("latest_updated_at") or _mtime_text(summary_path) or ""
+    last_fetch_at = _mtime_text(summary_path) or progress_stats.get("latest_updated_at") or ""
     stopped_by_quota = bool(summary.get("stopped_by_quota"))
     failed = _safe_int(summary.get("failed"))
     success = _safe_int(summary.get("success"))
@@ -615,6 +633,19 @@ def _ashare_minute_fetch_status() -> dict[str, Any]:
 
 def _latest_file(directory: Path, pattern: str) -> Optional[Path]:
     matches = [path for path in directory.glob(pattern) if path.is_file()]
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
+
+
+def _latest_full_jq_summary_file(directory: Path, min_universe: int = 1000) -> Optional[Path]:
+    matches: list[Path] = []
+    for path in directory.glob("jq_summary_*.json"):
+        if not path.is_file():
+            continue
+        summary = _read_json_object(path)
+        if _safe_int(summary.get("universe")) >= min_universe:
+            matches.append(path)
     if not matches:
         return None
     return max(matches, key=lambda path: path.stat().st_mtime)
