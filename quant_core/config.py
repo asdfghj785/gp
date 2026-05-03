@@ -21,6 +21,14 @@ def _load_local_env() -> None:
 _load_local_env()
 
 
+def _env_float(name: str, default: str) -> float:
+    return float(os.getenv(name, default))
+
+
+def _env_float_floor(name: str, default: str, floor: float) -> float:
+    return max(_env_float(name, default), floor)
+
+
 BASE_DIR = Path(os.getenv("QUANT_BASE_DIR", "/Users/eudis/ths"))
 DATA_DIR = Path(os.getenv("QUANT_DATA_DIR", str(BASE_DIR / "data" / "all_kline")))
 MIN_KLINE_DIR = Path(os.getenv("QUANT_MIN_KLINE_DIR", str(BASE_DIR / "data" / "min_kline")))
@@ -41,11 +49,11 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN", "").strip()
 PROFIT_TARGET_PCT = float(os.getenv("QUANT_PROFIT_TARGET_PCT", "1.00"))
 BREAKOUT_HIGH_TARGET_PCT = float(os.getenv("QUANT_BREAKOUT_HIGH_TARGET_PCT", "2.00"))
-BREAKOUT_MIN_SCORE = float(os.getenv("QUANT_BREAKOUT_MIN_SCORE", os.getenv("QUANT_MIN_COMPOSITE_SCORE", "65.50")))
+BREAKOUT_MIN_SCORE = _env_float_floor("QUANT_BREAKOUT_MIN_SCORE", os.getenv("QUANT_MIN_COMPOSITE_SCORE", "72.00"), 72.00)
 DIPBUY_MIN_SCORE = float(os.getenv("QUANT_DIPBUY_MIN_SCORE", "99.00"))
-REVERSAL_MIN_SCORE = float(os.getenv("QUANT_REVERSAL_MIN_SCORE", "3.00"))
-MAIN_WAVE_MIN_SCORE = float(os.getenv("QUANT_MAIN_WAVE_MIN_SCORE", "3.00"))
-GLOBAL_MIN_SCORE = float(os.getenv("QUANT_GLOBAL_MIN_SCORE", "0.85"))
+REVERSAL_MIN_SCORE = _env_float_floor("QUANT_REVERSAL_MIN_SCORE", "6.00", 6.00)
+MAIN_WAVE_MIN_SCORE = _env_float_floor("QUANT_MAIN_WAVE_MIN_SCORE", "6.60", 6.60)
+GLOBAL_MIN_SCORE = _env_float_floor("QUANT_GLOBAL_MIN_SCORE", "0.90", 0.90)
 MIN_COMPOSITE_SCORE = BREAKOUT_MIN_SCORE
 LATE_PULL_TRAP_THRESHOLD_PCT = float(os.getenv("QUANT_LATE_PULL_TRAP_THRESHOLD_PCT", "4.00"))
 
