@@ -20,7 +20,6 @@ from quant_core.config import (
     LATEST_TOP50_PATH,
     MAIN_WAVE_MIN_SCORE,
     MAIN_WAVE_MODEL_PATH,
-    MIN_KLINE_DIR,
     MODEL_PATH,
     PREMIUM_MODEL_PATH,
     PROFIT_TARGET_PCT,
@@ -175,8 +174,6 @@ DYNAMIC_FLOOR_POSITION = 0.05
 REGULAR_ARMY_STRATEGIES = {BREAKOUT_STRATEGY_TYPE, GLOBAL_MOMENTUM_STRATEGY_TYPE, MAIN_WAVE_STRATEGY_TYPE}
 LIMIT_UP_MAIN_BOARD_BLOCK_PCT = 9.8
 LIMIT_UP_GROWTH_BOARD_BLOCK_PCT = 19.8
-HISTORICAL_SIGNAL_CUTOFF = "14:50:00"
-HISTORICAL_SIGNAL_MIN_TIME = "14:45:00"
 THEME_EMOTION_WEIGHT = 0.18
 THEME_MAIN_WAVE_WEIGHT = 0.05
 THEME_REVERSAL_PENALTY_WEIGHT = 0.30
@@ -453,9 +450,8 @@ def _append_global_momentum_candidates(scored: pd.DataFrame, production_hard_fil
             if not code:
                 errors += len(index_values)
                 continue
-            proxy_rows = historical.loc[index_values]
             try:
-                proba_by_date = _global_probability_history_for_proxy_rows(str(code), tuple(feature_cols), proxy_rows)
+                proba_by_date = _global_probability_history_for_code(str(code), tuple(feature_cols))
             except Exception:
                 proba_by_date = {}
             if not proba_by_date:
@@ -538,11 +534,7 @@ def _normalize_trade_date(value: Any) -> str:
 
 @lru_cache(maxsize=8192)
 def _global_probability_history_for_code(code: str, feature_cols: tuple[str, ...]) -> dict[str, float]:
-    raise RuntimeError("disabled: full-day historical factors leak 15:00 data; use _global_probability_history_for_proxy_rows")
-
-
-def _global_probability_history_for_proxy_rows(code: str, feature_cols: tuple[str, ...], proxy_rows: pd.DataFrame) -> dict[str, float]:
-    """Precompute one stock's global probabilities using 14:50 proxy rows on signal dates."""
+    """Precompute one stock's historical global probabilities from complete 15:00 daily bars."""
     model, error, loaded_feature_cols = _load_global_daily_model()
     if model is None:
         raise RuntimeError(error or "global_momentum_model_unavailable")
@@ -551,33 +543,8 @@ def _global_probability_history_for_proxy_rows(code: str, feature_cols: tuple[st
     if not path.exists():
         return {}
     frame = pd.read_parquet(path).copy()
-    if frame.empty or proxy_rows.empty:
+    if frame.empty:
         return {}
-    date_key = _factor_date_series(frame)
-    frame = frame.assign(_date_key=date_key)
-    proxy_dates = {
-        _normalize_trade_date(row.get("date"))
-        for _, row in proxy_rows.iterrows()
-        if _normalize_trade_date(row.get("date"))
-    }
-    if not proxy_dates:
-        return {}
-    live_rows: list[pd.Series] = []
-    sorted_frame = frame.sort_values("_date_key")
-    for _, row in proxy_rows.iterrows():
-        trade_date = _normalize_trade_date(row.get("date"))
-        if not trade_date:
-            continue
-        previous = sorted_frame[sorted_frame["_date_key"] < trade_date].tail(1)
-        base = previous.iloc[0].copy() if not previous.empty else pd.Series(dtype="object")
-        live = _daily_proxy_row_from_inference_row(row, base)
-        live["_date_key"] = trade_date
-        live_rows.append(live)
-    if not live_rows:
-        return {}
-    frame = frame[~frame["_date_key"].isin(proxy_dates)].copy()
-    frame = pd.concat([frame, pd.DataFrame(live_rows)], ignore_index=True, sort=False)
-    frame = frame.sort_values("_date_key").drop(columns=["_date_key"], errors="ignore")
     factors = generate_daily_factors(frame)
     if factors.empty:
         return {}
@@ -597,43 +564,6 @@ def _factor_date_series(factors: pd.DataFrame) -> pd.Series:
     else:
         dates = pd.to_datetime(factors["date"].astype(str), errors="coerce")
     return dates.dt.strftime("%Y-%m-%d").fillna("")
-
-
-def _daily_proxy_row_from_inference_row(row: pd.Series, base: pd.Series | None = None) -> pd.Series:
-    live = base.copy() if isinstance(base, pd.Series) else pd.Series(dtype="object")
-    code = str(row.get("纯代码") or row.get("code") or "").zfill(6)[-6:]
-    live_date = pd.to_datetime(str(row.get("date") or datetime.now().date().isoformat()), errors="coerce")
-    if pd.isna(live_date):
-        live_date = pd.Timestamp(datetime.now().date())
-    live["date"] = live_date.strftime("%Y%m%d")
-    live["datetime"] = live_date
-    live["symbol"] = code
-    live["code"] = code
-    live["name"] = str(row.get("名称") or row.get("name") or code)
-    live["open"] = _row_first_float(row, ("今开", "open", "最新价", "close"))
-    live["high"] = _row_first_float(row, ("最高", "high", "最新价", "close"))
-    live["low"] = _row_first_float(row, ("最低", "low", "最新价", "close"))
-    live["close"] = _row_first_float(row, ("最新价", "close"))
-    live["volume"] = _row_first_float(row, ("volume",), 0.0)
-    live["amount"] = _row_first_float(row, ("amount",), 0.0)
-    live["pre_close"] = _row_first_float(row, ("昨收", "pre_close"), 0.0)
-    live["pctChg"] = _row_first_float(row, ("涨跌幅", "change_pct", "pctChg"), 0.0)
-    live["change_pct"] = live["pctChg"]
-    live["turn"] = _row_first_float(row, ("换手率", "turnover", "turn"), 0.0)
-    live["turnover"] = live["turn"]
-    live["volume_ratio"] = _row_first_float(row, ("量比", "volume_ratio"), 0.0)
-    return live
-
-
-def _row_first_float(row: pd.Series, keys: tuple[str, ...], default: float = 0.0) -> float:
-    for key in keys:
-        try:
-            parsed = float(row.get(key))
-        except (TypeError, ValueError):
-            continue
-        if np.isfinite(parsed):
-            return parsed
-    return default
 
 
 def _global_momentum_production_hard_filter_mask(df: pd.DataFrame) -> pd.Series:
@@ -1066,7 +996,6 @@ def prepare_historical_playback_candidates(
         }
 
     raw = raw[raw["date"].isin(valid_dates)].copy()
-    cutoff_stats = _apply_historical_signal_cutoff(raw, trading_dates)
     repaired_volume_ratio = _repair_historical_volume_ratio(raw)
     features = build_features(raw)
     features = features[features["date"].isin(trading_dates)].copy()
@@ -1076,15 +1005,14 @@ def prepare_historical_playback_candidates(
             "trading_dates": trading_dates,
             "start_date": trading_dates[0],
             "end_date": trading_dates[-1],
-            "model_status": f"historical_features_empty; 1450_cutoff={cutoff_stats}",
+            "model_status": "historical_features_empty; data_source=stock_daily_1500",
             "repaired_pre_close_count": repaired_pre_close,
             "repaired_volume_ratio_count": repaired_volume_ratio,
-            "cutoff_stats": cutoff_stats,
         }
     features["historical_playback"] = True
     scored, model_status = score_candidates(features, production_global_hard_filter=True)
     scored = _attach_historical_outcomes(scored, raw, valid_dates)
-    model_status = f"{model_status}; 1450_cutoff={cutoff_stats}"
+    model_status = f"{model_status}; data_source=stock_daily_1500"
     return {
         "candidates": scored,
         "trading_dates": trading_dates,
@@ -1093,7 +1021,6 @@ def prepare_historical_playback_candidates(
         "model_status": model_status,
         "repaired_pre_close_count": repaired_pre_close,
         "repaired_volume_ratio_count": repaired_volume_ratio,
-        "cutoff_stats": cutoff_stats,
     }
 
 
@@ -1125,103 +1052,6 @@ def _load_historical_daily_rows(start_date: str, end_date: str) -> pd.DataFrame:
     for col in numeric_cols:
         raw[col] = pd.to_numeric(raw[col], errors="coerce")
     return raw.dropna(subset=["code", "date"]).copy()
-
-
-def _apply_historical_signal_cutoff(df: pd.DataFrame, signal_dates: list[str]) -> dict[str, int]:
-    """Replace signal-day daily bars with the latest 5m state available at or before 14:50."""
-    stats = {"target": 0, "patched": 0, "dropped": 0, "missing_m5": 0}
-    if df.empty or not signal_dates:
-        return stats
-    target_dates = {str(day) for day in signal_dates}
-    target_mask = df["date"].astype(str).isin(target_dates)
-    stats["target"] = int(target_mask.sum())
-    if stats["target"] == 0:
-        return stats
-    for col in ("open", "high", "low", "close", "volume", "amount", "change_pct", "turnover", "volume_ratio"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
-
-    float_shares = _historical_float_share_proxy(df)
-    snapshots: dict[tuple[str, str], dict[str, float | str]] = {}
-    target_codes = sorted(df.loc[target_mask, "code"].dropna().astype(str).str.zfill(6).unique().tolist())
-    for code in target_codes:
-        path = MIN_KLINE_DIR / "5m" / f"{code}.parquet"
-        if not path.exists():
-            path = MIN_KLINE_DIR / f"{code}.parquet"
-        if not path.exists():
-            stats["missing_m5"] += int((target_mask & df["code"].astype(str).eq(code)).sum())
-            continue
-        try:
-            m5 = pd.read_parquet(path, columns=["datetime", "open", "high", "low", "close", "volume", "amount"])
-        except Exception:
-            stats["missing_m5"] += int((target_mask & df["code"].astype(str).eq(code)).sum())
-            continue
-        if m5.empty:
-            stats["missing_m5"] += int((target_mask & df["code"].astype(str).eq(code)).sum())
-            continue
-        dt = pd.to_datetime(m5["datetime"], errors="coerce")
-        m5 = m5.assign(_date=dt.dt.strftime("%Y-%m-%d"), _time=dt.dt.strftime("%H:%M:%S"))
-        m5 = m5[m5["_date"].isin(target_dates) & (m5["_time"] <= HISTORICAL_SIGNAL_CUTOFF)].copy()
-        if m5.empty:
-            stats["missing_m5"] += int((target_mask & df["code"].astype(str).eq(code)).sum())
-            continue
-        for trade_date, day_frame in m5.groupby("_date", sort=False):
-            day_frame = day_frame.sort_values("datetime")
-            latest_time = str(day_frame["_time"].iloc[-1])
-            if latest_time < HISTORICAL_SIGNAL_MIN_TIME:
-                continue
-            snapshots[(str(trade_date), code)] = {
-                "open": float(pd.to_numeric(day_frame["open"], errors="coerce").dropna().iloc[0]),
-                "high": float(pd.to_numeric(day_frame["high"], errors="coerce").max()),
-                "low": float(pd.to_numeric(day_frame["low"], errors="coerce").min()),
-                "close": float(pd.to_numeric(day_frame["close"], errors="coerce").iloc[-1]),
-                "volume": float(pd.to_numeric(day_frame["volume"], errors="coerce").fillna(0).sum()),
-                "amount": float(pd.to_numeric(day_frame["amount"], errors="coerce").fillna(0).sum()),
-                "snapshot_time": latest_time,
-            }
-
-    keep_index = []
-    patched = 0
-    dropped = 0
-    for idx, row in df.loc[target_mask].iterrows():
-        code = str(row.get("code") or "").zfill(6)
-        trade_date = str(row.get("date") or "")
-        snap = snapshots.get((trade_date, code))
-        if not snap:
-            dropped += 1
-            continue
-        keep_index.append(idx)
-        patched += 1
-        for col in ("open", "high", "low", "close", "volume", "amount"):
-            df.at[idx, col] = snap[col]
-        pre_close = float(pd.to_numeric(pd.Series([row.get("pre_close")]), errors="coerce").fillna(0).iloc[0])
-        close = float(snap["close"])
-        df.at[idx, "change_pct"] = (close / pre_close - 1) * 100 if pre_close > 0 else 0.0
-        shares = float_shares.get(idx)
-        if shares and np.isfinite(shares) and shares > 0:
-            df.at[idx, "turnover"] = float(snap["volume"]) / shares * 100.0
-        df.at[idx, "volume_ratio"] = np.nan
-        df.at[idx, "snapshot_time"] = snap["snapshot_time"]
-    if dropped:
-        df.drop(index=[idx for idx in df.loc[target_mask].index if idx not in set(keep_index)], inplace=True)
-    stats["patched"] = patched
-    stats["dropped"] = dropped
-    return stats
-
-
-def _historical_float_share_proxy(df: pd.DataFrame) -> dict[Any, float]:
-    if df.empty or "turnover" not in df.columns:
-        return {}
-    work = df[["code", "date", "volume", "turnover"]].copy()
-    work["_dt"] = pd.to_datetime(work["date"], errors="coerce")
-    work["_volume"] = pd.to_numeric(work["volume"], errors="coerce")
-    work["_turnover"] = pd.to_numeric(work["turnover"], errors="coerce")
-    valid = (work["_volume"] > 0) & (work["_turnover"] > 0)
-    work["_float_shares"] = np.nan
-    work.loc[valid, "_float_shares"] = work.loc[valid, "_volume"] / (work.loc[valid, "_turnover"] / 100.0)
-    work = work.sort_values(["code", "_dt"])
-    proxy = work.groupby("code", sort=False)["_float_shares"].transform(lambda values: values.shift(1).ffill())
-    return {idx: float(value) for idx, value in proxy.dropna().items() if np.isfinite(float(value))}
 
 
 def _repair_historical_pre_close(df: pd.DataFrame) -> int:
