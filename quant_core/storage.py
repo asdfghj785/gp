@@ -124,6 +124,8 @@ def init_db() -> None:
                 open_checked_at TEXT,
                 open_premium REAL,
                 t3_max_gain_pct REAL DEFAULT NULL,
+                suggested_position REAL DEFAULT NULL,
+                tier TEXT,
                 success INTEGER,
                 is_closed INTEGER NOT NULL DEFAULT 0,
                 close_date TEXT,
@@ -161,6 +163,8 @@ def init_db() -> None:
         _ensure_daily_picks_multi_strategy_schema(conn)
         _ensure_column(conn, "daily_picks", "strategy_type", "TEXT NOT NULL DEFAULT '尾盘突破'")
         _ensure_column(conn, "daily_picks", "t3_max_gain_pct", "REAL DEFAULT NULL")
+        _ensure_column(conn, "daily_picks", "suggested_position", "REAL DEFAULT NULL")
+        _ensure_column(conn, "daily_picks", "tier", "TEXT")
         _ensure_column(conn, "daily_picks", "snapshot_time", "TEXT")
         _ensure_column(conn, "daily_picks", "snapshot_price", "REAL")
         _ensure_column(conn, "daily_picks", "snapshot_vol_ratio", "REAL")
@@ -191,6 +195,21 @@ def init_db() -> None:
             UPDATE daily_picks
             SET is_shadow_test = 0
             WHERE json_extract(raw_json, '$.source') = 'historical_production_replay'
+            """
+        )
+        conn.execute(
+            """
+            UPDATE daily_picks
+            SET tier = COALESCE(NULLIF(tier, ''), NULLIF(json_extract(raw_json, '$.winner.selection_tier'), ''), 'base')
+            WHERE tier IS NULL OR tier = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE daily_picks
+            SET suggested_position = json_extract(raw_json, '$.winner.suggested_position')
+            WHERE suggested_position IS NULL
+              AND json_extract(raw_json, '$.winner.suggested_position') IS NOT NULL
             """
         )
         conn.execute("DROP INDEX IF EXISTS uidx_daily_picks_date_strategy")
@@ -712,6 +731,12 @@ def save_daily_pick(pick: dict[str, Any]) -> int:
     init_db()
     strategy_type = pick.get("strategy_type") or (pick.get("raw") or {}).get("winner", {}).get("strategy_type") or "尾盘突破"
     t3_max_gain_pct = pick.get("t3_max_gain_pct")
+    raw_payload = _daily_pick_raw_payload_with_theme_contract(pick)
+    raw_winner = raw_payload.get("winner", {}) if isinstance(raw_payload, dict) else {}
+    suggested_position = pick.get("suggested_position", raw_winner.get("suggested_position") if isinstance(raw_winner, dict) else None)
+    tier = pick.get("tier") or pick.get("selection_tier")
+    if not tier and isinstance(raw_winner, dict):
+        tier = raw_winner.get("selection_tier")
     selected_at = str(pick["selected_at"])
     snapshot_time = pick.get("snapshot_time") or (selected_at.split("T", 1)[1] if "T" in selected_at else selected_at)
     snapshot_price = pick.get("snapshot_price", pick.get("selection_price"))
@@ -724,9 +749,9 @@ def save_daily_pick(pick: dict[str, Any]) -> int:
             INSERT INTO daily_picks (
                 selection_date, target_date, selected_at, code, name, strategy_type, win_rate,
                 selection_price, selection_change, snapshot_time, snapshot_price, snapshot_vol_ratio,
-                is_shadow_test, model_status, status, t3_max_gain_pct, raw_json
+                is_shadow_test, model_status, status, t3_max_gain_pct, suggested_position, tier, raw_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(selection_date, strategy_type, code) DO NOTHING
             """,
             (
@@ -746,10 +771,60 @@ def save_daily_pick(pick: dict[str, Any]) -> int:
                 pick.get("model_status"),
                 pick.get("status", "pending_open"),
                 t3_max_gain_pct,
-                json.dumps(pick.get("raw", pick), ensure_ascii=False),
+                suggested_position,
+                tier,
+                json.dumps(raw_payload, ensure_ascii=False),
             ),
         )
         return int(cursor.lastrowid or 0) if cursor.rowcount else 0
+
+
+def _daily_pick_raw_payload_with_theme_contract(pick: dict[str, Any]) -> dict[str, Any]:
+    raw = dict(pick.get("raw") or pick)
+    winner = raw.get("winner") if isinstance(raw.get("winner"), dict) else {}
+    winner = dict(winner)
+    raw["winner"] = winner
+
+    core_theme = _theme_text(
+        pick.get("core_theme"),
+        pick.get("theme_name"),
+        winner.get("core_theme"),
+        winner.get("theme_name"),
+    )
+    momentum = _optional_float(
+        pick.get("theme_momentum_3d")
+        if pick.get("theme_momentum_3d") is not None
+        else pick.get("theme_momentum")
+        if pick.get("theme_momentum") is not None
+        else pick.get("theme_pct_chg_3")
+        if pick.get("theme_pct_chg_3") is not None
+        else winner.get("theme_momentum_3d")
+        if winner.get("theme_momentum_3d") is not None
+        else winner.get("theme_momentum")
+        if winner.get("theme_momentum") is not None
+        else winner.get("theme_pct_chg_3")
+    )
+    if momentum is None:
+        momentum = 0.0
+
+    raw["core_theme"] = core_theme
+    raw["theme_momentum_3d"] = momentum
+    winner["core_theme"] = core_theme
+    winner["theme_name"] = _theme_text(winner.get("theme_name"), core_theme)
+    winner["theme_momentum_3d"] = momentum
+    winner["theme_momentum"] = _optional_float(winner.get("theme_momentum")) if winner.get("theme_momentum") is not None else momentum
+    winner["theme_pct_chg_3"] = _optional_float(winner.get("theme_pct_chg_3")) if winner.get("theme_pct_chg_3") is not None else momentum
+    return raw
+
+
+def _theme_text(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"nan", "none", "-"}:
+            return text
+    return "-"
 
 
 def clear_daily_picks() -> int:
@@ -1029,11 +1104,11 @@ def latest_daily_picks(limit: int = 10, shadow_only: bool = False) -> list[dict[
     with connect() as conn:
         if shadow_only:
             rows = conn.execute(
-                "SELECT * FROM daily_picks WHERE COALESCE(is_shadow_test, 0) = 1 ORDER BY selection_date DESC LIMIT ?",
+                "SELECT * FROM daily_picks WHERE COALESCE(is_shadow_test, 0) = 1 ORDER BY selection_date DESC, id ASC LIMIT ?",
                 (limit,),
             ).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM daily_picks ORDER BY selection_date DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute("SELECT * FROM daily_picks ORDER BY selection_date DESC, id ASC LIMIT ?", (limit,)).fetchall()
     return [_decode_daily_pick(row) for row in rows if row]
 
 
@@ -1062,12 +1137,31 @@ def _attach_pick_display_fields(item: dict[str, Any]) -> None:
     item["sort_score"] = _optional_float(winner.get("sort_score"))
     item["score_threshold"] = _optional_float(winner.get("score_threshold"))
     item["score_floor"] = _optional_float(winner.get("score_floor"))
-    item["selection_tier"] = winner.get("selection_tier") or "base"
+    item["selection_tier"] = item.get("tier") or winner.get("selection_tier") or "base"
+    item["tier"] = item["selection_tier"]
     item["risk_warning"] = winner.get("risk_warning") or ""
     item["position_probability"] = _optional_float(winner.get("position_probability"))
-    item["suggested_position"] = _optional_float(winner.get("suggested_position"))
+    item["suggested_position"] = _optional_float(item.get("suggested_position"))
+    if item["suggested_position"] is None:
+        item["suggested_position"] = _optional_float(winner.get("suggested_position"))
     item["sentiment_bonus"] = _optional_float(winner.get("sentiment_bonus"))
     item["market_gate_mode"] = winner.get("market_gate_mode") or ""
+    item["core_theme"] = _theme_text(item.get("core_theme"), raw.get("core_theme"), winner.get("core_theme"), winner.get("theme_name"))
+    theme_momentum = _optional_float(
+        item.get("theme_momentum_3d")
+        if item.get("theme_momentum_3d") is not None
+        else raw.get("theme_momentum_3d")
+        if raw.get("theme_momentum_3d") is not None
+        else winner.get("theme_momentum_3d")
+        if winner.get("theme_momentum_3d") is not None
+        else winner.get("theme_momentum")
+        if winner.get("theme_momentum") is not None
+        else winner.get("theme_pct_chg_3")
+    )
+    item["theme_momentum_3d"] = 0.0 if theme_momentum is None else theme_momentum
+    item["theme_name"] = item["core_theme"]
+    item["theme_pct_chg_3"] = item["theme_momentum_3d"]
+    item["theme_momentum"] = item["theme_momentum_3d"]
 
     actual = _optional_float(item.get("open_premium"))
     expected = item.get("expected_premium")
@@ -1161,6 +1255,8 @@ def _ensure_daily_picks_multi_strategy_schema(conn: sqlite3.Connection) -> None:
             raw_json TEXT NOT NULL,
             strategy_type TEXT NOT NULL DEFAULT '尾盘突破',
             t3_max_gain_pct REAL DEFAULT NULL,
+            suggested_position REAL DEFAULT NULL,
+            tier TEXT,
             is_closed INTEGER NOT NULL DEFAULT 0,
             close_date TEXT,
             close_price REAL,

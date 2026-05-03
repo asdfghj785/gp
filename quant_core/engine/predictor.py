@@ -2164,13 +2164,23 @@ def attach_pick_theme_fields(item: dict[str, Any], source: Any | None = None) ->
     )
     if not theme_name and code:
         theme_name, theme_source = _theme_name_for_code(code)
-    theme_pct = _optional_theme_float(
-        _source_get(source_obj, "theme_pct_chg_3"),
-        out.get("theme_pct_chg_3"),
-        out.get("theme_momentum"),
+    theme_pct_values = [
         winner.get("theme_pct_chg_3"),
+        winner.get("theme_momentum_3d"),
         winner.get("theme_momentum"),
-    )
+        raw.get("theme_momentum_3d") if isinstance(raw, dict) else None,
+        raw.get("theme_pct_chg_3") if isinstance(raw, dict) else None,
+    ]
+    if source is not None:
+        theme_pct_values = [
+            _source_get(source_obj, "theme_pct_chg_3"),
+            _source_get(source_obj, "theme_momentum_3d"),
+            _source_get(source_obj, "theme_momentum"),
+            *theme_pct_values,
+        ]
+    if _safe_text(out.get("core_theme")) or _safe_text(out.get("theme_name")):
+        theme_pct_values.extend([out.get("theme_pct_chg_3"), out.get("theme_momentum_3d"), out.get("theme_momentum")])
+    theme_pct = _optional_theme_float(*theme_pct_values)
     if theme_pct is None and code:
         theme_pct = _latest_theme_pct_chg_3_for_code(code, trade_date)
     theme_pct = round(float(theme_pct), 6) if theme_pct is not None else 0.0
@@ -2182,6 +2192,7 @@ def attach_pick_theme_fields(item: dict[str, Any], source: Any | None = None) ->
     out["theme_pct_chg_3"] = theme_pct
     out["core_theme"] = "" if theme_name == "-" else theme_name
     out["theme_momentum"] = theme_pct
+    out["theme_momentum_3d"] = theme_pct
     if isinstance(raw, dict) and isinstance(winner, dict):
         if not _safe_text(winner.get("theme_name")):
             winner["theme_name"] = theme_name
@@ -2193,6 +2204,8 @@ def attach_pick_theme_fields(item: dict[str, Any], source: Any | None = None) ->
             winner["core_theme"] = out["core_theme"]
         if _optional_theme_float(winner.get("theme_momentum")) is None:
             winner["theme_momentum"] = theme_pct
+        if _optional_theme_float(winner.get("theme_momentum_3d")) is None:
+            winner["theme_momentum_3d"] = theme_pct
     return out
 
 

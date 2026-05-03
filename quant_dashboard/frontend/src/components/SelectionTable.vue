@@ -47,12 +47,12 @@
           </div>
         </template>
       </el-table-column>
-      <el-table-column prop="theme_name" label="核心主题" min-width="130">
+      <el-table-column prop="core_theme" label="核心主题" min-width="130">
         <template #default="{ row }">
           <span class="theme-name">{{ themeName(row) }}</span>
         </template>
       </el-table-column>
-      <el-table-column prop="theme_pct_chg_3" label="主题3日动量" align="right" min-width="122">
+      <el-table-column prop="theme_momentum" label="主题3日动量" align="right" min-width="122">
         <template #default="{ row }">
           <strong :class="themeMomentumClass(themeMomentum(row))">
             {{ themeMomentumText(themeMomentum(row)) }}
@@ -274,8 +274,9 @@ const themeMomentumClass = (value) => {
   return pctValue > 3 ? 'theme-hot' : numberClass(pctValue)
 }
 const rawWinner = (row) => row?.raw?.winner || {}
-const themeName = (row) => row?.theme_name || rawWinner(row)?.theme_name || '-'
-const themeMomentum = (row) => row?.theme_pct_chg_3 ?? rawWinner(row)?.theme_pct_chg_3 ?? null
+const themeName = (row) => row?.core_theme || row?.theme_name || rawWinner(row)?.core_theme || rawWinner(row)?.theme_name || '-'
+const themeMomentum = (row) =>
+  row?.theme_momentum ?? row?.theme_pct_chg_3 ?? rawWinner(row)?.theme_momentum ?? rawWinner(row)?.theme_pct_chg_3 ?? null
 const suggestedPosition = (row) => toNum(row?.suggested_position ?? rawWinner(row)?.suggested_position)
 const positionText = (row) => {
   const value = suggestedPosition(row)
