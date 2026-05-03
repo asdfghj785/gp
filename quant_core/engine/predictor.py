@@ -443,24 +443,30 @@ def _append_global_momentum_candidates(scored: pd.DataFrame, production_hard_fil
 
     historical_mask = _historical_playback_mask(scored)
     if historical_mask.any():
-        historical = scored.loc[historical_mask].copy()
-        historical_codes = _normalized_code_series(historical)
-        historical_dates = historical["date"].map(_normalize_trade_date) if "date" in historical.columns else pd.Series("", index=historical.index)
-        for code, index_values in historical_codes.groupby(historical_codes).groups.items():
-            if not code:
-                errors += len(index_values)
-                continue
-            try:
-                proba_by_date = _global_probability_history_for_code(str(code), tuple(feature_cols))
-            except Exception:
-                proba_by_date = {}
-            if not proba_by_date:
-                errors += len(index_values)
-                continue
-            matched = historical_dates.loc[index_values].map(proba_by_date)
-            valid = pd.to_numeric(matched, errors="coerce").dropna()
+        if "historical_global_probability" in scored.columns:
+            precomputed = pd.to_numeric(scored.loc[historical_mask, "historical_global_probability"], errors="coerce")
+            valid = precomputed.dropna()
             probabilities.update({idx: float(value) for idx, value in valid.items()})
-            errors += int(len(index_values) - len(valid))
+            errors += int(historical_mask.sum() - len(valid))
+        else:
+            historical = scored.loc[historical_mask].copy()
+            historical_codes = _normalized_code_series(historical)
+            historical_dates = historical["date"].map(_normalize_trade_date) if "date" in historical.columns else pd.Series("", index=historical.index)
+            for code, index_values in historical_codes.groupby(historical_codes).groups.items():
+                if not code:
+                    errors += len(index_values)
+                    continue
+                try:
+                    proba_by_date = _global_probability_history_for_code(str(code), tuple(feature_cols))
+                except Exception:
+                    proba_by_date = {}
+                if not proba_by_date:
+                    errors += len(index_values)
+                    continue
+                matched = historical_dates.loc[index_values].map(proba_by_date)
+                valid = pd.to_numeric(matched, errors="coerce").dropna()
+                probabilities.update({idx: float(value) for idx, value in valid.items()})
+                errors += int(len(index_values) - len(valid))
 
     live_rows = scored.loc[~historical_mask]
     for idx, row in live_rows.iterrows():
@@ -999,6 +1005,7 @@ def prepare_historical_playback_candidates(
     repaired_volume_ratio = _repair_historical_volume_ratio(raw)
     features = build_features(raw)
     features = features[features["date"].isin(trading_dates)].copy()
+    features, global_batch_status = _attach_historical_global_probabilities(features, raw)
     if features.empty:
         return {
             "candidates": pd.DataFrame(),
@@ -1012,7 +1019,7 @@ def prepare_historical_playback_candidates(
     features["historical_playback"] = True
     scored, model_status = score_candidates(features, production_global_hard_filter=True)
     scored = _attach_historical_outcomes(scored, raw, valid_dates)
-    model_status = f"{model_status}; data_source=stock_daily_1500"
+    model_status = f"{model_status}; {global_batch_status}; data_source=stock_daily_1500"
     return {
         "candidates": scored,
         "trading_dates": trading_dates,
@@ -1052,6 +1059,42 @@ def _load_historical_daily_rows(start_date: str, end_date: str) -> pd.DataFrame:
     for col in numeric_cols:
         raw[col] = pd.to_numeric(raw[col], errors="coerce")
     return raw.dropna(subset=["code", "date"]).copy()
+
+
+def _attach_historical_global_probabilities(features: pd.DataFrame, raw: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    if features.empty or raw.empty:
+        return features, "historical_global_batch_empty"
+    model, error, feature_cols = _load_global_daily_model()
+    if model is None:
+        return features, error or "historical_global_batch_model_unavailable"
+    try:
+        factors = generate_daily_factors(raw)
+        if factors.empty:
+            return features, "historical_global_batch_no_factors"
+        aligned = _align_global_daily_features(factors, list(feature_cols))
+        probabilities = model.predict_proba(aligned)[:, 1]
+    except Exception as exc:
+        return features, f"historical_global_batch_failed:{exc}"
+
+    factor_dates = _factor_date_series(factors)
+    factor_codes = _normalized_code_series(factors)
+    probability_frame = pd.DataFrame(
+        {
+            "_global_date": factor_dates.astype(str),
+            "_global_code": factor_codes.astype(str).str.zfill(6).str[-6:],
+            "historical_global_probability": probabilities,
+        }
+    )
+    probability_frame = probability_frame.dropna(subset=["_global_date", "_global_code"])
+    probability_frame = probability_frame.drop_duplicates(["_global_date", "_global_code"], keep="last")
+
+    out = features.copy()
+    out["_global_date"] = out["date"].astype(str)
+    out["_global_code"] = out["纯代码"].astype(str).str.zfill(6).str[-6:]
+    out = out.merge(probability_frame, on=["_global_date", "_global_code"], how="left")
+    matched = int(pd.to_numeric(out["historical_global_probability"], errors="coerce").notna().sum())
+    out = out.drop(columns=["_global_date", "_global_code"], errors="ignore")
+    return out, f"historical_global_batch_ready:{matched}/{len(out)}"
 
 
 def _repair_historical_pre_close(df: pd.DataFrame) -> int:

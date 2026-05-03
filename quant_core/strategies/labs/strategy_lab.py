@@ -16,7 +16,13 @@ from quant_core.engine.backtest import (
 )
 from quant_core.cache_utils import read_dataframe_cache, write_dataframe_cache
 from quant_core.config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE, REVERSAL_MIN_SCORE
-from quant_core.engine.predictor import PROFIT_TARGET_PCT, apply_production_filters, build_features, score_candidates
+from quant_core.engine.predictor import (
+    PROFIT_TARGET_PCT,
+    _attach_historical_global_probabilities,
+    apply_production_filters,
+    build_features,
+    score_candidates,
+)
 from quant_core.storage import init_db
 
 
@@ -116,7 +122,10 @@ def prepare_evaluated_candidates(months: int, refresh: bool = False) -> dict[str
     raw = raw[raw["date"].isin(all_trading_dates)].copy()
     candidates = build_features(raw)
     candidates = candidates[candidates["date"].isin(trading_dates)].copy()
+    candidates, global_batch_status = _attach_historical_global_probabilities(candidates, raw)
+    candidates["historical_playback"] = True
     candidates, model_status = score_candidates(candidates)
+    model_status = f"{model_status}; {global_batch_status}; data_source=stock_daily_1500"
     candidates = _attach_next_open(candidates, raw, trading_dates)
     evaluated = candidates[np.isfinite(candidates["open_premium"])].copy()
     result = {
