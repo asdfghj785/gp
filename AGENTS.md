@@ -1,6 +1,6 @@
 # AGENTS.md - A 股量化工作站开发上下文
 
-更新时间：2026-05-03
+更新时间：2026-05-04
 
 本文件给后续接手本项目的 Codex/Agent 使用。进入项目后先读本文件，再读 `TECHNICAL_DOC.md`、`PROJECT_STRUCTURE_GUIDE.md` 和相关源码。项目根目录固定为 `/Users/eudis/ths`。
 
@@ -8,19 +8,23 @@
 
 这是运行在本地 macOS/M4 上的 A 股量化工作站。核心目标是采集本地日线/分钟线/实时快照数据，训练 XGBoost 结构化模型，执行 14:50 多策略影子出票，使用 PushPlus 推送交易指令，并通过 FastAPI + Vue 深色金融终端展示结果。
 
-当前系统版本：V4.4 "Theme Alpha"。
+当前系统版本：V5.6 "5m Sentinel / Theme Alpha / Mac Sniper"。
 
-当前系统同时包含三条主线：
+当前系统同时包含五条主线：
 
-1. 生产影子测试主线：`quant_core/engine/predictor.py` 驱动四大核心军团独立分档出票，每个策略基准线最多 Top 3；若无达标票，则按当日合规池 99 分位动态下探 1 只并提示风偏。
-2. V4.4 Theme Alpha 全局日线模型主线：`quant_dashboard/backend/routers/v3_sniper.py` 同时挂载 `/api/v4/sniper/*`，使用带 `theme_*` 因子的全市场 XGBoost 分类模型，实时拼接当日腾讯行情后输出高置信候选。
-3. 09:15 实时巡逻兵主线：`live_sentinel.py` 从上一交易日 14:50 标的重建 `shadow_ledger.json`，盘中执行止损、追踪止盈、分钟级爆量滞涨和五档盘口委比反转预警。
+1. 生产影子测试主线：`quant_core/engine/predictor.py` 驱动多策略独立分档出票。当前生产启用 `全局动量狙击` 与 `尾盘突破`，每个启用策略只取 Top1，总输出上限 2；`右侧主升浪` 与 `中线超跌反转` 保留代码和模型但生产暂停。
+2. V5.6 5m Sentinel 离线回放主线：`scripts/backtest/simulate_sentinel_5m.py` 使用前复权冷数据与本地热数据合并回放，验证非对称日内风控、追踪止盈、尾盘结构止损与 T+3 兜底。
+3. Theme Alpha 全局日线模型主线：`quant_dashboard/backend/routers/v3_sniper.py` 同时挂载 `/api/v4/sniper/*`，使用带 `theme_*` 因子的全市场 XGBoost 分类模型，实时拼接当日腾讯行情后输出高置信候选。
+4. 09:15 实时巡逻兵主线：`live_sentinel.py` 从上一交易日 14:50 标的重建 `shadow_ledger.json`，盘中执行止损、追踪止盈、分钟级爆量滞涨和五档盘口委比反转预警。
+5. V5.0 资金池与 Mac Sniper 主线：`data/shadow_account.json` 记录影子资金池、锁定持仓和券商确认流水；`data/sniper_status.json` 是前端保险匣、14:50 总线和巡逻兵共享的物理外挂开关。
 
 重要原则：
 
 - LLM/Ollama 只做舆情、公告、新闻风控，不直接预测价格，也不覆盖 XGBoost 排序。
 - 实盘影子测试买入锚点是 14:50 的 `snapshot_price` 与 `snapshot_time`，这些字段必须不可篡改。
-- 生产出票必须保留 V4.4 风控契约：`selection_tier`、`risk_warning`、`dynamic_floor`/`score_floor`、`suggested_position` 必须随 `raw_json.winner` 落库，并在 PushPlus 与前端展示。
+- 生产出票必须保留 V5.6 风控契约：`selection_tier`、`risk_warning`、`dynamic_floor`/`score_floor`、`suggested_position`、`core_theme`、`theme_momentum_3d` 必须随 `raw_json.winner` 落库，并在 PushPlus、复盘 API 与前端展示。
+- 影子账本默认使用 `/api/daily-picks?view=strategy_top1`：按 `selection_date + strategy_type` 折叠，同一天允许 `全局动量狙击` 与 `尾盘突破` 各一只；`view=all` 只用于审计原始候选。
+- 历史复盘和历史账本重建使用 `stock_daily` 的 15:00 完整日线底座；5m Sentinel 回放只用于卖出引擎评估，不恢复历史 14:50 截面截断代理。
 - 禁止把 `.env`、PushPlus token、聚宽账号密码等密钥写入文档、日志或提交。
 - 禁止新增或恢复 AkShare/东方财富 行情与板块数据接入；实时快照优先使用腾讯，行业/板块日线只走 mpquant/Ashare `get_price` + 本地缓存。
 - 可以存在脏工作区。不要回滚或覆盖用户已有修改，除非用户明确要求。
@@ -66,7 +70,10 @@
 │   ├── sector_kline/              # 一级行业指数日线 Parquet，Theme Pipeline 兜底引擎
 │   ├── concept_stock_map.json     # 个股 -> 主概念映射
 │   ├── core_db/quant_workstation.sqlite3
-│   └── intraday/price_1430.json   # 14:30 快照
+│   ├── intraday/price_1430.json   # 14:30 快照
+│   ├── strategy_cache/            # 复盘/策略分析缓存
+│   ├── shadow_account.json        # V5.0 影子资金池
+│   └── sniper_status.json         # Mac Sniper 保险匣共享状态
 ├── models/                        # XGBoost 模型与 meta
 ├── live_sentinel.py                # 实时巡逻兵入口
 ├── shadow_ledger.json              # 实时巡逻兵账本
@@ -92,11 +99,11 @@
 
 关键策略门槛默认值：
 
-- `QUANT_BREAKOUT_MIN_SCORE=65.50`
+- `QUANT_BREAKOUT_MIN_SCORE=72.00`
 - `QUANT_DIPBUY_MIN_SCORE=99.00`，首阴低吸保留但生产冻结
-- `QUANT_REVERSAL_MIN_SCORE=3.00`
-- `QUANT_MAIN_WAVE_MIN_SCORE=3.00`
-- `QUANT_GLOBAL_MIN_SCORE=0.85`
+- `QUANT_REVERSAL_MIN_SCORE=6.00`
+- `QUANT_MAIN_WAVE_MIN_SCORE=6.60`
+- `QUANT_GLOBAL_MIN_SCORE=0.90`
 
 推送配置：
 
@@ -116,11 +123,12 @@ Ollama：
 
 - 主库是 `data/all_kline/*_daily.parquet`。
 - 常见字段：`symbol,date,open,high,low,close,volume,amount,turn,pctChg,MA5,MA10,MA20,量比,MACD_DIF` 等。
-- V4.4 全局模型会读取本地历史日线尾部约 80 天，再拼接今天实时行情行。
+- Theme Alpha 全局模型会读取本地历史日线尾部约 80 天，再拼接今天实时行情行；历史复盘批量推演使用 `stock_daily_1500` 完整日线行。
 
 分钟线：
 
 - 路径：`data/min_kline/5m/{code}.parquet`。
+- V5.6 5m Sentinel 回放优先读取前复权冷数据目录 `/Users/eudis/5min/organized_5min_pre_adj`，再合并项目热数据 `data/min_kline/5m/{code}.parquet`；同一 `datetime` 冷数据优先，热数据补 2026-04-27 之后每日归档缺口。
 - 冷数据：聚宽，定时入口 `scripts/shell/run_jq_cold_5m.sh`，主脚本 `scripts/data_pipeline/batch_fetch_historical_min.py`；`scripts/data_pipeline/batch_fetch_jq_history.py` 为旧手工入口。
 - 聚宽账号历史权限窗口会随自然日滚动，冷数据脚本会用 `JQ_ROLLING_START_LOOKBACK_DAYS=465` 自动把请求起点夹到当前允许窗口内，避免固定早期日期越界。
 - 聚宽断点文件是 `data/min_kline/5m/jq_cold_5m_progress.json`，汇总文件是 `data/min_kline/5m/jq_summary_*.json`。
@@ -220,13 +228,24 @@ SQLite 主库：`/Users/eudis/ths/data/core_db/quant_workstation.sqlite3`。
 - Theme Pipeline：细分概念优先，一级行业兜底，无数据保持 NaN。
 - 实盘硬过滤：只保留 `00/60` 主板，剔除 ST / *ST，剔除 14:50 实时涨幅 `>= 9.0%` 的涨停或准涨停票。
 
-### V4.4 分档与仓位
+### V5.6 分档与仓位
 
 - `ABSOLUTE_BOTTOM_PROBA=0.55` 是全策略通用绝对安全底线，禁止恢复人工 `_FLOOR_SCORE` 静态配置。
-- `select_strategy_top_picks()` 对每个策略先找 `score >= MIN_SCORE` 的 `base` 档，最多取 Top 3。
+- 当前生产启用策略来自 `PRODUCTION_STRATEGY_TYPES - PAUSED_STRATEGY_TYPES`，默认只输出 `全局动量狙击` 与 `尾盘突破`。
+- `select_strategy_top_picks()` 对每个启用策略先找 `score >= MIN_SCORE` 的 `base` 档，每个策略最多取 Top1；总输出上限由 `PRODUCTION_TOTAL_PICK_LIMIT=2` 控制。
 - 若 `base` 档为空，计算 `dynamic_floor=max(ABSOLUTE_BOTTOM_PROBA, legal_pool['score'].quantile(0.99))`，只有 Top 1 分数达到动态底线才以 `selection_tier=dynamic_floor` 出票。
 - `base` 档仓位使用 Half-Kelly，限制在 10% 到 30%；`dynamic_floor` 档固定 5% 试错轻仓。
 - 终端日志必须打印 `[AdaptiveFloor] ... dynamic_floor=...`，便于复盘当天动态及格线。
+
+### V5.6 5m Sentinel 卖出引擎
+
+- 脚本：`scripts/backtest/simulate_sentinel_5m.py`。
+- 数据：前复权冷数据 `/Users/eudis/5min/organized_5min_pre_adj` + 本地热数据 `data/min_kline/5m` 合并；历史未覆盖 T+3 时可用 `daily_picks` 已结算日线结果兜底。
+- 口径：买入样本按 `selection_date + strategy_type` 折叠为每策略 Top1，并过滤 `PAUSED_STRATEGY_TYPES`。
+- 日内防爆止损：正规军 `-6%`，敢死队/狙击/突破 `-4%`。
+- 动态追踪止盈：最高浮盈达到 `+4%` 激活，随后从最高价回撤 `-2%` 触发。
+- 尾盘结构止损：14:50/14:55，正规军收盘跌破 `-3%`，敢死队收盘跌破 `-1.5%`。
+- 强制离场：T+3 最后一根 5m bar 平仓；输出缓存写入 `data/strategy_cache/sentinel_5m_backtest_latest.json`。
 
 ### 首阴低吸
 
@@ -235,7 +254,7 @@ SQLite 主库：`/Users/eudis/ths/data/core_db/quant_workstation.sqlite3`。
 - 当前默认 `QUANT_DIPBUY_MIN_SCORE=99.00`，等价生产冻结。
 - 保留代码、模型和可视化兼容，不要随意删除。
 
-## V4.4 Theme Alpha 全局日线 XGBoost 雷达
+## Theme Alpha 全局日线 XGBoost 雷达
 
 核心模块：
 
@@ -300,9 +319,9 @@ FastAPI 实盘推理入口：
 - `09:21` 撤单关闭后竞价审计。
 - `09:25` 终极开盘哨兵，只此阶段允许回填 `open_price`。
 - `14:30` 保存全市场快照。
-- `14:45` 波段巡逻兵，处理 T+3 策略止盈/止损/清退。
-- `14:50` 四大核心军团出票与 PushPlus 推送。
-- `14:50` V4.4 全局动量狙击雷达锁定。
+- `15:10` T+3 收盘结算器，按目标交易日 15:00 close 闭环波段策略。
+- `14:50` 启用策略分策略 Top1 出票与 PushPlus 推送。
+- `14:50` 全局动量狙击雷达锁定。
 - `15:05` 盘后日线同步。
 - `15:15` Ashare/腾讯 5m 热数据归档。
 
@@ -340,11 +359,12 @@ FastAPI 实盘推理入口：
 
 - 每天 09:15 启动，默认用上一交易日 14:50 的 `daily_picks` 重建监控列表。
 - 09:15 到 11:30、13:00 到 15:00 每 30 秒扫描；午休不扫描；15:00 停止。
-- 开仓硬止损：`current_price <= buy_price * 0.97`，推送【初始止损报警】并移除持仓。
-- 动态追踪止盈：最高价曾达到 `buy_price * 1.05` 后，若 `current_price <= highest_price * 0.97`，推送【追踪止盈触发】并移除持仓。
-- T+3 超时：保持原到期清仓逻辑。
+- 日内防爆止损：正规军 `-6%`，敢死队/狙击/突破 `-4%`，只防暴雷，不处理普通分时洗盘。
+- 动态追踪止盈：最高浮盈达到 `+4%` 后激活，若当前价从最高点回撤 `2%`，推送【追踪止盈触发】并移除持仓。
+- 尾盘结构止损：14:50 到 15:00，正规军跌破 `-3%`、敢死队跌破 `-1.5%`，推送【尾盘破位卖出】并移除持仓。
+- T+3 超时：保持到期清仓逻辑。
 - 分钟级爆量滞涨和五档盘口委比 `<= -80` 只触发 PushPlus 风险预警并写入账本，不直接移除持仓。
-- 止损、追踪止盈、T+3 平仓后必须调用 `mark_daily_pick_closed()`，把 `close_price`、`close_return_pct` 和 `close_signal` 同步回 `daily_picks`。
+- 止损、追踪止盈、尾盘破位、T+3 平仓后必须调用 `mark_daily_pick_closed()`，把 `close_price`、`close_return_pct` 和 `close_signal` 同步回 `daily_picks`。
 
 ## FastAPI 后端
 
@@ -369,7 +389,7 @@ LaunchAgent 启动脚本：
 - `GET /api/overview`
 - `GET /api/radar/cache`
 - `GET /api/radar/scan?limit=10`
-- `GET /api/daily-picks`
+- `GET /api/daily-picks?view=strategy_top1`：默认真实影子账本，每个启用策略 Top1；`view=all` 仅审计原始记录。
 - `GET /api/data/market-sync/latest`
 - `GET /api/data/history/{code}`
 - `GET /api/data/history_min/{code}?period=5`
@@ -406,7 +426,7 @@ npm run build
 
 核心文件：
 
-- `src/App.vue`：V4.4 Theme Alpha 主工作站入口，Dashboard 统一承载四大军团。
+- `src/App.vue`：V5.6 5m Sentinel / Theme Alpha / Mac Sniper 主工作站入口，Dashboard 统一承载策略卡片、真实影子账本、资金池和物理外挂保险匣；暂停策略卡片灰显但不删除。
 - `src/components/Sidebar.vue`：左侧导航。
 - `src/components/StatsHeader.vue`：顶部状态条。
 - `src/components/SelectionTable.vue`：影子账本/策略表格。
@@ -495,7 +515,7 @@ cd /Users/eudis/ths
 python3 -m quant_core.execution.exit_sentinel --dry-run
 ```
 
-波段巡逻干跑：
+T+3 收盘结算干跑：
 
 ```bash
 cd /Users/eudis/ths

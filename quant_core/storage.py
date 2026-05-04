@@ -961,14 +961,13 @@ def update_daily_pick_t3_gain(
             "t3_max_gain_pct": float(t3_max_gain_pct),
             "checked_at": checked_at or datetime.now().isoformat(timespec="seconds"),
         }
-        success = 1 if float(t3_max_gain_pct) > 0 else 0
         conn.execute(
             """
             UPDATE daily_picks
-            SET t3_max_gain_pct = ?, success = ?, status = 't3_checked', raw_json = ?
+            SET t3_max_gain_pct = ?, status = 't3_checked', raw_json = ?
             WHERE id = ?
             """,
-            (float(t3_max_gain_pct), success, json.dumps(raw, ensure_ascii=False), int(item["id"])),
+            (float(t3_max_gain_pct), json.dumps(raw, ensure_ascii=False), int(item["id"])),
         )
     return get_daily_pick(selection_date, strategy_type=strategy_type or item.get("strategy_type"), code=code or item.get("code"), pick_id=int(item["id"]))
 
@@ -1036,7 +1035,7 @@ def open_position_picks(today: str | None = None) -> list[dict[str, Any]]:
                     )
                     OR (
                         strategy_type IN ('中线超跌反转', '右侧主升浪', '全局动量狙击')
-                        AND target_date >= ?
+                        AND target_date <= ?
                     )
                   )
             ORDER BY selection_date ASC

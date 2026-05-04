@@ -18,7 +18,6 @@ from quant_core.execution.pushplus_tasks import send_pushplus
 
 BREAKOUT_STRATEGY = "尾盘突破"
 SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪", "全局动量狙击"}
-SWING_BREAKDOWN_THRESHOLD_PCT = -4.0
 AUCTION_WARNING_LOW_PCT = -5.0
 AUCTION_WARNING_HIGH_PCT = 5.0
 STAGE_LABELS = {
@@ -177,29 +176,6 @@ def _judge_one_pick(
         return result
 
     if strategy_type in SWING_STRATEGY_TYPES:
-        if open_premium < SWING_BREAKDOWN_THRESHOLD_PCT:
-            result = {
-                "id": pick.get("id"),
-                "status": "action",
-                "selection_date": pick.get("selection_date"),
-                "target_date": target_day,
-                "strategy_type": strategy_type,
-                "code": pick.get("code"),
-                "name": pick.get("name"),
-                "snapshot_price": round(base_price, 4),
-                "open_price": round(open_price, 4),
-                "open_premium": round(open_premium, 4),
-                "quote_time": _quote_time(quote),
-                "price_mode": "15:00收盘价模拟开盘" if use_close_as_open else "09:25开盘价",
-                "level": "danger",
-                "action": "波段破位警告",
-                "title": "🚨【波段破位警告】",
-                "instruction": "遭遇极端下杀，洗盘过度逻辑破位，请立刻市价止损出局！",
-            }
-            if not dry_run:
-                _update_pick_open(pick, open_price, open_premium, checked_at, result, close_position=True)
-            return result
-
         result = {
             "id": pick.get("id"),
             "status": "silent",
@@ -213,8 +189,8 @@ def _judge_one_pick(
             "open_premium": round(open_premium, 4),
             "quote_time": _quote_time(quote),
             "price_mode": "15:00收盘价模拟开盘" if use_close_as_open else "09:25开盘价",
-            "action": "静默洗盘",
-            "instruction": "开盘波动在正常洗盘区间，保持静默，等待 14:45 波段巡逻兵指令。",
+            "action": "T+3开盘记录",
+            "instruction": "T+3策略不在开盘或盘中触发卖出，只记录 open_price/open_premium，等待目标交易日 15:00 收盘价结算。",
         }
         if not dry_run:
             _update_pick_open(pick, open_price, open_premium, checked_at, result, close_position=False)
@@ -245,22 +221,22 @@ def _breakout_action(open_premium: float) -> dict[str, str]:
     if open_premium < 0:
         return {
             "level": "danger",
-            "action": "核按钮",
-            "title": "🔴【核按钮】",
-            "instruction": "逻辑证伪，立刻按跌停价挂单卖出，斩断亏损！操作指南：请立即在券商 App 以‘跌停价’挂委卖单，利用时间优先原则在 09:30 第一秒出货！",
+            "action": "T+1开盘卖出",
+            "title": "🔴【T+1开盘卖出】",
+            "instruction": "尾盘突破策略到期，按 T+1 开盘价卖出结算。",
         }
     if open_premium < 3.0:
         return {
             "level": "profit",
-            "action": "落袋为安",
-            "title": "🟢【落袋为安】",
-            "instruction": "符合预期，开盘止盈，将隔夜套利兑现。",
+            "action": "T+1开盘卖出",
+            "title": "🟢【T+1开盘卖出】",
+            "instruction": "尾盘突破策略到期，按 T+1 开盘价卖出结算。",
         }
     return {
         "level": "strong",
-        "action": "超预期锁仓",
-        "title": "🚀【超预期锁仓】",
-        "instruction": "强势高开超预期，请勿早盘秒卖，等待盘中冲高或封板。",
+        "action": "T+1高开兑现",
+        "title": "🚀【T+1高开兑现】",
+        "instruction": "尾盘突破策略到期，即使高开超预期也按 T+1 开盘价卖出结算。",
     }
 
 
@@ -432,15 +408,15 @@ def _build_push_message(
                 ]
             )
     else:
-        lines.append("今日早盘哨兵无异常，全部波段标的正常洗盘。")
+        lines.append("今日早盘哨兵无开盘卖出动作。T+3 标的仅记录开盘价，等待目标交易日 15:00 收盘结算。")
         lines.append("")
 
     if silent:
         lines.append("### 静默持仓")
         for item in silent:
             lines.append(
-                f"- **波段持仓/静默洗盘**：{item['name']}({item['code']}) / {item['strategy_type']}："
-                f"开盘溢价 {item['open_premium']:.2f}%，保持静默。"
+                f"- **T+3到期结算持仓**：{item['name']}({item['code']}) / {item['strategy_type']}："
+                f"开盘溢价 {item['open_premium']:.2f}%，不触发盘中卖出。"
             )
         lines.append("")
 

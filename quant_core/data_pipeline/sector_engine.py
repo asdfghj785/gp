@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 import importlib
 from pathlib import Path
 import sys
@@ -242,6 +243,7 @@ def get_stock_sector_map(refresh: bool = False) -> dict[str, str]:
     return {code: name for code, name in zip(codes, names) if code and name}
 
 
+@lru_cache(maxsize=128)
 def load_sector_daily(sector_name: str) -> pd.DataFrame:
     path = sector_cache_path(sector_name)
     if not path.exists():

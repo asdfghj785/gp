@@ -7,6 +7,7 @@ from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Sequence
 
+import pandas as pd
 from tqdm import tqdm
 
 BASE_DIR = Path("/Users/eudis/ths")
@@ -332,7 +333,28 @@ def segment_done(
         item = code_state.get(key)
         if isinstance(item, dict) and item.get("status") in {"saved", "empty"}:
             return True
+        if progress_segment_covers(code_state, segment):
+            return True
     return any(path_has_jq_segment(path, segment) for path in minute_parquet_paths(safe_code, period, output_root))
+
+
+def progress_segment_covers(code_state: dict[str, object], segment: tuple[str, str]) -> bool:
+    requested_start = parse_cli_datetime(segment[0], is_end=False)
+    requested_end = parse_cli_datetime(segment[1], is_end=True)
+    for existing_key, item in code_state.items():
+        if not isinstance(existing_key, str) or "|" not in existing_key:
+            continue
+        if not isinstance(item, dict) or item.get("status") not in {"saved", "empty"}:
+            continue
+        try:
+            existing_start_text, existing_end_text = existing_key.split("|", 1)
+            existing_start = parse_cli_datetime(existing_start_text, is_end=False)
+            existing_end = parse_cli_datetime(existing_end_text, is_end=True)
+        except Exception:
+            continue
+        if existing_start <= requested_start and existing_end >= requested_end:
+            return True
+    return False
 
 
 def mark_segment_done(

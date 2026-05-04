@@ -64,21 +64,22 @@ def run_strategy_threshold_sweep(
 
     strategy_type = profile["strategy_type"]
     strategy_pool = evaluated[evaluated["strategy_type"].eq(strategy_type)].copy()
-    strategy_pool = strategy_pool[np.isfinite(pd.to_numeric(strategy_pool.get("t3_max_gain_pct"), errors="coerce"))].copy()
+    settlement_col = "t3_settlement_return_pct" if "t3_settlement_return_pct" in strategy_pool.columns else "t3_close_return_pct"
+    strategy_pool = strategy_pool[np.isfinite(pd.to_numeric(strategy_pool.get(settlement_col), errors="coerce"))].copy()
     rows: list[dict[str, Any]] = []
     sweep_start = float(profile["start"] if start is None else start)
     sweep_end = float(profile["end"] if end is None else end)
     sweep_step = float(profile["step"] if step is None else step)
     for threshold in np.arange(sweep_start, sweep_end + 0.001, sweep_step):
         selected = _daily_strategy_top(strategy_pool[strategy_pool["综合评分"] >= threshold])
-        gains = pd.to_numeric(selected.get("t3_max_gain_pct"), errors="coerce").dropna()
-        wins = gains > 0
+        returns = pd.to_numeric(selected.get(settlement_col), errors="coerce").dropna()
+        wins = returns > 0
         rows.append(
             {
                 "threshold": round(float(threshold), 2),
-                "trades": int(len(gains)),
-                "t3_win_rate": round(float(wins.mean() * 100), 4) if len(gains) else 0.0,
-                "avg_t3_max_gain_pct": round(float(gains.mean()), 4) if len(gains) else 0.0,
+                "trades": int(len(returns)),
+                "t3_win_rate": round(float(wins.mean() * 100), 4) if len(returns) else 0.0,
+                "avg_t3_close_return_pct": round(float(returns.mean()), 4) if len(returns) else 0.0,
                 "max_losing_streak": _max_losing_streak(wins.tolist()),
             }
         )
@@ -139,33 +140,33 @@ def format_markdown(report: dict[str, Any]) -> str:
         f"- 候选行数：{report.get('candidate_rows', 0)}",
         f"- 模型状态：{report.get('model_status', '-')}",
         "",
-        "| 评分门槛 | 年出手次数 | T+3 胜率 | T+3 平均最大涨幅 | 最大连亏次数 |",
+        "| 评分门槛 | 年出手次数 | T+3 胜率 | T+3 平均结算收益 | 最大连亏次数 |",
         "|---:|---:|---:|---:|---:|",
     ]
     for row in report.get("rows", []):
         lines.append(
             f"| {row['threshold']:.1f} | {row['trades']} | "
-            f"{row['t3_win_rate']:.2f}% | {row['avg_t3_max_gain_pct']:.2f}% | {row['max_losing_streak']} |"
+            f"{row['t3_win_rate']:.2f}% | {row['avg_t3_close_return_pct']:.2f}% | {row['max_losing_streak']} |"
     )
     rows = report.get("rows", [])
     sweet = [
         row for row in rows
         if min_trades <= row["trades"] <= max_trades
         and row["t3_win_rate"] >= target_win_rate
-        and row["avg_t3_max_gain_pct"] >= target_avg_gain
+        and row["avg_t3_close_return_pct"] >= target_avg_gain
     ]
     lines.extend(["", "## 结论", ""])
     if sweet:
-        best = max(sweet, key=lambda row: (row["avg_t3_max_gain_pct"], row["t3_win_rate"], row["trades"]))
+        best = max(sweet, key=lambda row: (row["avg_t3_close_return_pct"], row["t3_win_rate"], row["trades"]))
         lines.append(
             f"- 存在甜蜜点：门槛 {best['threshold']:.1f}，出手 {best['trades']} 次，"
-            f"胜率 {best['t3_win_rate']:.2f}%，平均涨幅 {best['avg_t3_max_gain_pct']:.2f}%，"
+            f"胜率 {best['t3_win_rate']:.2f}%，平均结算收益 {best['avg_t3_close_return_pct']:.2f}%，"
             f"最大连亏 {best['max_losing_streak']} 次。"
         )
     else:
         lines.append(
             f"- 当前区间内没有同时满足出手 {min_trades}-{max_trades} 次、"
-            f"T+3 平均涨幅 >={target_avg_gain:.1f}% 且胜率 >={target_win_rate:.1f}% 的门槛。"
+            f"T+3 平均结算收益 >={target_avg_gain:.1f}% 且胜率 >={target_win_rate:.1f}% 的门槛。"
         )
     return "\n".join(lines)
 

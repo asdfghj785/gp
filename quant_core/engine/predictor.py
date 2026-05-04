@@ -23,6 +23,9 @@ from quant_core.config import (
     MODEL_PATH,
     PREMIUM_MODEL_PATH,
     PROFIT_TARGET_PCT,
+    PAUSED_STRATEGY_TYPES,
+    PRODUCTION_STRATEGY_TYPES,
+    PRODUCTION_TOTAL_PICK_LIMIT,
     REVERSAL_MIN_SCORE,
     REVERSAL_MODEL_PATH,
 )
@@ -98,7 +101,12 @@ STRATEGY_PRIORITY = {
     BREAKOUT_STRATEGY_TYPE: 1,
     DIPBUY_STRATEGY_TYPE: 0,
 }
-PRODUCTION_OUTPUT_STRATEGIES = [GLOBAL_MOMENTUM_STRATEGY_TYPE, MAIN_WAVE_STRATEGY_TYPE, REVERSAL_STRATEGY_TYPE, BREAKOUT_STRATEGY_TYPE]
+PRODUCTION_OUTPUT_STRATEGIES = [
+    strategy_type
+    for strategy_type in PRODUCTION_STRATEGY_TYPES
+    if strategy_type in {GLOBAL_MOMENTUM_STRATEGY_TYPE, MAIN_WAVE_STRATEGY_TYPE, BREAKOUT_STRATEGY_TYPE}
+    and strategy_type not in set(PAUSED_STRATEGY_TYPES)
+]
 REVERSAL_FEATURE_COLS = [
     "body_pct",
     "upper_shadow_pct",
@@ -164,7 +172,7 @@ LIVE_NEAR_LIMIT_CHANGE_PCT = 8.5
 GLOBAL_MOMENTUM_MAX_LIVE_CHANGE_PCT = 9.0
 ABSOLUTE_BOTTOM_PROBA = 0.55
 GLOBAL_MOMENTUM_DYNAMIC_ABSOLUTE_FLOOR = GLOBAL_MIN_SCORE
-PRODUCTION_MAX_PICKS_PER_STRATEGY = 3
+PRODUCTION_MAX_PICKS_PER_STRATEGY = 1
 RISK_WARNING_DYNAMIC_FLOOR = "⚠️ 动态下探: 逆势相对龙头，注意控制仓位"
 KELLY_WIN_LOSS_RATIO = 1.5
 HALF_KELLY_FACTOR = 0.5
@@ -182,6 +190,20 @@ THEME_EXTREME_HOT_SCORE = 82.0
 THEME_LAGGARD_RS_FLOOR = 0.0
 THEME_LAGGARD_MAX_PENALTY = 12.0
 THEME_EXTREME_REVERSAL_PENALTY = 10.0
+PAUSED_STRATEGY_TYPE_SET = set(PAUSED_STRATEGY_TYPES)
+
+
+def _apply_total_pick_limit(df: pd.DataFrame, requested_limit: int) -> pd.DataFrame:
+    if df.empty:
+        return df
+    try:
+        request_cap = int(requested_limit)
+    except (TypeError, ValueError):
+        request_cap = 0
+    cap = int(PRODUCTION_TOTAL_PICK_LIMIT)
+    if request_cap > 0:
+        cap = min(cap, request_cap)
+    return df.head(min(len(df), max(1, cap))).copy()
 
 
 @lru_cache(maxsize=1)
@@ -729,6 +751,9 @@ def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = Non
     """Default live strategy filters selected from the current strategy lab."""
     if df.empty:
         return df
+    df = filter_paused_strategies(df)
+    if df.empty:
+        return df
     if gate and gate.get("blocked"):
         return df.iloc[0:0].copy()
     filtered = df[~df["纯代码"].str.startswith(("68", "689"), na=False)].copy()
@@ -772,6 +797,12 @@ def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = Non
             | (pd.to_numeric(filtered["近3日断头铡刀标记"], errors="coerce").fillna(0) < 0.5)
         ].copy()
     return apply_strategy_score_gate(filtered, gate)
+
+
+def filter_paused_strategies(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or not PAUSED_STRATEGY_TYPE_SET or "strategy_type" not in df.columns:
+        return df
+    return df[~df["strategy_type"].fillna("").astype(str).isin(PAUSED_STRATEGY_TYPE_SET)].copy()
 
 
 def _strategy_min_score(strategy_type: str) -> float:
@@ -1168,12 +1199,15 @@ def _attach_historical_outcomes(candidates: pd.DataFrame, raw: pd.DataFrame, tra
         high_values = [highs.get((future_day, code), np.nan) for future_day in candidate_dates]
         numeric_highs = pd.to_numeric(pd.Series(high_values), errors="coerce").dropna()
         future_highs.append(float(numeric_highs.max()) if len(numeric_highs) == 3 else np.nan)
-        t3_closes.append(float(closes.get((exit_date, code), np.nan)) if exit_date else np.nan)
+        t3_close = float(closes.get((exit_date, code), np.nan)) if exit_date else np.nan
+        t3_closes.append(t3_close)
 
     out["t3_max_high"] = future_highs
     out["t3_close"] = t3_closes
     out["t3_max_gain_pct"] = (pd.to_numeric(out["t3_max_high"], errors="coerce") / out["最新价"] - 1) * 100
     out["t3_close_return_pct"] = (pd.to_numeric(out["t3_close"], errors="coerce") / out["最新价"] - 1) * 100
+    out["t3_settlement_price"] = out["t3_close"]
+    out["t3_settlement_return_pct"] = out["t3_close_return_pct"]
     return out
 
 
@@ -1242,15 +1276,14 @@ def scan_market(
             LATEST_TOP50_PATH.write_text(json.dumps([], ensure_ascii=False, indent=2), encoding="utf-8")
         return payload
     df = select_strategy_top_picks(df, limit_per_strategy=PRODUCTION_MAX_PICKS_PER_STRATEGY)
-    if limit > 0:
-        df = df.head(min(len(df), max(int(limit), len(PRODUCTION_OUTPUT_STRATEGIES))))
+    df = _apply_total_pick_limit(df, limit)
     rows = [_row_to_api(row) for _, row in df.iterrows()]
     snapshot_id = save_prediction_snapshot("quad_xgboost_regressor" if "regressor_ready" in model_status else "rule_fallback", rows) if cache_prediction else None
     payload = {
         "id": snapshot_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_status": model_status,
-        "strategy": f"生产策略：四大核心军团分档出票，每个策略基准线最多 Top{PRODUCTION_MAX_PICKS_PER_STRATEGY}，无达标票时按合规池 99 分位动态下探 1 只并提示风偏；尾盘突破预测次日开盘预期溢价，中线超跌反转/右侧主升浪/全局动量狙击复用 T+3 波段收益口径；实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；突破门槛>={BREAKOUT_MIN_SCORE:.1f}，反转门槛>={REVERSAL_MIN_SCORE:.1f}%，主升浪门槛>={MAIN_WAVE_MIN_SCORE:.1f}%，全局狙击概率>={GLOBAL_MIN_SCORE:.2f}，绝对安全底线>={ABSOLUTE_BOTTOM_PROBA:.2f}；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多直接剔除；近3日断头铡刀和上影线强过滤仅约束尾盘突破，波段策略豁免。",
+        "strategy": f"生产策略：当前启用策略各取 Top{PRODUCTION_MAX_PICKS_PER_STRATEGY}，总输出上限 Top{PRODUCTION_TOTAL_PICK_LIMIT}；无达标票时按合规池 99 分位动态下探 1 只并提示风偏；尾盘突破预测次日开盘预期溢价，中线超跌反转/右侧主升浪/全局动量狙击复用 T+3 波段收益口径；实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；突破门槛>={BREAKOUT_MIN_SCORE:.1f}，反转门槛>={REVERSAL_MIN_SCORE:.1f}%，主升浪门槛>={MAIN_WAVE_MIN_SCORE:.1f}%，全局狙击概率>={GLOBAL_MIN_SCORE:.2f}，绝对安全底线>={ABSOLUTE_BOTTOM_PROBA:.2f}；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多直接剔除；近3日断头铡刀和上影线强过滤仅约束尾盘突破，波段策略豁免。",
         "market_gate": gate,
         "intraday_snapshot": intraday_snapshot,
         "rows": rows,
@@ -1316,8 +1349,7 @@ def _scan_historical_market(
         }
 
     df = select_strategy_top_picks(df, limit_per_strategy=PRODUCTION_MAX_PICKS_PER_STRATEGY)
-    if limit > 0:
-        df = df.head(min(len(df), max(int(limit), len(PRODUCTION_OUTPUT_STRATEGIES))))
+    df = _apply_total_pick_limit(df, limit)
     rows = [_row_to_api(row) for _, row in df.iterrows()]
     snapshot_id = save_prediction_snapshot("historical_playback_v44", rows) if cache_prediction else None
     return {
@@ -1325,7 +1357,7 @@ def _scan_historical_market(
         "created_at": f"{trade_date}T14:50:00",
         "prediction_date": trade_date,
         "model_status": model_status,
-        "strategy": f"V4.4 Historical Playback: scan_market(target_date={trade_date}) 复用生产过滤、动态底线和 Half-Kelly 仓位。",
+        "strategy": f"V4.4 Historical Playback: scan_market(target_date={trade_date}) 复用生产过滤、动态底线、Half-Kelly 仓位和分策略 Top{PRODUCTION_MAX_PICKS_PER_STRATEGY} / 总 Top{PRODUCTION_TOTAL_PICK_LIMIT} 出票上限。",
         "market_gate": gate,
         "rows": rows,
     }
@@ -1333,6 +1365,9 @@ def _scan_historical_market(
 
 def select_strategy_top_picks(df: pd.DataFrame, limit_per_strategy: int = PRODUCTION_MAX_PICKS_PER_STRATEGY) -> pd.DataFrame:
     """Return tiered production picks per strategy, avoiding duplicate stocks per day."""
+    if df.empty:
+        return df
+    df = filter_paused_strategies(df)
     if df.empty:
         return df
     selected: list[pd.DataFrame] = []
@@ -2286,4 +2321,6 @@ def _row_to_api(row: pd.Series) -> dict[str, Any]:
         "t3_max_gain_pct": round(float(row.get("t3_max_gain_pct")), 4) if pd.notna(row.get("t3_max_gain_pct")) else None,
         "t3_close": round(float(row.get("t3_close")), 4) if pd.notna(row.get("t3_close")) else None,
         "t3_close_return_pct": round(float(row.get("t3_close_return_pct")), 4) if pd.notna(row.get("t3_close_return_pct")) else None,
+        "t3_settlement_price": round(float(row.get("t3_settlement_price")), 4) if pd.notna(row.get("t3_settlement_price")) else None,
+        "t3_settlement_return_pct": round(float(row.get("t3_settlement_return_pct")), 4) if pd.notna(row.get("t3_settlement_return_pct")) else None,
     }, row)

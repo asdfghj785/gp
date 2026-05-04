@@ -9,15 +9,24 @@ from typing import Any
 
 import requests
 
-from quant_core.config import PUSHPLUS_TOKEN, check_push_config
+from quant_core.config import PRODUCTION_TOTAL_PICK_LIMIT, PUSHPLUS_TOKEN, check_push_config
 from quant_core.ai_agent.agent_gateway import attach_ai_interview, run_1446_ai_interview
 from quant_core.data_pipeline.trading_calendar import is_trading_day
 from quant_core.daily_pick import save_pushed_top_picks
 from quant_core.engine.predictor import scan_market
+from quant_core.execution.mac_sniper import aim_and_fire, read_trade_panel_snapshot
+from quant_core.execution.position_sizer import (
+    InsufficientFundsError,
+    build_broker_confirmed_trade_record,
+    calculate_order,
+    sync_shadow_account_from_broker,
+)
+from quant_core.sniper_status import get_sniper_status
 from quant_core.storage import (
     database_overview,
     get_daily_picks,
     latest_prediction_snapshot,
+    latest_daily_picks,
     list_unpushed_daily_picks,
     mark_daily_picks_push_result,
 )
@@ -28,6 +37,14 @@ BASE_DIR = Path(__file__).resolve().parent
 PUSHPLUS_RETRY_COUNT = 3
 PUSHPLUS_RETRY_DELAY_SECONDS = 2
 PUSHPLUS_MAX_CONTENT_LENGTH = 3500
+MAC_SNIPER_APP_NAME = os.getenv("QUANT_MAC_SNIPER_APP", "同花顺").strip() or "同花顺"
+PUSH_STRATEGY_PRIORITY = {
+    "全局动量狙击": 4,
+    "右侧主升浪": 3,
+    "中线超跌反转": 2,
+    "尾盘突破": 1,
+    "首阴低吸": 0,
+}
 
 
 def send_pushplus(title: str, content: str) -> dict[str, Any]:
@@ -119,22 +136,23 @@ def top_pick() -> dict[str, Any]:
         print(result)
         return result
 
-    locked_rows = get_daily_picks(date.today().isoformat())
+    locked_rows = _limit_top_push_rows(get_daily_picks(date.today().isoformat()))
     if locked_rows:
         locked_lines = "\n".join(_pick_line(row, exists=True) for row in locked_rows) or "- 今日记录存在，但没有可展示标的。"
-        content = f"""14:50 推送标的已锁定
+        content = f"""14:50 分策略 Top1 推送标的已锁定
 时间: {now}
 标的数量: {len(locked_rows)}
 {locked_lines}
 
 今日记录已存在，系统不会重新扫描或覆盖修改。
 """
-        result = send_pushplus(f"14:50多轨候选已锁定: {len(locked_rows)}只", content)
+        result = send_pushplus(f"14:50 分策略Top1候选已锁定: {len(locked_rows)}只", content)
         _mark_push(date.today().isoformat(), locked_rows, result)
-        print(_compact_task_result("sent_locked", "top_pick", now, locked_rows, result))
-        return {"pushplus": result, "daily_pick": {"status": "exists", "picks": locked_rows}}
+        sniper_result = _trigger_mac_sniper(locked_rows)
+        print(_compact_task_result("sent_locked", "top_pick", now, locked_rows, result, mac_sniper=sniper_result))
+        return {"pushplus": result, "mac_sniper": sniper_result, "daily_pick": {"status": "exists", "picks": locked_rows}}
 
-    scan = scan_market(limit=12, persist_snapshot=False, cache_prediction=False, async_persist=False)
+    scan = scan_market(limit=PRODUCTION_TOTAL_PICK_LIMIT, persist_snapshot=False, cache_prediction=False, async_persist=False)
     rows = scan.get("rows", [])
     gate = scan.get("market_gate") or {}
     intraday = scan.get("intraday_snapshot") or {}
@@ -173,7 +191,7 @@ def top_pick() -> dict[str, Any]:
     saved = save_pushed_top_picks(rows, scan, force=False)
     pick_lines = "\n".join(_pick_line(winner) for winner in rows) or "- 本次扫描无可展示标的。"
     ai_block = str(ai_interview.get("markdown") or "").strip()
-    content = f"""14:50 实时多轨独立候选
+    content = f"""14:50 实时分策略 Top1 候选
 时间: {now}
 标的数量: {len(rows)}
 {pick_lines}
@@ -185,19 +203,20 @@ def top_pick() -> dict[str, Any]:
 14:30快照: {intraday.get('status')} | 匹配: {intraday.get('matched_count', 0)} | 拦截: {intraday.get('trapped_count', 0)}
 模型状态: {scan.get('model_status')}
 
-过滤规则: 已排除创业板、北交所、科创板、ST/退市；四大核心军团按基准线最多 Top3，未达基准时按当日合规池 99 分位动态下探 1 只并标红风偏；雷暴或下跌缩量空仓；14:30后尾盘拉升超过阈值、近3日断头铡刀按策略风控剔除。
+过滤规则: 已排除创业板、北交所、科创板、ST/退市；当前启用军团各取 Top1，总输出上限 {PRODUCTION_TOTAL_PICK_LIMIT} 只，未达基准时按当日合规池 99 分位动态下探 1 只并标红风偏；雷暴或下跌缩量空仓；14:30后尾盘拉升超过阈值、近3日断头铡刀按策略风控剔除。
 """
-    result = send_pushplus(f"14:50多轨候选: {len(rows)}只", content)
-    day_rows = get_daily_picks(date.today().isoformat())
+    result = send_pushplus(f"14:50 分策略Top1候选: {len(rows)}只", content)
+    day_rows = _limit_top_push_rows(get_daily_picks(date.today().isoformat()))
     _mark_push(date.today().isoformat(), day_rows, result)
-    print(_compact_task_result("sent", "top_pick", now, day_rows, result, daily_pick=saved))
-    return {"pushplus": result, "daily_pick": saved}
+    sniper_result = _trigger_mac_sniper(rows)
+    print(_compact_task_result("sent", "top_pick", now, day_rows, result, daily_pick=saved, mac_sniper=sniper_result))
+    return {"pushplus": result, "mac_sniper": sniper_result, "daily_pick": saved}
 
 
 def resend_today(send_push: bool = True) -> dict[str, Any]:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     today = date.today().isoformat()
-    rows = list_unpushed_daily_picks(today)
+    rows = _limit_top_push_rows(list_unpushed_daily_picks(today))
     if not rows:
         result = {"status": "noop", "reason": "今日没有未推送的影子测试标的", "selection_date": today}
         print(result)
@@ -218,52 +237,190 @@ def resend_today(send_push: bool = True) -> dict[str, Any]:
     return {"pushplus": result, "daily_pick": {"status": "resent", "picks": rows}}
 
 
+def preview_trade_markdown(selection_date: str = "latest", limit: int = PRODUCTION_TOTAL_PICK_LIMIT) -> dict[str, Any]:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = _preview_rows(selection_date, limit=limit)
+    if not rows:
+        result = {"status": "noop", "reason": "没有可预览的 daily_picks 记录", "selection_date": selection_date}
+        print(result)
+        return result
+
+    preview_date = str(rows[0].get("selection_date") or selection_date)
+    pick_lines = "\n".join(_pick_line(row, exists=True) for row in rows)
+    content = f"""14:50 一键狙击通道预览
+时间: {now}
+预览日期: {preview_date}
+标的数量: {len(rows)}
+
+{pick_lines}
+"""
+    print(content)
+    return {"status": "dry_run", "selection_date": preview_date, "count": len(rows), "content": content}
+
+
 def _pick_line(row: dict[str, Any], exists: bool = False) -> str:
     strategy_type = str(row.get("strategy_type") or "未知")
     name = str(row.get("name") or "-")
-    code = str(row.get("code") or "-")
-    price = _safe_float(row.get("snapshot_price") or row.get("selection_price") or row.get("price"))
-    change = _safe_float(row.get("selection_change") if exists else row.get("change"))
-    is_swing = strategy_type in {"中线超跌反转", "右侧主升浪", "全局动量狙击"}
-    expected = _safe_float(
+    code = _normalize_a_share_code(row.get("code") or "-")
+    position = _suggested_position(row)
+    position_text = f"{position * 100:.0f}%" if position is not None else "-"
+    risk_warning = _risk_warning(row) or "无"
+    return (
+        f"### 🔴 {strategy_type} | {name}\n"
+        "- **买入代码** (长按下方数字复制):\n"
+        f"`{code}`\n"
+        f"- **凯利仓位**: 💰 **{position_text}** 💰\n"
+        f"- **风险提示**: {risk_warning}"
+    )
+
+
+def _trigger_mac_sniper(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not get_sniper_status():
+        return {"status": "skipped", "reason": "mac_sniper_disabled"}
+    if not rows:
+        return {"status": "skipped", "reason": "empty_rows"}
+    top = rows[0]
+    code = _normalize_a_share_code(top.get("code") or "")
+    if not code or len(code) != 6:
+        return {"status": "skipped", "reason": "missing_code", "raw_code": top.get("code")}
+
+    current_price = _safe_float(top.get("snapshot_price") or top.get("selection_price") or top.get("price"))
+    if current_price <= 0:
+        return {"status": "skipped", "reason": "missing_price", "code": code}
+
+    position_pct = _suggested_position(top)
+    if position_pct is None or position_pct <= 0:
+        return {"status": "skipped", "reason": "missing_position_pct", "code": code}
+
+    try:
+        sizing = calculate_order(code, current_price, position_pct)
+    except InsufficientFundsError as exc:
+        print(f"⚠️ [物理狙击跳过] {exc}")
+        return {"status": "skipped", "reason": "insufficient_funds", "code": code, "error": str(exc)}
+    except Exception as exc:
+        print(f"⚠️ [物理狙击算股异常] {exc}")
+        return {"status": "failed", "reason": "position_sizing_failed", "code": code, "error": str(exc)}
+
+    shares = int(sizing["shares"])
+    try:
+        print(f"🎯 [物理狙击] 正在拉起同花顺全自动买入: {code} | {shares}股 | 参考价 {current_price:.2f}")
+        sniper_result = aim_and_fire(code, app_name=MAC_SNIPER_APP_NAME, shares=shares, limit_price=current_price)
+        payload = {
+            "status": sniper_result.get("status"),
+            "code": code,
+            "app_name": MAC_SNIPER_APP_NAME,
+            "shares": shares,
+            "current_price": current_price,
+            "position_pct": position_pct,
+            "sizing": sizing,
+            "mac_sniper": sniper_result,
+        }
+        if sniper_result.get("status") == "broker_confirmed":
+            try:
+                trade_record = build_broker_confirmed_trade_record(
+                    code,
+                    top.get("name") or "",
+                    current_price,
+                    shares,
+                    position_pct,
+                    "pushplus_tasks.top_pick",
+                    mac_sniper_result=sniper_result,
+                    metadata={
+                        "selection_date": top.get("selection_date") or date.today().isoformat(),
+                        "name": top.get("name"),
+                        "strategy_type": top.get("strategy_type"),
+                        "source": "pushplus_tasks.top_pick",
+                    },
+                )
+                payload["shadow_account"] = sync_shadow_account_from_broker(
+                    sniper_result.get("after_snapshot") or read_trade_panel_snapshot(MAC_SNIPER_APP_NAME),
+                    trade_record=trade_record,
+                )
+                payload["trade_record"] = trade_record
+            except Exception as exc:
+                payload["status"] = "broker_confirmed_account_sync_failed"
+                payload["shadow_account_error"] = str(exc)
+                print(f"⚠️ [影子资金池异常] 买入已确认但本地同步失败: {exc}")
+        elif sniper_result.get("status") == "submitted_unverified":
+            print("⚠️ [物理狙击未记账] 买入提交后未在持仓表确认成交，本地流水未写入")
+        return payload
+    except Exception as exc:
+        print(f"⚠️ [物理狙击异常] 无法拉起终端: {exc}")
+        return {
+            "status": "failed",
+            "code": code,
+            "app_name": MAC_SNIPER_APP_NAME,
+            "shares": shares,
+            "error": str(exc),
+        }
+
+
+def _limit_top_push_rows(rows: list[dict[str, Any]], limit: int = PRODUCTION_TOTAL_PICK_LIMIT) -> list[dict[str, Any]]:
+    try:
+        cap = int(limit)
+    except (TypeError, ValueError):
+        cap = int(PRODUCTION_TOTAL_PICK_LIMIT)
+    cap = max(1, min(int(PRODUCTION_TOTAL_PICK_LIMIT), cap))
+    return sorted(list(rows or []), key=_push_row_sort_key, reverse=True)[:cap]
+
+
+def _push_row_sort_key(row: dict[str, Any]) -> tuple[float, float, float, float]:
+    winner = _winner_payload(row)
+    strategy_type = str(row.get("strategy_type") or winner.get("strategy_type") or "")
+    score = (
+        row.get("global_probability")
+        or winner.get("global_probability")
+        or row.get("composite_score")
+        or winner.get("composite_score")
+        or row.get("expected_premium")
+        or winner.get("expected_premium")
+    )
+    expected = (
         row.get("expected_t3_max_gain_pct")
-        if is_swing
-        else row.get("expected_premium")
+        or winner.get("expected_t3_max_gain_pct")
+        or row.get("expected_premium")
+        or winner.get("expected_premium")
     )
-    if expected == 0:
-        expected = _safe_float(row.get("expected_premium") or row.get("composite_score"))
-    score = _safe_float(row.get("composite_score"))
-    target_date = row.get("target_date") or "-"
-    snapshot_time = row.get("snapshot_time") or "14:50"
-    metric_label = "T+3预期最大涨幅" if is_swing else "预期开盘溢价"
-    position_line = _position_line(row, strategy_type, name, code)
-    line = (
-        f"- {position_line}\n"
-        f"  - 14:50价 {_fmt(price)} / 涨跌 {_fmt(change)}% / "
-        f"{metric_label} {_fmt(expected)}% / 评分 {_fmt(score)} / "
-        f"快照 {snapshot_time} / 目标日 {target_date}"
+    return (
+        float(PUSH_STRATEGY_PRIORITY.get(strategy_type, 0)),
+        _safe_float(score),
+        _safe_float(expected),
+        -_safe_float(row.get("id")),
     )
-    ai_summary = _ai_summary(row)
-    if ai_summary:
-        line += f"\n  - AI舆情：{ai_summary}"
-    risk_warning = _risk_warning(row)
-    if risk_warning:
-        line += f"\n  - ‼️ 风偏提示：{risk_warning}"
-    return line
 
 
-def _position_line(row: dict[str, Any], strategy_type: str, name: str, code: str) -> str:
-    suggested = _suggested_position(row)
-    tier = str(row.get("selection_tier") or "").strip()
-    if not tier:
-        raw = row.get("raw")
-        if isinstance(raw, dict) and isinstance(raw.get("winner"), dict):
-            tier = str(raw["winner"].get("selection_tier") or "").strip()
-    is_probe = tier == "dynamic_floor"
-    icon = "🔴" if is_probe else "🟢"
-    note = "试错轻仓" if is_probe else "凯利优选"
-    position_pct = f"{suggested * 100:.0f}%" if suggested is not None else "-"
-    return f"{icon} {strategy_type} | {name} ({code}) | 💰 建议仓位: {position_pct} ({note})"
+def _winner_payload(row: dict[str, Any]) -> dict[str, Any]:
+    raw = row.get("raw")
+    if isinstance(raw, dict):
+        winner = raw.get("winner")
+        if isinstance(winner, dict):
+            return winner
+    return {}
+
+
+def _preview_rows(selection_date: str, limit: int = PRODUCTION_TOTAL_PICK_LIMIT) -> list[dict[str, Any]]:
+    requested = str(selection_date or "latest").strip()
+    if requested and requested.lower() != "latest":
+        return _limit_top_push_rows(get_daily_picks(requested[:10]), limit=limit)
+
+    latest_rows = latest_daily_picks(limit=max(limit, 30), shadow_only=False)
+    if not latest_rows:
+        return []
+    latest_date = str(latest_rows[0].get("selection_date") or "")[:10]
+    if not latest_date:
+        return _limit_top_push_rows(latest_rows, limit=limit)
+    return _limit_top_push_rows(get_daily_picks(latest_date), limit=limit)
+
+
+def _normalize_a_share_code(code: Any) -> str:
+    text = str(code or "").strip().upper()
+    if "." in text:
+        text = text.split(".", 1)[0]
+    for prefix in ("SH", "SZ", "BJ"):
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits[-6:].zfill(6) if digits else text
 
 
 def _suggested_position(row: dict[str, Any]):
@@ -375,6 +532,7 @@ def _compact_task_result(
     rows: list[dict[str, Any]],
     pushplus: dict[str, Any],
     daily_pick: dict[str, Any] | None = None,
+    mac_sniper: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "status": status,
@@ -396,6 +554,8 @@ def _compact_task_result(
     }
     if daily_pick is not None:
         payload["daily_pick"] = daily_pick
+    if mac_sniper is not None:
+        payload["mac_sniper"] = mac_sniper
     return payload
 
 
@@ -414,7 +574,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="PushPlus 定时通知任务")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("heartbeat", help="发送项目运行正常心跳")
-    sub.add_parser("top-pick", help="推送实时最高预期溢价股票")
+    top_parser = sub.add_parser("top-pick", help="推送实时最高预期溢价股票")
+    top_parser.add_argument("--dry-run", action="store_true", help="只打印一键狙击 Markdown，不发送微信、不扫描、不写库")
+    top_parser.add_argument("--preview-date", default="latest", help="dry-run 预览日期，默认 latest 使用最近一次出票")
     resend_parser = sub.add_parser("resend-today", help="补发今日未标记为已推送的影子测试标的")
     resend_parser.add_argument("--dry-run", action="store_true", help="只检查补发候选，不发送微信、不写推送状态")
     args = parser.parse_args()
@@ -422,7 +584,10 @@ def main() -> None:
     if args.command == "heartbeat":
         heartbeat()
     elif args.command == "top-pick":
-        top_pick()
+        if args.dry_run:
+            preview_trade_markdown(selection_date=args.preview_date)
+        else:
+            top_pick()
     elif args.command == "resend-today":
         resend_today(send_push=not args.dry_run)
 

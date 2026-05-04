@@ -6,6 +6,7 @@ from typing import Any
 from quant_core.data_pipeline.market import fetch_sina_snapshot
 from quant_core.data_pipeline.trading_calendar import is_trading_day, next_trading_day, nth_trading_day
 from quant_core.engine.predictor import attach_pick_theme_fields, scan_market
+from quant_core.config import PRODUCTION_TOTAL_PICK_LIMIT
 from .storage import (
     get_daily_picks,
     latest_daily_picks,
@@ -31,7 +32,7 @@ def nth_weekday(day: date, n: int) -> date:
     return nth_trading_day(day, n)
 
 
-def save_today_top_pick(limit: int = 12, force: bool = False) -> dict[str, Any]:
+def save_today_top_pick(limit: int = PRODUCTION_TOTAL_PICK_LIMIT, force: bool = False) -> dict[str, Any]:
     today = date.today()
     if not force and not is_weekday(today):
         return {"status": "skipped", "reason": "非工作日不保存 14:50 推送标的", "selection_date": today.isoformat()}

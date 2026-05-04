@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from datetime import date, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -116,6 +117,7 @@ def get_stock_concept_map(refresh: bool = False) -> dict[str, str]:
     return out
 
 
+@lru_cache(maxsize=2048)
 def load_concept_daily(concept_code: str) -> pd.DataFrame:
     index = _load_concept_index()
     if not index.empty:

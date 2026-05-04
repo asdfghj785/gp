@@ -17,7 +17,9 @@ if str(BASE_DIR) not in sys.path:
 
 from quant_core.data_pipeline.tencent_engine import get_tencent_realtime, tencent_symbol
 from quant_core.data_pipeline.trading_calendar import is_trading_day, nth_trading_day, trading_day_count_after
+from quant_core.execution.mac_sniper import aim_and_fire
 from quant_core.execution.pushplus_tasks import send_pushplus
+from quant_core.sniper_status import get_sniper_status
 from quant_core.storage import connect, init_db, latest_daily_picks, mark_daily_pick_closed
 
 
@@ -36,8 +38,18 @@ ORDER_BOOK_IMBALANCE_THRESHOLD = -80.0
 VWAP_FAKE_DUMP_HOLD_RATIO = 0.995
 ANTI_NUCLEAR_CONFIRM_SECONDS = 180
 ANTI_NUCLEAR_MAX_LOSS_PCT = -1.0
-SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪"}
-NON_SWING_STRATEGY_TYPES = {"尾盘突破", "首阴低吸"}
+REGULAR_INTRADAY_DISASTER_STOP_PCT = -6.0
+SNIPER_INTRADAY_DISASTER_STOP_PCT = -4.0
+REGULAR_EOD_STRUCTURAL_STOP_PCT = -3.0
+SNIPER_EOD_STRUCTURAL_STOP_PCT = -1.5
+TRAILING_ARM_GAIN_PCT = 4.0
+TRAILING_DRAWDOWN_PCT = -2.0
+EOD_STRUCTURAL_STOP_START = clock_time(14, 50)
+INTRADAY_EXIT_MONITOR_ENABLED = True
+REGULAR_STRATEGY_TYPES = {"右侧主升浪"}
+SNIPER_STRATEGY_TYPES = {"尾盘突破", "全局动量狙击"}
+DEPRECATED_STRATEGY_TYPES = {"右侧主升浪", "中线超跌反转", "首阴低吸"}
+SHADOW_ACCOUNT_PATH = BASE_DIR / "data" / "shadow_account.json"
 
 
 def load_ledger(path: Path = LEDGER_PATH) -> dict[str, Any]:
@@ -136,6 +148,8 @@ def add_position(
         "name": name or clean_code,
         "buy_price": round(float(buy_price), 4),
         "highest_price": round(float(buy_price), 4),
+        "tier": "base",
+        "selection_tier": "base",
         "volume_alert_triggered": False,
         "order_book_alert_triggered": False,
         "buy_date": buy_date or now.date().isoformat(),
@@ -191,13 +205,15 @@ def seed_from_latest_1450_picks(path: Path = LEDGER_PATH, monitor_date: Optional
             "buy_time": str(pick.get("selected_at") or pick.get("snapshot_time") or ""),
             "target_date": str(pick.get("target_date") or t_plus_3_date(source_date)),
             "strategy_type": pick.get("strategy_type") or "",
+            "tier": pick.get("selection_tier") or pick.get("tier") or "base",
+            "selection_tier": pick.get("selection_tier") or pick.get("tier") or "base",
             "source": "daily_picks_1450",
             "source_selection_date": source_date,
             "source_pick_id": pick.get("id"),
             "monitor_date": current_day,
         }
         positions.append(position)
-        seeded.append({"code": code, "name": position["name"], "buy_price": position["buy_price"]})
+        seeded.append({"code": code, "name": position["name"], "buy_price": position["buy_price"], "tier": position["tier"]})
 
     ledger["positions"] = positions
     ledger["last_seeded_at"] = datetime.now().isoformat(timespec="seconds")
@@ -245,6 +261,13 @@ def run_loop(
     summary: dict[str, Any] = {"checked_rounds": 0, "events": []}
     if seed_latest_picks and not dry_run:
         summary["seed"] = seed_from_latest_1450_picks(path)
+    if not INTRADAY_EXIT_MONITOR_ENABLED:
+        result = check_positions(path=path, send_push=send_push, dry_run=dry_run)
+        summary["checked_rounds"] += 1
+        summary["events"].extend(result.get("events", []))
+        summary["disabled"] = True
+        summary["stop_reason"] = result.get("reason")
+        return summary
     while True:
         if not once:
             wait_seconds = seconds_until_scan_window()
@@ -275,10 +298,24 @@ def run_loop(
 
 def check_positions(path: Path = LEDGER_PATH, send_push: bool = True, dry_run: bool = False) -> dict[str, Any]:
     ledger = load_ledger(path)
+    positions = list(open_positions(ledger))
+    if not INTRADAY_EXIT_MONITOR_ENABLED:
+        event = {
+            "status": "disabled",
+            "reason": "盘中监控卖出体系已屏蔽；T+1 由开盘哨兵闭环，T+3 由收盘结算器按 15:00 close 闭环。",
+            "count": len(positions),
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        return {
+            "status": "disabled",
+            "reason": event["reason"],
+            "count": len(positions),
+            "events": [event],
+            "ledger": ledger,
+        }
     if not is_trading_day(date.today()):
         return {"status": "skipped", "reason": "非交易日不执行实时巡逻", "count": 0, "events": [], "ledger": ledger}
 
-    positions = list(open_positions(ledger))
     events: list[dict[str, Any]] = []
 
     for position in positions:
@@ -298,6 +335,61 @@ def check_positions(path: Path = LEDGER_PATH, send_push: bool = True, dry_run: b
             )
 
     return {"status": "checked", "count": len(positions), "events": events, "ledger": ledger}
+
+
+def mock_stop_loss_alert(
+    code: str,
+    name: str,
+    buy_price: float,
+    current_price: float,
+    tier: str = "dynamic_floor",
+    strategy_type: str = "尾盘突破",
+    path: Path = LEDGER_PATH,
+) -> dict[str, Any]:
+    clean_code = normalize_code(code)
+    position = {
+        "code": clean_code,
+        "name": name or clean_code,
+        "buy_price": round(float(buy_price), 4),
+        "highest_price": round(float(buy_price), 4),
+        "tier": tier,
+        "selection_tier": tier,
+        "strategy_type": strategy_type,
+        "buy_date": date.today().isoformat(),
+        "buy_time": datetime.now().isoformat(timespec="seconds"),
+        "target_date": t_plus_3_date(date.today().isoformat()),
+        "source": "mock_stop_loss",
+    }
+    quote = {
+        "current_price": current_price,
+        "date": date.today().isoformat(),
+        "time": datetime.now().time().isoformat(timespec="seconds"),
+    }
+    current_gain_pct = gain_pct(current_price, buy_price)
+    tier_text, monitor_text = tier_display(position)
+    event = close_position(
+        ledger={"positions": [position], "closed_positions": []},
+        position=position,
+        path=path,
+        reason="intraday_disaster_stop",
+        title=f"【卖出警告】{name or clean_code} 触发{tier_text}止损线",
+        message=(
+            f"### 🚨 强制止损触发 | {name or clean_code} ({clean_code})\n"
+            f"- **持仓属性**: {tier_text} ({monitor_text})\n"
+            f"- **盈亏状态**: 买入价 {buy_price:.2f} | 现价 {current_price:.2f} | 跌幅 {current_gain_pct:.2f}%"
+        ),
+        current_price=current_price,
+        highest_price=buy_price,
+        buy_price=buy_price,
+        current_gain_pct=current_gain_pct,
+        highest_gain_pct=0.0,
+        drawdown_pct=current_gain_pct,
+        quote=quote,
+        send_push=False,
+        dry_run=True,
+    )
+    print(event["markdown"])
+    return event
 
 
 def check_one_position(
@@ -335,6 +427,8 @@ def check_one_position(
     current_gain_pct = gain_pct(current_price, buy_price)
     highest_gain_pct = gain_pct(highest_price, buy_price)
     drawdown_pct = gain_pct(current_price, highest_price)
+    intraday_stop_pct = intraday_disaster_stop_pct(position)
+    structural_stop_pct = eod_structural_stop_pct(position)
     anti_nuclear_event = check_anti_nuclear_pool(
         position=position,
         ledger=ledger,
@@ -377,16 +471,19 @@ def check_one_position(
             "checked_at": datetime.now().isoformat(timespec="seconds"),
         }
 
-    if current_price <= buy_price * 0.97:
+    if current_gain_pct <= intraday_stop_pct:
+        tier_text, monitor_text = tier_display(position)
         event = close_position(
             ledger=ledger,
             position=position,
             path=path,
-            reason="initial_stop",
-            title=f"【初始止损报警】{name} 跌破买入价 3% 防线",
+            reason="intraday_disaster_stop",
+            title=f"【日内防爆止损】{name} 触发{tier_text}{intraday_stop_pct:.1f}%防线",
             message=(
-                f"【初始止损报警】{name}({code}) 当前价 {current_price:.2f}，"
-                f"相对买入价 {buy_price:.2f} 亏损约 {abs(current_gain_pct):.2f}%，建议立即止损。"
+                f"### 🚨 日内防爆止损 | {name} ({code})\n"
+                f"- **持仓属性**: {tier_text} ({monitor_text})\n"
+                f"- **防爆阈值**: {intraday_stop_pct:.1f}%\n"
+                f"- **盈亏状态**: 买入价 {buy_price:.2f} | 现价 {current_price:.2f} | 盈亏 {current_gain_pct:.2f}%"
             ),
             current_price=current_price,
             highest_price=highest_price,
@@ -406,18 +503,51 @@ def check_one_position(
             event["anti_nuclear"] = anti_nuclear_event
         return event
 
-    trailing_active = highest_price >= buy_price * 1.05
-    trailing_hit = current_price <= highest_price * 0.97
+    trailing_active = highest_gain_pct >= TRAILING_ARM_GAIN_PCT
+    trailing_hit = drawdown_pct <= TRAILING_DRAWDOWN_PCT
     if trailing_active and trailing_hit:
         event = close_position(
             ledger=ledger,
             position=position,
             path=path,
             reason="trailing_take_profit",
-            title=f"【追踪止盈触发】{name} 从最高点回撤 3%",
+            title=f"【追踪止盈触发】{name} 最高浮盈达标后回撤 2%",
             message=(
-                f"【追踪止盈触发】{name}从最高点回撤 {abs(drawdown_pct):.2f}%，"
+                f"【追踪止盈触发】{name}最高浮盈 {highest_gain_pct:.2f}%，"
+                f"当前从最高点回撤 {abs(drawdown_pct):.2f}%，"
                 f"当前盈利约 {current_gain_pct:.2f}%，建议落袋为安！"
+            ),
+            current_price=current_price,
+            highest_price=highest_price,
+            buy_price=buy_price,
+            current_gain_pct=current_gain_pct,
+            highest_gain_pct=highest_gain_pct,
+            drawdown_pct=drawdown_pct,
+            quote=quote,
+            send_push=send_push,
+            dry_run=dry_run,
+        )
+        if volume_alert_event:
+            event["volume_alert"] = volume_alert_event
+        if order_book_alert_event:
+            event["order_book_alert"] = order_book_alert_event
+        if anti_nuclear_event:
+            event["anti_nuclear"] = anti_nuclear_event
+        return event
+
+    if is_eod_structural_stop_window() and current_gain_pct <= structural_stop_pct:
+        tier_text, monitor_text = tier_display(position)
+        event = close_position(
+            ledger=ledger,
+            position=position,
+            path=path,
+            reason="eod_structural_stop",
+            title=f"【尾盘破位卖出】{name} 触发{tier_text}{structural_stop_pct:.1f}%结构止损",
+            message=(
+                f"### 🚨 尾盘结构止损 | {name} ({code})\n"
+                f"- **持仓属性**: {tier_text} ({monitor_text})\n"
+                f"- **结构阈值**: {structural_stop_pct:.1f}%\n"
+                f"- **盈亏状态**: 买入价 {buy_price:.2f} | 现价 {current_price:.2f} | 盈亏 {current_gain_pct:.2f}%"
             ),
             current_price=current_price,
             highest_price=highest_price,
@@ -476,6 +606,10 @@ def check_one_position(
         "current_gain_pct": round(current_gain_pct, 4),
         "highest_gain_pct": round(highest_gain_pct, 4),
         "drawdown_pct": round(drawdown_pct, 4),
+        "tier": position_tier(position),
+        "intraday_disaster_stop_pct": round(intraday_stop_pct, 4),
+        "eod_structural_stop_pct": round(structural_stop_pct, 4),
+        "trailing_active": trailing_active,
         "updated_highest": updated_highest,
         "checked_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -718,7 +852,7 @@ def check_order_book_imbalance(
 
 def should_verify_fake_dump(position: dict[str, Any], current_price: float) -> bool:
     buy_price = safe_float(position.get("buy_price"))
-    if buy_price > 0 and current_price <= buy_price * 0.97:
+    if buy_price > 0 and gain_pct(current_price, buy_price) <= intraday_disaster_stop_pct(position):
         return False
     return current_price > 0
 
@@ -863,7 +997,7 @@ def check_anti_nuclear_pool(
         }
 
     current_gain = gain_pct(current_price, buy_price)
-    if current_gain <= -3.0:
+    if current_gain <= intraday_disaster_stop_pct(position):
         return finish_anti_nuclear_observation(
             position=position,
             ledger=ledger,
@@ -1032,6 +1166,12 @@ def close_position(
         checked_at=now,
         dry_run=dry_run,
     )
+    mac_sniper_result = execute_mac_sniper_sell(
+        position=position,
+        code=code,
+        settlement_price=settlement_price,
+        dry_run=dry_run,
+    )
 
     closed = dict(position)
     closed.update(
@@ -1048,6 +1188,7 @@ def close_position(
             "closed_at": now,
             "push_status": push_result,
             "daily_pick_sync": daily_pick_sync,
+            "mac_sniper": mac_sniper_result,
         }
     )
 
@@ -1074,9 +1215,84 @@ def close_position(
         "highest_gain_pct": round(highest_gain_pct, 4),
         "drawdown_pct": round(drawdown_pct, 4),
         "pushplus": push_result,
+        "markdown": content,
         "daily_pick_sync": daily_pick_sync,
+        "mac_sniper": mac_sniper_result,
         "dry_run": dry_run,
     }
+
+
+def execute_mac_sniper_sell(
+    position: dict[str, Any],
+    code: str,
+    settlement_price: float,
+    dry_run: bool,
+) -> dict[str, Any]:
+    if not get_sniper_status():
+        return {"status": "skipped", "reason": "mac_sniper_locked"}
+
+    shares = close_share_count(position)
+    if shares <= 0:
+        return {"status": "skipped", "reason": "missing_shares", "code": code}
+
+    try:
+        print(f"💥 [物理清仓] Mac Sniper 卖出: {code} | {shares}股 | 参考价 {settlement_price:.2f}")
+        return aim_and_fire(
+            code,
+            shares=shares,
+            limit_price=settlement_price,
+            action_type="sell",
+            dry_run=dry_run,
+        )
+    except Exception as exc:
+        return {"status": "failed", "reason": "mac_sniper_sell_failed", "code": code, "shares": shares, "error": str(exc)}
+
+
+def close_share_count(position: dict[str, Any]) -> int:
+    for key in ("sell_shares", "close_shares", "shares", "quantity", "available_quantity", "stock_balance", "actual_quantity"):
+        shares = safe_int(position.get(key))
+        if shares and shares > 0:
+            return shares
+    return shadow_account_share_count(normalize_code(position.get("code")))
+
+
+def shadow_account_share_count(code: str) -> int:
+    if not SHADOW_ACCOUNT_PATH.exists():
+        return 0
+    try:
+        account = json.loads(SHADOW_ACCOUNT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+
+    for order in account.get("locked_orders") or []:
+        if not isinstance(order, dict):
+            continue
+        try:
+            order_code = normalize_code(order.get("code"))
+        except ValueError:
+            continue
+        if order_code != code:
+            continue
+        for key in ("available_quantity", "stock_balance", "actual_quantity", "shares"):
+            shares = safe_int(order.get(key))
+            if shares and shares > 0:
+                return shares
+
+    broker_snapshot = account.get("broker_snapshot") if isinstance(account.get("broker_snapshot"), dict) else {}
+    for broker_position in broker_snapshot.get("positions") or []:
+        if not isinstance(broker_position, dict):
+            continue
+        try:
+            broker_code = normalize_code(broker_position.get("code"))
+        except ValueError:
+            continue
+        if broker_code != code:
+            continue
+        for key in ("available_quantity", "stock_balance", "actual_quantity", "shares"):
+            shares = safe_int(broker_position.get(key))
+            if shares and shares > 0:
+                return shares
+    return 0
 
 
 def sync_daily_pick_close(
@@ -1177,30 +1393,24 @@ def build_push_content(
 ) -> str:
     code = normalize_code(position.get("code"))
     name = str(position.get("name") or code)
-    strategy_type = str(position.get("strategy_type") or "").strip()
-    target_label = "T+3 日期" if supports_t_plus_3_timeout(position) else "目标日期"
     settlement_lines = ""
     close_price = safe_float(settlement_price)
     close_gain = safe_float(settlement_gain_pct)
     if close_price > 0 and settlement_basis != "realtime":
-        settlement_label = "结算价（开盘价）" if settlement_basis == "morning_auction_open" else "结算价"
-        settlement_lines = f"- {settlement_label}：{close_price:.2f}\n- 结算盈亏：{close_gain:.2f}%\n"
-    return f"""## {message}
-
-- 标的：{name}({code})
-- 命中策略：{strategy_type or "-"}
-- 触发规则：{reason}
-- 买入价：{buy_price:.2f}
-- 盘中最高价：{highest_price:.2f}
-- 触发价：{current_price:.2f}
-{settlement_lines}
-- 最高盈利：{highest_gain_pct:.2f}%
-- 当前盈利：{current_gain_pct:.2f}%
-- 较最高点回撤：{abs(drawdown_pct):.2f}%
-- 买入日期：{position.get("buy_date") or "-"}
-- {target_label}：{position.get("target_date") or "-"}
-- 行情时间：{quote.get("date") or "-"} {quote.get("time") or "-"}
-- 检查时间：{checked_at}
+        settlement_label = "开盘结算" if settlement_basis == "morning_auction_open" else "结算"
+        settlement_lines = f"\n- **{settlement_label}**: {close_price:.2f} | 结算盈亏 {close_gain:.2f}%"
+    elif close_price > 0:
+        settlement_lines = f"\n- **卖出结算**: {close_price:.2f} | 收益率 {close_gain:.2f}%"
+    gain_label = "跌幅" if current_gain_pct < 0 else "盈亏"
+    strategy_type = str(position.get("strategy_type") or "-")
+    reason_text = close_alert_heading(reason, name, code).replace("### 🚨 ", "").split("|", 1)[0].strip()
+    return f"""{close_alert_heading(reason, name, code)}
+- **卖出代码** (长按下方数字复制):
+`{code}`
+- **卖出策略**: {reason_text}
+- **命中军团**: {strategy_type}
+- **当前状态**: 现价 {current_price:.2f} | {gain_label} {current_gain_pct:.2f}%{settlement_lines}
+- **最高浮盈**: {highest_gain_pct:.2f}% | **高点回撤**: {drawdown_pct:.2f}%
 """
 
 
@@ -1420,6 +1630,8 @@ def scan_pause_reason(now: Optional[datetime] = None) -> str:
 def is_t_plus_3_timeout(position: dict[str, Any], today: Optional[date] = None) -> bool:
     if not supports_t_plus_3_timeout(position):
         return False
+    if not is_eod_structural_stop_window():
+        return False
 
     current_day = today or date.today()
     target_date = parse_date(position.get("target_date"))
@@ -1434,12 +1646,58 @@ def is_t_plus_3_timeout(position: dict[str, Any], today: Optional[date] = None) 
 
 def supports_t_plus_3_timeout(position: dict[str, Any]) -> bool:
     strategy_type = str(position.get("strategy_type") or "").strip()
+    if strategy_type in DEPRECATED_STRATEGY_TYPES:
+        return False
+    return True
+
+
+def position_tier(position: dict[str, Any]) -> str:
+    tier = str(position.get("tier") or position.get("selection_tier") or "").strip()
+    if not tier:
+        tier = "base"
+    return tier
+
+
+def is_sniper_position(position: dict[str, Any]) -> bool:
+    strategy_type = str(position.get("strategy_type") or "").strip()
     if strategy_type:
-        if strategy_type in NON_SWING_STRATEGY_TYPES:
-            return False
-        return strategy_type in SWING_STRATEGY_TYPES
-    # Legacy manually added positions had no strategy_type; their target_date was T+3.
-    return str(position.get("source") or "") != "daily_picks_1450"
+        return strategy_type in SNIPER_STRATEGY_TYPES
+    return position_tier(position) == "dynamic_floor"
+
+
+def intraday_disaster_stop_pct(position: dict[str, Any]) -> float:
+    return SNIPER_INTRADAY_DISASTER_STOP_PCT if is_sniper_position(position) else REGULAR_INTRADAY_DISASTER_STOP_PCT
+
+
+def eod_structural_stop_pct(position: dict[str, Any]) -> float:
+    return SNIPER_EOD_STRUCTURAL_STOP_PCT if is_sniper_position(position) else REGULAR_EOD_STRUCTURAL_STOP_PCT
+
+
+def is_eod_structural_stop_window(now: Optional[datetime] = None) -> bool:
+    current = now or datetime.now()
+    current_time = current.time()
+    return EOD_STRUCTURAL_STOP_START <= current_time <= MARKET_CLOSE
+
+
+def tier_stop_loss_pct(position: dict[str, Any]) -> float:
+    return intraday_disaster_stop_pct(position)
+
+
+def tier_display(position: dict[str, Any]) -> tuple[str, str]:
+    if is_sniper_position(position):
+        return "敢死队", "极严监控"
+    return "正规军", "标准监控"
+
+
+def close_alert_heading(reason: str, name: str, code: str) -> str:
+    labels = {
+        "intraday_disaster_stop": "日内防爆止损",
+        "eod_structural_stop": "尾盘破位卖出",
+        "trailing_take_profit": "追踪止盈触发",
+        "t3_timeout": "T+3 到期清仓",
+        "breakout_open_stop": "核按钮触发",
+    }
+    return f"### 🚨 {labels.get(reason, '卖出警告')} | {name}"
 
 
 def t_plus_3_date(buy_date: str) -> str:
@@ -1498,7 +1756,7 @@ def gain_pct(price: float, base: float) -> float:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="盘中持仓巡逻兵：硬止损 + 动态追踪止盈 + T+3 超时")
+    parser = argparse.ArgumentParser(description="V5.6 盘中巡逻兵：非对称防爆止损、追踪止盈、尾盘结构止损与 T+3 清仓")
     parser.add_argument("--ledger", default=str(LEDGER_PATH), help="shadow_ledger.json 路径")
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_SECONDS, help="循环间隔秒数")
     parser.add_argument("--once", action="store_true", help="只检查一轮")
@@ -1514,6 +1772,14 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--buy-price", required=True, type=float)
     add.add_argument("--buy-date", default=None)
     add.add_argument("--target-date", default=None)
+
+    mock = subparsers.add_parser("mock-alert", help="干跑生成一条一键核按钮卖出警报")
+    mock.add_argument("--code", default="002027")
+    mock.add_argument("--name", default="分众传媒")
+    mock.add_argument("--buy-price", type=float, default=6.42)
+    mock.add_argument("--current-price", type=float, default=6.32)
+    mock.add_argument("--tier", default="dynamic_floor", choices=["base", "dynamic_floor"])
+    mock.add_argument("--strategy-type", default="尾盘突破")
     return parser
 
 
@@ -1532,6 +1798,18 @@ def main(argv: Optional[list[str]] = None) -> None:
             path=ledger_path,
         )
         print(json.dumps({"status": "added", "position": position}, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "mock-alert":
+        mock_stop_loss_alert(
+            code=args.code,
+            name=args.name,
+            buy_price=args.buy_price,
+            current_price=args.current_price,
+            tier=args.tier,
+            strategy_type=args.strategy_type,
+            path=ledger_path,
+        )
         return
 
     if args.seed_only:

@@ -33,4 +33,4 @@ launchctl enable "gui/$(id -u)/com.eudis.quant.exit-sentinel-0921"
 launchctl enable "gui/$(id -u)/com.eudis.quant.exit-sentinel-0925"
 launchctl enable "gui/$(id -u)/com.eudis.quant.swing-patrol"
 
-echo "Installed daily pick, 09:16/09:21/09:25 staged exit sentinels and 14:45 swing patrol LaunchAgents."
+echo "Installed daily pick, 09:16/09:21/09:25 staged exit sentinels and 15:10 T+3 close settlement LaunchAgents."

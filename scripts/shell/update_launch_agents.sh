@@ -103,7 +103,7 @@ plists = {
         [str(root / "scripts/shell/run_swing_patrol.sh")],
         "swing_patrol_agent.log",
         "swing_patrol_agent_err.log",
-        schedule=(14, 45),
+        schedule=(15, 10),
     ),
     "com.eudis.quant.v3-sniper-lock.plist": base(
         "com.eudis.quant.v3-sniper-lock",

@@ -21,6 +21,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from quant_core.ai_agent.agent_gateway import run_1446_ai_interview
+from quant_core.cache_utils import CACHE_DIR, read_json_cache
 from quant_core.config import MODELS_DIR
 from quant_core.data_pipeline.concept_engine import CONCEPT_CATALOG_PATH, CONCEPT_INDEX_PATH, get_stock_concept_map
 from quant_core.data_pipeline.market import fetch_realtime_quote, fetch_sina_snapshot
@@ -85,7 +86,7 @@ async def scan_today(
 
 @router.get("/sniper/history")
 async def sniper_history(limit: int = Query(default=20, ge=1, le=120)) -> dict[str, Any]:
-    """Return immutable daily V4 Theme Alpha sniper locks with T+1/T+2/T+3 close follow-up."""
+    """Return V4 Theme Alpha sniper locks plus synced 全局动量狙击 backtest settlement rows."""
     return await asyncio.to_thread(_sniper_history_sync, limit)
 
 
@@ -230,10 +231,12 @@ def lock_today_sniper_snapshot(limit: int = 0, max_workers: int = 8) -> dict[str
 def _sniper_history_sync(limit: int) -> dict[str, Any]:
     locks = list_v3_sniper_locks(limit=limit)
     rows: list[dict[str, Any]] = []
+    backtest_by_date = _global_momentum_backtest_history(limit=limit)
     for lock in locks:
         payload = dict(lock.get("payload") or {})
         signals = _filter_display_rows(list(payload.get("rows") or []))[: int(payload.get("top_k") or _TOP_K)]
         stocks = [_history_stock_row(signal, str(lock["selection_date"])) for signal in signals]
+        _merge_backtest_stocks(stocks, backtest_by_date.pop(str(lock["selection_date"]), []))
         rows.append(
             {
                 "id": lock.get("id"),
@@ -246,11 +249,161 @@ def _sniper_history_sync(limit: int) -> dict[str, Any]:
                 "stocks": stocks,
             }
         )
+    for selection_date in sorted(backtest_by_date.keys(), reverse=True):
+        stocks = backtest_by_date[selection_date]
+        if not stocks:
+            continue
+        rows.append(
+            {
+                "id": f"backtest-global-{selection_date}",
+                "selection_date": selection_date,
+                "locked_at": f"{selection_date}T15:00:00",
+                "top_k": len(stocks),
+                "signal_count": len(stocks),
+                "elapsed_seconds": None,
+                "live_source": "top_pick_backtest_m12",
+                "history_source": "top_pick_backtest_m12",
+                "stocks": stocks,
+            }
+        )
+        if len(rows) >= limit:
+            break
+    rows = sorted(rows, key=lambda item: str(item.get("selection_date") or ""), reverse=True)[:limit]
     return {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "count": len(rows),
+        "backtest_sync": {
+            "enabled": True,
+            "source": "data/strategy_cache/top_pick_backtest_m12.json",
+            "strategy_type": "全局动量狙击",
+        },
         "rows": rows,
     }
+
+
+def _merge_backtest_stocks(stocks: list[dict[str, Any]], backtest_stocks: list[dict[str, Any]]) -> None:
+    if not backtest_stocks:
+        return
+    by_code = {str(item.get("code") or ""): item for item in stocks}
+    for backtest in backtest_stocks:
+        code = str(backtest.get("code") or "")
+        if code in by_code:
+            target = by_code[code]
+            target.update(
+                {
+                    "backtest_sync": True,
+                    "t3_max_gain_pct": backtest.get("t3_max_gain_pct"),
+                    "t3_close": backtest.get("t3_close"),
+                    "t3_close_return_pct": backtest.get("t3_close_return_pct"),
+                    "t3_settlement_price": backtest.get("t3_settlement_price"),
+                    "t3_settlement_return_pct": backtest.get("t3_settlement_return_pct"),
+                    "close_price": backtest.get("close_price"),
+                    "close_return_pct": backtest.get("close_return_pct"),
+                    "success": backtest.get("success"),
+                }
+            )
+            if len(target.get("t_days") or []) >= 3 and backtest.get("t3_close") is not None:
+                target["t_days"][2].update(
+                    {
+                        "status": "closed",
+                        "date": backtest.get("t3_exit_date") or target["t_days"][2].get("date"),
+                        "close": backtest.get("t3_close"),
+                        "return_pct": backtest.get("t3_close_return_pct"),
+                        "source": "top_pick_backtest_m12",
+                    }
+                )
+        else:
+            stocks.append(backtest)
+
+
+def _global_momentum_backtest_history(limit: int = 120) -> dict[str, list[dict[str, Any]]]:
+    payload = _read_top_pick_backtest_payload()
+    if not payload:
+        return {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in payload.get("rows") or []:
+        if str(row.get("strategy_type") or "") != "全局动量狙击":
+            continue
+        selection_date = str(row.get("selection_date") or row.get("date") or "")[:10]
+        if not selection_date:
+            continue
+        grouped.setdefault(selection_date, []).append(_backtest_history_stock_row(dict(row), selection_date))
+        if len(grouped) >= limit:
+            break
+    return grouped
+
+
+def _read_top_pick_backtest_payload() -> dict[str, Any] | None:
+    cached = read_json_cache("top_pick_backtest", 12)
+    if cached:
+        return cached
+    path = CACHE_DIR / "top_pick_backtest_m12.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _backtest_history_stock_row(row: dict[str, Any], selection_date: str) -> dict[str, Any]:
+    base_close = _safe_float(_first_present(row, "snapshot_price", "selection_price", "close"), None)
+    signal = {
+        "code": row.get("code"),
+        "name": row.get("name"),
+        "close": base_close,
+        "theme_name": _first_present(row, "theme_name", "core_theme"),
+        "theme_source": row.get("theme_source") or "",
+        "theme_pct_chg_3": _first_present(row, "theme_pct_chg_3", "theme_momentum_3d", "theme_momentum"),
+        "probability_pct": _first_present(row, "global_probability_pct", "probability_pct", "composite_score"),
+        "pct_chg": _first_present(row, "pct_chg", "change"),
+        "live_quote_time": row.get("snapshot_time") or "15:00",
+        "strategy_type": "全局动量狙击",
+    }
+    stock = _history_stock_row(signal, selection_date)
+    t3_close = _safe_float(_first_present(row, "t3_close", "t3_settlement_price", "close_price"), None)
+    t3_return = _safe_float(_first_present(row, "t3_close_return_pct", "t3_settlement_return_pct", "close_return_pct"), None)
+    t3_exit_date = row.get("t3_exit_date")
+    if len(stock.get("t_days") or []) >= 3 and t3_close is not None and t3_return is not None:
+        stock["t_days"][2].update(
+            {
+                "status": "closed",
+                "date": t3_exit_date or stock["t_days"][2].get("date"),
+                "close": round(float(t3_close), 4),
+                "return_pct": round(float(t3_return), 4),
+                "source": "top_pick_backtest_m12",
+                "checked_at": f"{t3_exit_date or selection_date}T15:00:00",
+            }
+        )
+    stock.update(
+        {
+            "history_source": "top_pick_backtest_m12",
+            "backtest_sync": True,
+            "locked_price": base_close,
+            "locked_quote_time": row.get("snapshot_time") or "15:00",
+            "strategy_type": "全局动量狙击",
+            "t3_exit_date": t3_exit_date,
+            "t3_max_gain_pct": _safe_float(row.get("t3_max_gain_pct"), None),
+            "t3_close": t3_close,
+            "t3_close_return_pct": t3_return,
+            "t3_settlement_price": _safe_float(_first_present(row, "t3_settlement_price", "t3_close", "close_price"), None),
+            "t3_settlement_return_pct": _safe_float(
+                _first_present(row, "t3_settlement_return_pct", "t3_close_return_pct", "close_return_pct"),
+                None,
+            ),
+            "close_price": _safe_float(_first_present(row, "close_price", "t3_settlement_price", "t3_close"), None),
+            "close_return_pct": _safe_float(_first_present(row, "close_return_pct", "t3_settlement_return_pct", "t3_close_return_pct"), None),
+            "success": row.get("success"),
+        }
+    )
+    return stock
+
+
+def _first_present(row: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value is not None and value != "":
+            return value
+    return None
 
 
 def _history_stock_row(signal: dict[str, Any], selection_date: str) -> dict[str, Any]:

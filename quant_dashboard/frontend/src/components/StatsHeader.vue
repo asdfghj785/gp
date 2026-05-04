@@ -23,6 +23,10 @@
       </article>
     </section>
 
+    <section class="header-actions" aria-label="顶部快捷操作">
+      <slot name="actions"></slot>
+    </section>
+
     <section class="lights" aria-label="服务指示灯">
       <span :class="['light', syncOk ? 'green' : 'yellow']" title="数据同步状态"></span>
       <span :class="['light', health?.pushplus?.ok ? 'green' : 'red']" title="推送服务状态"></span>
@@ -59,7 +63,7 @@ const modelOk = computed(() => Boolean(props.modelStatus && props.modelStatus !=
   top: 0;
   z-index: 10;
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) minmax(420px, 0.9fr) auto;
+  grid-template-columns: minmax(230px, 0.72fr) minmax(360px, 0.82fr) auto auto;
   gap: 14px;
   align-items: center;
   padding: 12px 18px;
@@ -126,6 +130,14 @@ const modelOk = computed(() => Boolean(props.modelStatus && props.modelStatus !=
   color: #f2f6ff;
   font-size: 0.92rem;
   overflow-wrap: anywhere;
+}
+
+.header-actions {
+  min-width: 0;
+}
+
+.header-actions:empty {
+  display: none;
 }
 
 .lights {

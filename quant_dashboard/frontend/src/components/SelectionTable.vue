@@ -84,7 +84,7 @@
           </div>
         </template>
       </el-table-column>
-      <el-table-column label="卖出/观察" min-width="150">
+      <el-table-column label="卖出策略" min-width="220">
         <template #default="{ row }">
           <el-popover
             v-if="isT3Strategy(row)"
@@ -117,13 +117,14 @@
           <span v-else>{{ exitText(row) }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="结算价 / 收益" align="right" min-width="150">
+      <el-table-column label="结算价 / 收益" align="right" min-width="170">
         <template #default="{ row }">
           <div v-if="row.is_closed" class="stacked">
             <small>{{ row.close_reason || row.close_date || '已结清' }}</small>
             <strong :class="numberClass(resultValue(row))">
-              {{ money(row.close_price) }} / {{ pct(resultValue(row)) }}
+              {{ money(closePrice(row)) }} / {{ pct(resultValue(row)) }}
             </strong>
+            <span v-if="maxFloatingGain(row) !== null" class="mfe-tag">MFE {{ pct(maxFloatingGain(row)) }}</span>
           </div>
           <span v-else class="muted-inline">{{ isSwingStrategy(row) ? '持仓观察' : '待结算' }}</span>
         </template>
@@ -133,9 +134,12 @@
           <span :class="stateClass(row)">{{ stateText(row) }}</span>
         </template>
       </el-table-column>
-      <el-table-column v-if="showInspect" label="风控" width="112" fixed="right">
+      <el-table-column label="操作" width="146" fixed="right">
         <template #default="{ row }">
-          <el-button link type="primary" @click="$emit('inspect', row)">Ollama</el-button>
+          <div class="row-actions">
+            <el-button link type="warning" @click="$emit('explain', row)">因子</el-button>
+            <el-button v-if="showInspect" link type="primary" @click="$emit('inspect', row)">Ollama</el-button>
+          </div>
         </template>
       </el-table-column>
     </el-table>
@@ -158,7 +162,7 @@ const props = defineProps({
   showInspect: { type: Boolean, default: false },
 })
 
-defineEmits(['inspect'])
+defineEmits(['inspect', 'explain'])
 
 const selectedMonth = ref('')
 const returnTrailCache = reactive({})
@@ -274,9 +278,13 @@ const themeMomentumClass = (value) => {
   return pctValue > 3 ? 'theme-hot' : numberClass(pctValue)
 }
 const rawWinner = (row) => row?.raw?.winner || {}
-const themeName = (row) => row?.core_theme || row?.theme_name || rawWinner(row)?.core_theme || rawWinner(row)?.theme_name || '-'
+const themeName = (row) => {
+  const value = row?.core_theme || row?.theme_name || rawWinner(row)?.core_theme || rawWinner(row)?.theme_name || ''
+  return value && value !== '-' ? value : '-'
+}
 const themeMomentum = (row) =>
-  row?.theme_momentum ?? row?.theme_pct_chg_3 ?? rawWinner(row)?.theme_momentum ?? rawWinner(row)?.theme_pct_chg_3 ?? null
+  row?.theme_momentum_3d ?? row?.theme_momentum ?? row?.theme_pct_chg_3 ??
+  rawWinner(row)?.theme_momentum_3d ?? rawWinner(row)?.theme_momentum ?? rawWinner(row)?.theme_pct_chg_3 ?? null
 const suggestedPosition = (row) => toNum(row?.suggested_position ?? rawWinner(row)?.suggested_position)
 const positionText = (row) => {
   const value = suggestedPosition(row)
@@ -290,10 +298,27 @@ const positionClass = (row) => {
   return 'position-badge position-normal'
 }
 const expected = (row) => toNum(row.expected_t3_max_gain_pct ?? row.expected_premium ?? row.predicted_open_premium ?? row.composite_score)
+const settlementReturn = (row) => toNum(
+  row.close_return_pct ??
+  row.t3_settlement_return_pct ??
+  rawWinner(row)?.t3_settlement_return_pct ??
+  row.t3_close_return_pct ??
+  rawWinner(row)?.t3_close_return_pct
+)
+const closePrice = (row) => toNum(
+  row.close_price ??
+  row.t3_settlement_price ??
+  rawWinner(row)?.t3_settlement_price ??
+  row.t3_close ??
+  rawWinner(row)?.t3_close
+)
+const maxFloatingGain = (row) => isSwingStrategy(row)
+  ? toNum(row.t3_max_gain_pct ?? rawWinner(row)?.t3_max_gain_pct)
+  : null
 const resultValue = (row) => {
-  const closedReturn = toNum(row.close_return_pct)
+  const closedReturn = settlementReturn(row)
   if (row.is_closed && closedReturn !== null) return closedReturn
-  return toNum(isSwingStrategy(row) ? row.t3_max_gain_pct : row.open_premium)
+  return isSwingStrategy(row) ? settlementReturn(row) : toNum(row.open_premium)
 }
 const primaryValue = (row) => isSwingStrategy(row) ? expected(row) : toNum(row.composite_score ?? row.win_rate)
 const primaryText = (row) => isSwingStrategy(row) ? pct(expected(row)) : `${(primaryValue(row) ?? 0).toFixed(2)} 分`
@@ -311,6 +336,9 @@ const numberClass = (value) => {
   return num > 0 ? 'rise' : 'fall'
 }
 const exitText = (row) => {
+  const policy = row?.sell_strategy || row?.exit_policy || rawWinner(row)?.sell_strategy || rawWinner(row)?.exit_policy
+  if (policy) return policy
+  if (row.is_closed) return row.close_reason || row.close_date || '已结清'
   if (isSwingStrategy(row)) return row.close_date || row.target_date || 'T+3 观察期'
   return row.close_date || row.target_date || row.next_date || 'T+1 开盘'
 }
@@ -422,11 +450,25 @@ h2 {
   --el-table-bg-color: var(--terminal-card);
   --el-table-tr-bg-color: var(--terminal-card);
   --el-table-header-bg-color: var(--terminal-bg);
-  --el-table-row-hover-bg-color: #1b2230;
+  --el-table-row-hover-bg-color: var(--terminal-card);
   --el-table-border-color: rgba(255, 255, 255, 0.07);
   --el-table-text-color: #d7deeb;
   --el-table-header-text-color: #7f8aa1;
   width: 100%;
+}
+
+.selection-table :deep(.el-table__body tr > td.el-table__cell),
+.selection-table :deep(.el-table__body tr:hover > td.el-table__cell),
+.selection-table :deep(.el-table__body tr.current-row > td.el-table__cell),
+.selection-table :deep(.el-table__body tr.el-table__row--striped > td.el-table__cell) {
+  background-color: var(--terminal-card) !important;
+}
+
+.row-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
 }
 
 .stock-stack {
@@ -553,9 +595,9 @@ h2 {
 }
 
 .strategy-reversal {
-  border: 1px solid rgba(245, 34, 45, 0.45);
-  background: rgba(245, 34, 45, 0.15);
-  color: #ff7875;
+  border: 1px solid rgba(250, 173, 20, 0.58);
+  background: rgba(250, 173, 20, 0.16);
+  color: #ffd666;
 }
 
 .strategy-main {
@@ -604,6 +646,19 @@ h2 {
 .stacked small {
   color: #6f7d95;
   font-size: 0.7rem;
+}
+
+.mfe-tag {
+  display: inline-flex;
+  align-self: flex-end;
+  border: 1px solid rgba(127, 138, 161, 0.28);
+  border-radius: 999px;
+  padding: 1px 6px;
+  background: rgba(127, 138, 161, 0.1);
+  color: #7f8aa1;
+  font-size: 0.66rem;
+  font-weight: 900;
+  line-height: 1.25;
 }
 
 .muted-inline {
