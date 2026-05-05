@@ -31,11 +31,11 @@
               <td colspan="8" class="empty-row">暂无数据</td>
             </tr>
             <tr v-for="item in rows" :key="item.代码">
-              <td class="mono">{{ item.代码 }}</td>
               <td>
-                <button class="name-btn" type="button" @click="openAnalysis(item)">
-                  {{ item.名称 }}
-                </button>
+                <StockLink :code="item.代码" :name="item.名称" :label="item.代码" mono class="radar-stock-code" />
+              </td>
+              <td>
+                <StockLink :code="item.代码" :name="item.名称" :label="item.名称" class="name-btn" />
               </td>
               <td>{{ formatNumber(item.最新价) }}</td>
               <td :class="changeClass(item.涨跌幅)">{{ formatPercent(item.涨跌幅) }}</td>
@@ -55,7 +55,14 @@
       <aside class="drawer-panel">
         <header class="drawer-head">
           <div>
-            <div class="drawer-stock">{{ activeStock?.名称 }} ({{ activeStock?.代码 }})</div>
+            <div class="drawer-stock">
+              <StockLink
+                v-if="activeStock"
+                :code="activeStock.代码"
+                :name="activeStock.名称"
+                :label="`${activeStock.名称} (${activeStock.代码})`"
+              />
+            </div>
             <div class="drawer-sub">深度分析引擎</div>
           </div>
           <button class="close-btn" type="button" @click="closeDrawer">✕</button>
@@ -135,6 +142,7 @@
 
 <script setup>
 import { onMounted, ref } from 'vue'
+import StockLink from './components/StockLink.vue'
 
 const rows = ref([])
 const loading = ref(false)
@@ -348,6 +356,11 @@ onMounted(fetchData)
 
 .name-btn:hover {
   color: #c0ecff;
+}
+
+.radar-stock-code {
+  color: #e5eeff;
+  font-weight: 800;
 }
 
 .action-btn {

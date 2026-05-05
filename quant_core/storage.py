@@ -28,6 +28,7 @@ DAILY_COLUMNS = [
     "source",
     "ingested_at",
 ]
+LIVE_DAILY_SOURCES = {"sina_close_sync", "sina_snapshot", "sina_open_check"}
 
 
 def connect() -> sqlite3.Connection:
@@ -79,6 +80,29 @@ def init_db() -> None:
                 rows_json TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS v3_sniper_locks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                selection_date TEXT NOT NULL UNIQUE,
+                locked_at TEXT NOT NULL,
+                top_k INTEGER NOT NULL DEFAULT 5,
+                payload_json TEXT NOT NULL,
+                created_by TEXT NOT NULL DEFAULT 'v3_sniper_1450'
+            );
+
+            CREATE TABLE IF NOT EXISTS v3_sniper_followups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                selection_date TEXT NOT NULL,
+                code TEXT NOT NULL,
+                horizon INTEGER NOT NULL,
+                trade_date TEXT NOT NULL,
+                close REAL,
+                return_pct REAL,
+                change_pct REAL,
+                checked_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'stock_daily',
+                UNIQUE(selection_date, code, horizon)
+            );
+
             CREATE TABLE IF NOT EXISTS daily_picks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 selection_date TEXT NOT NULL,
@@ -100,6 +124,8 @@ def init_db() -> None:
                 open_checked_at TEXT,
                 open_premium REAL,
                 t3_max_gain_pct REAL DEFAULT NULL,
+                suggested_position REAL DEFAULT NULL,
+                tier TEXT,
                 success INTEGER,
                 is_closed INTEGER NOT NULL DEFAULT 0,
                 close_date TEXT,
@@ -112,6 +138,8 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_daily_picks_target_date ON daily_picks(target_date);
             CREATE INDEX IF NOT EXISTS idx_daily_picks_status ON daily_picks(status);
+            CREATE INDEX IF NOT EXISTS idx_v3_sniper_followups_selection ON v3_sniper_followups(selection_date);
+            CREATE INDEX IF NOT EXISTS idx_v3_sniper_followups_code ON v3_sniper_followups(code);
 
             CREATE TABLE IF NOT EXISTS market_sync_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,6 +163,8 @@ def init_db() -> None:
         _ensure_daily_picks_multi_strategy_schema(conn)
         _ensure_column(conn, "daily_picks", "strategy_type", "TEXT NOT NULL DEFAULT '尾盘突破'")
         _ensure_column(conn, "daily_picks", "t3_max_gain_pct", "REAL DEFAULT NULL")
+        _ensure_column(conn, "daily_picks", "suggested_position", "REAL DEFAULT NULL")
+        _ensure_column(conn, "daily_picks", "tier", "TEXT")
         _ensure_column(conn, "daily_picks", "snapshot_time", "TEXT")
         _ensure_column(conn, "daily_picks", "snapshot_price", "REAL")
         _ensure_column(conn, "daily_picks", "snapshot_vol_ratio", "REAL")
@@ -169,8 +199,24 @@ def init_db() -> None:
         )
         conn.execute(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS uidx_daily_picks_date_strategy
-            ON daily_picks(selection_date, strategy_type)
+            UPDATE daily_picks
+            SET tier = COALESCE(NULLIF(tier, ''), NULLIF(json_extract(raw_json, '$.winner.selection_tier'), ''), 'base')
+            WHERE tier IS NULL OR tier = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE daily_picks
+            SET suggested_position = json_extract(raw_json, '$.winner.suggested_position')
+            WHERE suggested_position IS NULL
+              AND json_extract(raw_json, '$.winner.suggested_position') IS NOT NULL
+            """
+        )
+        conn.execute("DROP INDEX IF EXISTS uidx_daily_picks_date_strategy")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uidx_daily_picks_date_strategy_code
+            ON daily_picks(selection_date, strategy_type, code)
             """
         )
         conn.executescript(
@@ -194,6 +240,18 @@ def init_db() -> None:
             WHEN OLD.snapshot_vol_ratio IS NOT NULL AND NEW.snapshot_vol_ratio IS NOT OLD.snapshot_vol_ratio
             BEGIN
                 SELECT RAISE(ABORT, 'snapshot_vol_ratio is immutable once written');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_v3_sniper_locks_immutable_update
+            BEFORE UPDATE ON v3_sniper_locks
+            BEGIN
+                SELECT RAISE(ABORT, 'v3_sniper_locks are immutable once written');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_v3_sniper_locks_immutable_delete
+            BEFORE DELETE ON v3_sniper_locks
+            BEGIN
+                SELECT RAISE(ABORT, 'v3_sniper_locks cannot be deleted');
             END;
             """
         )
@@ -278,6 +336,7 @@ def _parse_mixed_dates(values: pd.Series) -> pd.Series:
 def upsert_daily_rows(df: pd.DataFrame, source: str = "unknown") -> int:
     init_db()
     rows_df = normalize_daily_frame(df, source=source)
+    rows_df = _filter_live_trading_dates(rows_df, source=source)
     if rows_df.empty:
         return 0
     rows = [
@@ -294,6 +353,31 @@ def upsert_daily_rows(df: pd.DataFrame, source: str = "unknown") -> int:
     with connect() as conn:
         conn.executemany(sql, rows)
     return len(rows)
+
+
+def _filter_live_trading_dates(rows_df: pd.DataFrame, source: str) -> pd.DataFrame:
+    if rows_df.empty or source not in LIVE_DAILY_SOURCES or "date" not in rows_df.columns:
+        return rows_df
+
+    unique_dates = sorted(str(item) for item in rows_df["date"].dropna().unique().tolist())
+    if not unique_dates:
+        return rows_df
+
+    max_day = pd.to_datetime(unique_dates[-1], errors="coerce")
+    if pd.isna(max_day):
+        return rows_df.iloc[0:0].copy()
+
+    try:
+        from quant_core.data_pipeline.trading_calendar import trading_days_on_or_before
+
+        valid_days = {
+            item.isoformat()
+            for item in trading_days_on_or_before(max_day.date(), lookback_days=max(90, len(unique_dates) + 30))
+        }
+    except Exception as exc:
+        raise RuntimeError(f"交易日校验失败，拒绝写入实时日线: {exc}") from exc
+
+    return rows_df[rows_df["date"].astype(str).isin(valid_days)].copy()
 
 
 def import_parquet_files(
@@ -423,6 +507,212 @@ def save_prediction_snapshot(strategy: str, rows: list[dict[str, Any]]) -> int:
         return int(cursor.lastrowid)
 
 
+def save_v3_sniper_lock(payload: dict[str, Any], created_by: str = "v3_sniper_1450") -> dict[str, Any]:
+    init_db()
+    selection_date = str(payload.get("prediction_date") or datetime.now().date().isoformat())
+    locked_at = str(payload.get("locked_at") or datetime.now().isoformat(timespec="seconds"))
+    top_k = int(payload.get("top_k") or 5)
+    stored_payload = dict(payload)
+    stored_payload["prediction_date"] = selection_date
+    stored_payload["locked"] = True
+    stored_payload["locked_at"] = locked_at
+    stored_payload["lock_source"] = created_by
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO v3_sniper_locks (selection_date, locked_at, top_k, payload_json, created_by)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                selection_date,
+                locked_at,
+                top_k,
+                json.dumps(stored_payload, ensure_ascii=False),
+                created_by,
+            ),
+        )
+        inserted = int(cursor.rowcount or 0) > 0
+        row = conn.execute(
+            """
+            SELECT id, selection_date, locked_at, top_k, payload_json, created_by
+            FROM v3_sniper_locks
+            WHERE selection_date = ?
+            LIMIT 1
+            """,
+            (selection_date,),
+        ).fetchone()
+    item = _decode_v3_sniper_lock(row)
+    if item:
+        item["inserted"] = inserted
+    return item or {"inserted": False, "payload": stored_payload}
+
+
+def get_v3_sniper_lock(selection_date: str) -> dict[str, Any] | None:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, selection_date, locked_at, top_k, payload_json, created_by
+            FROM v3_sniper_locks
+            WHERE selection_date = ?
+            LIMIT 1
+            """,
+            (selection_date,),
+        ).fetchone()
+    return _decode_v3_sniper_lock(row)
+
+
+def latest_v3_sniper_lock() -> dict[str, Any] | None:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, selection_date, locked_at, top_k, payload_json, created_by
+            FROM v3_sniper_locks
+            ORDER BY selection_date DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    return _decode_v3_sniper_lock(row)
+
+
+def list_v3_sniper_locks(limit: int = 20) -> list[dict[str, Any]]:
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, selection_date, locked_at, top_k, payload_json, created_by
+            FROM v3_sniper_locks
+            ORDER BY selection_date DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    return [item for item in (_decode_v3_sniper_lock(row) for row in rows) if item]
+
+
+def v3_sniper_future_closes(code: str, selection_date: str, limit: int = 3) -> list[dict[str, Any]]:
+    init_db()
+    clean_code = str(code).zfill(6)[-6:]
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT code, name, date, open, high, low, close, pre_close, change_pct,
+                   volume, amount, turnover, volume_ratio
+            FROM stock_daily
+            WHERE code = ? AND date > ?
+              AND strftime('%w', date) NOT IN ('0', '6')
+            ORDER BY date ASC
+            LIMIT ?
+            """,
+            (clean_code, selection_date, int(limit)),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def v3_sniper_followup_rows(code: str, selection_date: str, limit: int = 3) -> list[dict[str, Any]]:
+    init_db()
+    clean_code = str(code).zfill(6)[-6:]
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT selection_date, code, horizon, trade_date AS date, close, return_pct,
+                   change_pct, checked_at, source
+            FROM v3_sniper_followups
+            WHERE selection_date = ? AND code = ?
+            ORDER BY horizon ASC
+            LIMIT ?
+            """,
+            (selection_date, clean_code, int(limit)),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_v3_sniper_followups(limit_locks: int = 120) -> dict[str, Any]:
+    """Materialize V3 Top-5 T+1/T+2/T+3 closes without mutating lock rows."""
+    init_db()
+    locks = list_v3_sniper_locks(limit=limit_locks)
+    checked_at = datetime.now().isoformat(timespec="seconds")
+    rows_to_write: list[tuple[Any, ...]] = []
+    for lock in locks:
+        selection_date = str(lock.get("selection_date") or "")
+        payload = dict(lock.get("payload") or {})
+        top_k = int(lock.get("top_k") or payload.get("top_k") or 5)
+        signals = list(payload.get("rows") or [])[:top_k]
+        for signal in signals:
+            code = str(signal.get("code") or "").zfill(6)[-6:]
+            if len(code) != 6:
+                continue
+            base_close = _safe_float(signal.get("close"))
+            closes = v3_sniper_future_closes(code, selection_date, limit=3)
+            for index, row in enumerate(closes[:3], start=1):
+                close = _safe_float(row.get("close"))
+                return_pct = None
+                if base_close and close:
+                    return_pct = round((float(close) / float(base_close) - 1) * 100, 2)
+                rows_to_write.append(
+                    (
+                        selection_date,
+                        code,
+                        index,
+                        row.get("date"),
+                        close,
+                        return_pct,
+                        _safe_float(row.get("change_pct")),
+                        checked_at,
+                        "stock_daily",
+                    )
+                )
+
+    if not rows_to_write:
+        return {"locks_seen": len(locks), "rows_upserted": 0, "checked_at": checked_at}
+
+    with connect() as conn:
+        conn.executemany(
+            """
+            INSERT INTO v3_sniper_followups (
+                selection_date, code, horizon, trade_date, close, return_pct,
+                change_pct, checked_at, source
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(selection_date, code, horizon) DO UPDATE SET
+                trade_date = excluded.trade_date,
+                close = excluded.close,
+                return_pct = excluded.return_pct,
+                change_pct = excluded.change_pct,
+                checked_at = excluded.checked_at,
+                source = excluded.source
+            """,
+            rows_to_write,
+        )
+    return {"locks_seen": len(locks), "rows_upserted": len(rows_to_write), "checked_at": checked_at}
+
+
+def _decode_v3_sniper_lock(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if not row:
+        return None
+    item = dict(row)
+    payload = json.loads(item.pop("payload_json"))
+    payload.setdefault("prediction_date", item["selection_date"])
+    payload.setdefault("locked_at", item["locked_at"])
+    payload.setdefault("top_k", item["top_k"])
+    payload["locked"] = True
+    payload["lock_id"] = item["id"]
+    payload["lock_source"] = item.get("created_by") or "v3_sniper_1450"
+    item["payload"] = payload
+    return item
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(num):
+        return None
+    return num
+
+
 def latest_prediction_snapshot() -> dict[str, Any] | None:
     init_db()
     with connect() as conn:
@@ -441,6 +731,12 @@ def save_daily_pick(pick: dict[str, Any]) -> int:
     init_db()
     strategy_type = pick.get("strategy_type") or (pick.get("raw") or {}).get("winner", {}).get("strategy_type") or "尾盘突破"
     t3_max_gain_pct = pick.get("t3_max_gain_pct")
+    raw_payload = _daily_pick_raw_payload_with_theme_contract(pick)
+    raw_winner = raw_payload.get("winner", {}) if isinstance(raw_payload, dict) else {}
+    suggested_position = pick.get("suggested_position", raw_winner.get("suggested_position") if isinstance(raw_winner, dict) else None)
+    tier = pick.get("tier") or pick.get("selection_tier")
+    if not tier and isinstance(raw_winner, dict):
+        tier = raw_winner.get("selection_tier")
     selected_at = str(pick["selected_at"])
     snapshot_time = pick.get("snapshot_time") or (selected_at.split("T", 1)[1] if "T" in selected_at else selected_at)
     snapshot_price = pick.get("snapshot_price", pick.get("selection_price"))
@@ -453,10 +749,10 @@ def save_daily_pick(pick: dict[str, Any]) -> int:
             INSERT INTO daily_picks (
                 selection_date, target_date, selected_at, code, name, strategy_type, win_rate,
                 selection_price, selection_change, snapshot_time, snapshot_price, snapshot_vol_ratio,
-                is_shadow_test, model_status, status, t3_max_gain_pct, raw_json
+                is_shadow_test, model_status, status, t3_max_gain_pct, suggested_position, tier, raw_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(selection_date, strategy_type) DO NOTHING
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(selection_date, strategy_type, code) DO NOTHING
             """,
             (
                 pick["selection_date"],
@@ -475,10 +771,60 @@ def save_daily_pick(pick: dict[str, Any]) -> int:
                 pick.get("model_status"),
                 pick.get("status", "pending_open"),
                 t3_max_gain_pct,
-                json.dumps(pick.get("raw", pick), ensure_ascii=False),
+                suggested_position,
+                tier,
+                json.dumps(raw_payload, ensure_ascii=False),
             ),
         )
         return int(cursor.lastrowid or 0) if cursor.rowcount else 0
+
+
+def _daily_pick_raw_payload_with_theme_contract(pick: dict[str, Any]) -> dict[str, Any]:
+    raw = dict(pick.get("raw") or pick)
+    winner = raw.get("winner") if isinstance(raw.get("winner"), dict) else {}
+    winner = dict(winner)
+    raw["winner"] = winner
+
+    core_theme = _theme_text(
+        pick.get("core_theme"),
+        pick.get("theme_name"),
+        winner.get("core_theme"),
+        winner.get("theme_name"),
+    )
+    momentum = _optional_float(
+        pick.get("theme_momentum_3d")
+        if pick.get("theme_momentum_3d") is not None
+        else pick.get("theme_momentum")
+        if pick.get("theme_momentum") is not None
+        else pick.get("theme_pct_chg_3")
+        if pick.get("theme_pct_chg_3") is not None
+        else winner.get("theme_momentum_3d")
+        if winner.get("theme_momentum_3d") is not None
+        else winner.get("theme_momentum")
+        if winner.get("theme_momentum") is not None
+        else winner.get("theme_pct_chg_3")
+    )
+    if momentum is None:
+        momentum = 0.0
+
+    raw["core_theme"] = core_theme
+    raw["theme_momentum_3d"] = momentum
+    winner["core_theme"] = core_theme
+    winner["theme_name"] = _theme_text(winner.get("theme_name"), core_theme)
+    winner["theme_momentum_3d"] = momentum
+    winner["theme_momentum"] = _optional_float(winner.get("theme_momentum")) if winner.get("theme_momentum") is not None else momentum
+    winner["theme_pct_chg_3"] = _optional_float(winner.get("theme_pct_chg_3")) if winner.get("theme_pct_chg_3") is not None else momentum
+    return raw
+
+
+def _theme_text(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"nan", "none", "-"}:
+            return text
+    return "-"
 
 
 def clear_daily_picks() -> int:
@@ -615,14 +961,13 @@ def update_daily_pick_t3_gain(
             "t3_max_gain_pct": float(t3_max_gain_pct),
             "checked_at": checked_at or datetime.now().isoformat(timespec="seconds"),
         }
-        success = 1 if float(t3_max_gain_pct) > 0 else 0
         conn.execute(
             """
             UPDATE daily_picks
-            SET t3_max_gain_pct = ?, success = ?, status = 't3_checked', raw_json = ?
+            SET t3_max_gain_pct = ?, status = 't3_checked', raw_json = ?
             WHERE id = ?
             """,
-            (float(t3_max_gain_pct), success, json.dumps(raw, ensure_ascii=False), int(item["id"])),
+            (float(t3_max_gain_pct), json.dumps(raw, ensure_ascii=False), int(item["id"])),
         )
     return get_daily_pick(selection_date, strategy_type=strategy_type or item.get("strategy_type"), code=code or item.get("code"), pick_id=int(item["id"]))
 
@@ -689,8 +1034,8 @@ def open_position_picks(today: str | None = None) -> list[dict[str, Any]]:
                         AND target_date <= ?
                     )
                     OR (
-                        strategy_type IN ('中线超跌反转', '右侧主升浪')
-                        AND target_date >= ?
+                        strategy_type IN ('中线超跌反转', '右侧主升浪', '全局动量狙击')
+                        AND target_date <= ?
                     )
                   )
             ORDER BY selection_date ASC
@@ -758,11 +1103,11 @@ def latest_daily_picks(limit: int = 10, shadow_only: bool = False) -> list[dict[
     with connect() as conn:
         if shadow_only:
             rows = conn.execute(
-                "SELECT * FROM daily_picks WHERE COALESCE(is_shadow_test, 0) = 1 ORDER BY selection_date DESC LIMIT ?",
+                "SELECT * FROM daily_picks WHERE COALESCE(is_shadow_test, 0) = 1 ORDER BY selection_date DESC, id ASC LIMIT ?",
                 (limit,),
             ).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM daily_picks ORDER BY selection_date DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute("SELECT * FROM daily_picks ORDER BY selection_date DESC, id ASC LIMIT ?", (limit,)).fetchall()
     return [_decode_daily_pick(row) for row in rows if row]
 
 
@@ -790,8 +1135,32 @@ def _attach_pick_display_fields(item: dict[str, Any]) -> None:
     item["composite_score"] = _optional_float(winner.get("composite_score"))
     item["sort_score"] = _optional_float(winner.get("sort_score"))
     item["score_threshold"] = _optional_float(winner.get("score_threshold"))
+    item["score_floor"] = _optional_float(winner.get("score_floor"))
+    item["selection_tier"] = item.get("tier") or winner.get("selection_tier") or "base"
+    item["tier"] = item["selection_tier"]
+    item["risk_warning"] = winner.get("risk_warning") or ""
+    item["position_probability"] = _optional_float(winner.get("position_probability"))
+    item["suggested_position"] = _optional_float(item.get("suggested_position"))
+    if item["suggested_position"] is None:
+        item["suggested_position"] = _optional_float(winner.get("suggested_position"))
     item["sentiment_bonus"] = _optional_float(winner.get("sentiment_bonus"))
     item["market_gate_mode"] = winner.get("market_gate_mode") or ""
+    item["core_theme"] = _theme_text(item.get("core_theme"), raw.get("core_theme"), winner.get("core_theme"), winner.get("theme_name"))
+    theme_momentum = _optional_float(
+        item.get("theme_momentum_3d")
+        if item.get("theme_momentum_3d") is not None
+        else raw.get("theme_momentum_3d")
+        if raw.get("theme_momentum_3d") is not None
+        else winner.get("theme_momentum_3d")
+        if winner.get("theme_momentum_3d") is not None
+        else winner.get("theme_momentum")
+        if winner.get("theme_momentum") is not None
+        else winner.get("theme_pct_chg_3")
+    )
+    item["theme_momentum_3d"] = 0.0 if theme_momentum is None else theme_momentum
+    item["theme_name"] = item["core_theme"]
+    item["theme_pct_chg_3"] = item["theme_momentum_3d"]
+    item["theme_momentum"] = item["theme_momentum_3d"]
 
     actual = _optional_float(item.get("open_premium"))
     expected = item.get("expected_premium")
@@ -885,6 +1254,8 @@ def _ensure_daily_picks_multi_strategy_schema(conn: sqlite3.Connection) -> None:
             raw_json TEXT NOT NULL,
             strategy_type TEXT NOT NULL DEFAULT '尾盘突破',
             t3_max_gain_pct REAL DEFAULT NULL,
+            suggested_position REAL DEFAULT NULL,
+            tier TEXT,
             is_closed INTEGER NOT NULL DEFAULT 0,
             close_date TEXT,
             close_price REAL,

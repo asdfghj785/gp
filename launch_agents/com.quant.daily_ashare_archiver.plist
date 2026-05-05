@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.quant.daily_ashare_archiver</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/eudis/ths/scripts/shell/run_daily_ashare_archiver.sh</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/eudis/ths</string>
+	<key>StandardOutPath</key>
+	<string>/Users/eudis/ths/logs/daily_ashare_archiver_agent.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/eudis/ths/logs/daily_ashare_archiver_agent_err.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>15</integer>
+		<key>Minute</key>
+		<integer>15</integer>
+	</dict>
+</dict>
+</plist>

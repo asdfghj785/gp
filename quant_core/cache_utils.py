@@ -19,7 +19,7 @@ from .config import (
 from .storage import database_overview
 
 
-CACHE_VERSION = "strategy-cache-v13-reversal-pressure-filter"
+CACHE_VERSION = "strategy-cache-v15-t3-close-only-settlement"
 CACHE_DIR = BASE_DIR / "data" / "strategy_cache"
 
 

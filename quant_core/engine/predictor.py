@@ -14,17 +14,26 @@ from quant_core.config import (
     DATA_DIR,
     DIPBUY_MIN_SCORE,
     DIPBUY_PREMIUM_MODEL_PATH,
+    GLOBAL_DAILY_META_PATH,
+    GLOBAL_DAILY_MODEL_PATH,
+    GLOBAL_MIN_SCORE,
     LATEST_TOP50_PATH,
     MAIN_WAVE_MIN_SCORE,
     MAIN_WAVE_MODEL_PATH,
     MODEL_PATH,
     PREMIUM_MODEL_PATH,
     PROFIT_TARGET_PCT,
+    PAUSED_STRATEGY_TYPES,
+    PRODUCTION_STRATEGY_TYPES,
+    PRODUCTION_TOTAL_PICK_LIMIT,
     REVERSAL_MIN_SCORE,
     REVERSAL_MODEL_PATH,
 )
+from quant_core.data_pipeline.concept_engine import CONCEPT_CATALOG_PATH, CONCEPT_INDEX_PATH, get_stock_concept_map
 from quant_core.data_pipeline.intraday_snapshot import attach_late_pull_trap
 from quant_core.data_pipeline.market import fetch_market_indices, fetch_sina_snapshot
+from quant_core.data_pipeline.sector_engine import get_stock_sector_map
+from quant_core.engine.daily_factor_factory import THEME_FACTOR_COLUMNS, generate_daily_factors
 from quant_core.storage import connect, save_prediction_snapshot, upsert_daily_rows
 
 
@@ -83,14 +92,21 @@ DIPBUY_STRATEGY_TYPE = "首阴低吸"
 BREAKOUT_STRATEGY_TYPE = "尾盘突破"
 REVERSAL_STRATEGY_TYPE = "中线超跌反转"
 MAIN_WAVE_STRATEGY_TYPE = "右侧主升浪"
-SWING_STRATEGY_TYPES = {REVERSAL_STRATEGY_TYPE, MAIN_WAVE_STRATEGY_TYPE}
+GLOBAL_MOMENTUM_STRATEGY_TYPE = "全局动量狙击"
+SWING_STRATEGY_TYPES = {REVERSAL_STRATEGY_TYPE, MAIN_WAVE_STRATEGY_TYPE, GLOBAL_MOMENTUM_STRATEGY_TYPE}
 STRATEGY_PRIORITY = {
+    GLOBAL_MOMENTUM_STRATEGY_TYPE: 4,
     MAIN_WAVE_STRATEGY_TYPE: 3,
     REVERSAL_STRATEGY_TYPE: 2,
     BREAKOUT_STRATEGY_TYPE: 1,
     DIPBUY_STRATEGY_TYPE: 0,
 }
-PRODUCTION_OUTPUT_STRATEGIES = [MAIN_WAVE_STRATEGY_TYPE, REVERSAL_STRATEGY_TYPE, BREAKOUT_STRATEGY_TYPE]
+PRODUCTION_OUTPUT_STRATEGIES = [
+    strategy_type
+    for strategy_type in PRODUCTION_STRATEGY_TYPES
+    if strategy_type in {GLOBAL_MOMENTUM_STRATEGY_TYPE, MAIN_WAVE_STRATEGY_TYPE, BREAKOUT_STRATEGY_TYPE}
+    and strategy_type not in set(PAUSED_STRATEGY_TYPES)
+]
 REVERSAL_FEATURE_COLS = [
     "body_pct",
     "upper_shadow_pct",
@@ -153,6 +169,41 @@ HIGH_LIQUIDITY_AMOUNT = 800_000_000_000
 DIPBUY_SENTIMENT_BONUS = 10.0
 LIVE_VOLUME_EXTRAPOLATION_FACTOR = 1.05
 LIVE_NEAR_LIMIT_CHANGE_PCT = 8.5
+GLOBAL_MOMENTUM_MAX_LIVE_CHANGE_PCT = 9.0
+ABSOLUTE_BOTTOM_PROBA = 0.55
+GLOBAL_MOMENTUM_DYNAMIC_ABSOLUTE_FLOOR = GLOBAL_MIN_SCORE
+PRODUCTION_MAX_PICKS_PER_STRATEGY = 1
+RISK_WARNING_DYNAMIC_FLOOR = "⚠️ 动态下探: 逆势相对龙头，注意控制仓位"
+KELLY_WIN_LOSS_RATIO = 1.5
+HALF_KELLY_FACTOR = 0.5
+BASE_POSITION_MIN = 0.10
+BASE_POSITION_MAX = 0.30
+DYNAMIC_FLOOR_POSITION = 0.05
+REGULAR_ARMY_STRATEGIES = {BREAKOUT_STRATEGY_TYPE, GLOBAL_MOMENTUM_STRATEGY_TYPE, MAIN_WAVE_STRATEGY_TYPE}
+LIMIT_UP_MAIN_BOARD_BLOCK_PCT = 9.8
+LIMIT_UP_GROWTH_BOARD_BLOCK_PCT = 19.8
+THEME_EMOTION_WEIGHT = 0.18
+THEME_MAIN_WAVE_WEIGHT = 0.05
+THEME_REVERSAL_PENALTY_WEIGHT = 0.30
+THEME_HOT_SCORE = 70.0
+THEME_EXTREME_HOT_SCORE = 82.0
+THEME_LAGGARD_RS_FLOOR = 0.0
+THEME_LAGGARD_MAX_PENALTY = 12.0
+THEME_EXTREME_REVERSAL_PENALTY = 10.0
+PAUSED_STRATEGY_TYPE_SET = set(PAUSED_STRATEGY_TYPES)
+
+
+def _apply_total_pick_limit(df: pd.DataFrame, requested_limit: int) -> pd.DataFrame:
+    if df.empty:
+        return df
+    try:
+        request_cap = int(requested_limit)
+    except (TypeError, ValueError):
+        request_cap = 0
+    cap = int(PRODUCTION_TOTAL_PICK_LIMIT)
+    if request_cap > 0:
+        cap = min(cap, request_cap)
+    return df.head(min(len(df), max(1, cap))).copy()
 
 
 @lru_cache(maxsize=1)
@@ -225,6 +276,26 @@ def _load_main_wave_model():
         return None, f"右侧主升浪模型加载失败: {exc}"
 
 
+@lru_cache(maxsize=1)
+def _load_global_daily_model():
+    if not GLOBAL_DAILY_MODEL_PATH.exists():
+        return None, f"找不到全局日线模型文件: {GLOBAL_DAILY_MODEL_PATH}", []
+    if not GLOBAL_DAILY_META_PATH.exists():
+        return None, f"找不到全局日线模型元数据: {GLOBAL_DAILY_META_PATH}", []
+    try:
+        import xgboost as xgb
+
+        model = xgb.XGBClassifier()
+        model.load_model(str(GLOBAL_DAILY_MODEL_PATH))
+        meta = json.loads(GLOBAL_DAILY_META_PATH.read_text(encoding="utf-8"))
+        feature_cols = list(meta.get("feature_columns") or [])
+        if not feature_cols:
+            return None, f"全局日线模型元数据缺少 feature_columns: {GLOBAL_DAILY_META_PATH}", []
+        return model, None, feature_cols
+    except Exception as exc:
+        return None, f"全局日线模型加载失败: {exc}", []
+
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "code" not in df.columns:
         return pd.DataFrame()
@@ -249,8 +320,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out = out[~out["纯代码"].str.startswith(("30", "68", "4", "8", "92"), na=False)].copy()
     out = out[~out["名称"].str.contains("ST|退", case=False, na=False)].copy()
     out = out[(out["最新价"] > 0) & (out["昨收"] > 0)].copy()
-    high_limit_board = out["纯代码"].str.startswith(("30", "68"), na=False)
-    out = out[((high_limit_board) & (out["涨跌幅"] < 19.5)) | ((~high_limit_board) & (out["涨跌幅"] < 9.5))].copy()
+    tradable_mask = _not_limit_up_tradable_mask(out)
+    out["涨停不可交易标记"] = (~tradable_mask).astype(float)
+    out = out[tradable_mask].copy()
     if out.empty:
         return out
     out = _add_temporal_features(out)
@@ -269,7 +341,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def score_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+def score_candidates(df: pd.DataFrame, production_global_hard_filter: bool = False) -> tuple[pd.DataFrame, str]:
     scored = df.copy()
     for col in dict.fromkeys([*FEATURE_COLS, *DIPBUY_FEATURE_COLS, *REVERSAL_FEATURE_COLS, *MAIN_WAVE_FEATURE_COLS]):
         if col not in scored.columns:
@@ -371,8 +443,244 @@ def score_candidates(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
         + scored.loc[is_dipbuy, "流动性评分"] * 0.05
     ).clip(0, 100)
     scored.loc[is_swing, "综合评分"] = _num(scored.loc[is_swing], "预期溢价").clip(-20, 30)
+    scored, global_status = _append_global_momentum_candidates(
+        scored,
+        production_hard_filter=production_global_hard_filter,
+    )
+    status_parts.append(global_status)
     model_status = "; ".join(status_parts) if status_parts else "ready"
     return scored, model_status
+
+
+def _append_global_momentum_candidates(scored: pd.DataFrame, production_hard_filter: bool = False) -> tuple[pd.DataFrame, str]:
+    """Add the global daily XGBoost model as the fourth independent legion."""
+    if scored.empty:
+        return scored, "global_momentum_empty_pool"
+    model, error, feature_cols = _load_global_daily_model()
+    if model is None:
+        return scored, error or "global_momentum_model_unavailable"
+
+    probabilities: dict[Any, float] = {}
+    errors = 0
+
+    historical_mask = _historical_playback_mask(scored)
+    if historical_mask.any():
+        if "historical_global_probability" in scored.columns:
+            precomputed = pd.to_numeric(scored.loc[historical_mask, "historical_global_probability"], errors="coerce")
+            valid = precomputed.dropna()
+            probabilities.update({idx: float(value) for idx, value in valid.items()})
+            errors += int(historical_mask.sum() - len(valid))
+        else:
+            historical = scored.loc[historical_mask].copy()
+            historical_codes = _normalized_code_series(historical)
+            historical_dates = historical["date"].map(_normalize_trade_date) if "date" in historical.columns else pd.Series("", index=historical.index)
+            for code, index_values in historical_codes.groupby(historical_codes).groups.items():
+                if not code:
+                    errors += len(index_values)
+                    continue
+                try:
+                    proba_by_date = _global_probability_history_for_code(str(code), tuple(feature_cols))
+                except Exception:
+                    proba_by_date = {}
+                if not proba_by_date:
+                    errors += len(index_values)
+                    continue
+                matched = historical_dates.loc[index_values].map(proba_by_date)
+                valid = pd.to_numeric(matched, errors="coerce").dropna()
+                probabilities.update({idx: float(value) for idx, value in valid.items()})
+                errors += int(len(index_values) - len(valid))
+
+    live_rows = scored.loc[~historical_mask]
+    for idx, row in live_rows.iterrows():
+        try:
+            factors = generate_daily_factors(_stitch_global_daily_frame_from_live_row(row))
+            if factors.empty:
+                errors += 1
+                continue
+            latest = factors.tail(1)
+            aligned = _align_global_daily_features(latest, feature_cols)
+            probabilities[idx] = float(model.predict_proba(aligned)[:, 1][0])
+        except Exception:
+            errors += 1
+
+    if not probabilities:
+        return scored, f"global_momentum_no_valid_factor; errors:{errors}"
+
+    prob = pd.Series(probabilities, dtype="float64")
+    hard_filtered = 0
+    eligible_prob = prob
+    if production_hard_filter:
+        hard_mask = _global_momentum_production_hard_filter_mask(scored.loc[prob.index])
+        hard_filtered = int((~hard_mask).sum())
+        eligible_prob = prob.loc[hard_mask[hard_mask].index]
+    filter_status = f"; hard_filtered:{hard_filtered}" if production_hard_filter else ""
+    if len(eligible_prob) == 0:
+        base = scored.copy()
+        base["global_probability"] = eligible_prob.reindex(base.index)
+        return base, f"global_momentum_ready:0/{len(prob)}{filter_status}; errors:{errors}"
+
+    global_rows = scored.loc[eligible_prob.index].copy()
+    global_rows["strategy_type"] = GLOBAL_MOMENTUM_STRATEGY_TYPE
+    global_rows["global_probability"] = eligible_prob
+    global_rows["global_probability_pct"] = global_rows["global_probability"] * 100
+    global_rows["预期溢价"] = _global_expected_t3_pct(global_rows["global_probability"])
+    global_rows["AI胜率"] = global_rows["global_probability_pct"]
+    global_rows["综合评分"] = global_rows["global_probability_pct"]
+    global_rows["排序评分"] = global_rows["global_probability_pct"]
+    global_rows["生产门槛"] = GLOBAL_MIN_SCORE
+    global_rows["策略优先级"] = STRATEGY_PRIORITY[GLOBAL_MOMENTUM_STRATEGY_TYPE]
+    min_count = int((eligible_prob >= GLOBAL_MIN_SCORE).sum())
+    out = pd.concat([scored, global_rows], ignore_index=True, sort=False)
+    return out, f"global_momentum_ready:{min_count}/{len(prob)}; eligible:{len(global_rows)}{filter_status}; errors:{errors}"
+
+
+def _historical_playback_mask(df: pd.DataFrame) -> pd.Series:
+    if "historical_playback" not in df.columns:
+        return pd.Series(False, index=df.index)
+    return df["historical_playback"].fillna(False).astype(bool)
+
+
+def _normalized_code_series(df: pd.DataFrame) -> pd.Series:
+    if "纯代码" in df.columns:
+        source = df["纯代码"]
+    elif "code" in df.columns:
+        source = df["code"]
+    elif "symbol" in df.columns:
+        source = df["symbol"]
+    else:
+        source = pd.Series("", index=df.index)
+    extracted = source.fillna("").astype(str).str.extract(r"(\d{6})", expand=False)
+    return extracted.fillna(source.fillna("").astype(str).str.zfill(6).str[-6:])
+
+
+def _normalize_trade_date(value: Any) -> str:
+    parsed = pd.to_datetime(str(value), errors="coerce")
+    if pd.isna(parsed):
+        return ""
+    return parsed.strftime("%Y-%m-%d")
+
+
+@lru_cache(maxsize=8192)
+def _global_probability_history_for_code(code: str, feature_cols: tuple[str, ...]) -> dict[str, float]:
+    """Precompute one stock's historical global probabilities from complete 15:00 daily bars."""
+    model, error, loaded_feature_cols = _load_global_daily_model()
+    if model is None:
+        raise RuntimeError(error or "global_momentum_model_unavailable")
+    columns = list(feature_cols or tuple(loaded_feature_cols))
+    path = DATA_DIR / f"{str(code).zfill(6)[-6:]}_daily.parquet"
+    if not path.exists():
+        return {}
+    frame = pd.read_parquet(path).copy()
+    if frame.empty:
+        return {}
+    factors = generate_daily_factors(frame)
+    if factors.empty:
+        return {}
+    aligned = _align_global_daily_features(factors, columns)
+    probabilities = model.predict_proba(aligned)[:, 1]
+    dates = _factor_date_series(factors)
+    out: dict[str, float] = {}
+    for trade_date, probability in zip(dates, probabilities):
+        if trade_date and np.isfinite(probability):
+            out[str(trade_date)] = float(probability)
+    return out
+
+
+def _factor_date_series(factors: pd.DataFrame) -> pd.Series:
+    if "datetime" in factors.columns:
+        dates = pd.to_datetime(factors["datetime"], errors="coerce")
+    else:
+        dates = pd.to_datetime(factors["date"].astype(str), errors="coerce")
+    return dates.dt.strftime("%Y-%m-%d").fillna("")
+
+
+def _global_momentum_production_hard_filter_mask(df: pd.DataFrame) -> pd.Series:
+    """Production-only buyability wall for global momentum picks."""
+    if df.empty:
+        return pd.Series(False, index=df.index)
+    code_source = df["纯代码"] if "纯代码" in df.columns else df.get("code", pd.Series("", index=df.index))
+    code_text = code_source.fillna("").astype(str)
+    code = code_text.str.extract(r"(\d{6})", expand=False).fillna("")
+    code = code.where(code.ne(""), code_text.str.zfill(6).str[-6:])
+    name_source = df["名称"] if "名称" in df.columns else df.get("name", pd.Series("", index=df.index))
+    name = name_source.fillna("").astype(str).str.upper()
+    live_change_pct = _global_momentum_live_change_pct(df)
+
+    mainboard_mask = code.str.startswith(("00", "60"), na=False)
+    non_st_mask = ~name.str.contains("ST", regex=False, na=False)
+    tradable_price_mask = live_change_pct.fillna(np.inf) < GLOBAL_MOMENTUM_MAX_LIVE_CHANGE_PCT
+    return (mainboard_mask & non_st_mask & tradable_price_mask).fillna(False)
+
+
+def _global_momentum_live_change_pct(df: pd.DataFrame) -> pd.Series:
+    for col in ("涨跌幅", "pctChg", "change_pct", "change"):
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce")
+    if {"最新价", "昨收"}.issubset(df.columns):
+        latest = pd.to_numeric(df["最新价"], errors="coerce")
+        pre_close = pd.to_numeric(df["昨收"], errors="coerce")
+        return ((latest - pre_close) / pre_close * 100).where(pre_close > 0)
+    if {"close", "pre_close"}.issubset(df.columns):
+        latest = pd.to_numeric(df["close"], errors="coerce")
+        pre_close = pd.to_numeric(df["pre_close"], errors="coerce")
+        return ((latest - pre_close) / pre_close * 100).where(pre_close > 0)
+    return pd.Series(np.nan, index=df.index)
+
+
+def _stitch_global_daily_frame_from_live_row(row: pd.Series, history_days: int = 90) -> pd.DataFrame:
+    code = str(row.get("纯代码") or row.get("code") or "").zfill(6)[-6:]
+    path = DATA_DIR / f"{code}_daily.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"缺少本地日线: {path}")
+    raw_history = pd.read_parquet(path).copy()
+    if raw_history.empty:
+        raise ValueError(f"{code} 本地日线为空")
+    if "datetime" in raw_history.columns:
+        raw_dt = pd.to_datetime(raw_history["datetime"], errors="coerce")
+    else:
+        raw_dt = pd.to_datetime(raw_history["date"].astype(str), errors="coerce")
+    live_date = pd.to_datetime(str(row.get("date") or datetime.now().date().isoformat()), errors="coerce")
+    if pd.isna(live_date):
+        live_date = pd.Timestamp(datetime.now().date())
+    history = raw_history[raw_dt.dt.normalize() < live_date.normalize()].tail(history_days).copy()
+
+    last = history.iloc[-1].copy() if not history.empty else pd.Series(dtype="object")
+    live = last.copy()
+    live["date"] = live_date.strftime("%Y%m%d")
+    live["datetime"] = live_date
+    live["symbol"] = code
+    live["code"] = code
+    live["name"] = str(row.get("名称") or row.get("name") or code)
+    live["open"] = float(row.get("今开") or row.get("open") or row.get("最新价") or 0)
+    live["high"] = float(row.get("最高") or row.get("high") or row.get("最新价") or 0)
+    live["low"] = float(row.get("最低") or row.get("low") or row.get("最新价") or 0)
+    live["close"] = float(row.get("最新价") or row.get("close") or 0)
+    live["volume"] = float(row.get("volume") or 0)
+    live["amount"] = float(row.get("amount") or 0)
+    live["pre_close"] = float(row.get("昨收") or row.get("pre_close") or 0)
+    live["pctChg"] = float(row.get("涨跌幅") or row.get("change_pct") or 0)
+    live["change_pct"] = float(row.get("涨跌幅") or row.get("change_pct") or 0)
+    live["turn"] = float(row.get("换手率") or row.get("turnover") or 0)
+    live["turnover"] = float(row.get("换手率") or row.get("turnover") or 0)
+    live["volume_ratio"] = float(row.get("量比") or row.get("volume_ratio") or 0)
+    return pd.concat([history, pd.DataFrame([live])], ignore_index=True, sort=False)
+
+
+def _align_global_daily_features(frame: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+    out = frame.copy()
+    for col in feature_cols:
+        if col not in out.columns:
+            out[col] = np.nan if col in THEME_FACTOR_COLUMNS else 0.0
+    aligned = out[feature_cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    fillable_cols = [col for col in aligned.columns if col not in THEME_FACTOR_COLUMNS]
+    if fillable_cols:
+        aligned[fillable_cols] = aligned[fillable_cols].ffill().fillna(0.0)
+    return aligned.astype("float32", copy=False)
+
+
+def _global_expected_t3_pct(probability: pd.Series) -> pd.Series:
+    prob = pd.to_numeric(probability, errors="coerce").fillna(0.0)
+    return (4.0 + (prob - GLOBAL_MIN_SCORE).clip(lower=0) * 20.0).clip(4.0, 9.0)
 
 
 def _dipbuy_physical_mask(df: pd.DataFrame) -> pd.Series:
@@ -406,11 +714,11 @@ def _main_wave_physical_mask(df: pd.DataFrame) -> pd.Series:
     return (
         (_num(df, "ma20_ma60_spread_prev") > 0)
         & (_num(df, "pullback_from_60d_high") >= -15.0)
-        & (_num(df, "contraction_amplitude_5d") <= 15.0)
+        & (_num(df, "contraction_amplitude_5d") <= 12.0)
         & (_num(df, "prev_volume_ratio_to_5d") < 1.0)
         & (_num(df, "breakout_strength") > 0)
         & (_num(df, "body_pct") >= 3.5)
-        & (_num(df, "volume_burst_ratio") >= 1.15)
+        & (_num(df, "volume_burst_ratio") >= 1.30)
     ).fillna(False)
 
 
@@ -443,6 +751,9 @@ def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = Non
     """Default live strategy filters selected from the current strategy lab."""
     if df.empty:
         return df
+    df = filter_paused_strategies(df)
+    if df.empty:
+        return df
     if gate and gate.get("blocked"):
         return df.iloc[0:0].copy()
     filtered = df[~df["纯代码"].str.startswith(("68", "689"), na=False)].copy()
@@ -451,6 +762,10 @@ def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = Non
         filtered = filtered[~filtered["market_gate_mode"].isin(["雷暴", "缩量下跌"])].copy()
     else:
         filtered["market_gate_mode"] = str(gate.get("mode") or "晴天")
+    if "涨停不可交易标记" in filtered.columns:
+        filtered = filtered[pd.to_numeric(filtered["涨停不可交易标记"], errors="coerce").fillna(0) < 0.5].copy()
+    else:
+        filtered = filtered[_not_limit_up_tradable_mask(filtered)].copy()
     if "涨跌幅" in filtered.columns:
         is_swing = filtered.get("strategy_type", "").isin(SWING_STRATEGY_TYPES) if "strategy_type" in filtered.columns else pd.Series(False, index=filtered.index)
         filtered = filtered[(is_swing) | (filtered["涨跌幅"] < 7)].copy()
@@ -484,30 +799,118 @@ def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = Non
     return apply_strategy_score_gate(filtered, gate)
 
 
+def filter_paused_strategies(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or not PAUSED_STRATEGY_TYPE_SET or "strategy_type" not in df.columns:
+        return df
+    return df[~df["strategy_type"].fillna("").astype(str).isin(PAUSED_STRATEGY_TYPE_SET)].copy()
+
+
+def _strategy_min_score(strategy_type: str) -> float:
+    if strategy_type == DIPBUY_STRATEGY_TYPE:
+        return DIPBUY_MIN_SCORE
+    if strategy_type == REVERSAL_STRATEGY_TYPE:
+        return REVERSAL_MIN_SCORE
+    if strategy_type == MAIN_WAVE_STRATEGY_TYPE:
+        return MAIN_WAVE_MIN_SCORE
+    if strategy_type == GLOBAL_MOMENTUM_STRATEGY_TYPE:
+        return GLOBAL_MIN_SCORE
+    return BREAKOUT_MIN_SCORE
+
+
+def _strategy_selection_score(df: pd.DataFrame, strategy_type: str) -> pd.Series:
+    if strategy_type == GLOBAL_MOMENTUM_STRATEGY_TYPE and "global_probability" in df.columns:
+        return _num(df, "global_probability")
+    return _num(df, "综合评分")
+
+
+def _strategy_requires_absolute_floor(strategy_type: str) -> bool:
+    return strategy_type in REGULAR_ARMY_STRATEGIES
+
+
+def _strategy_dynamic_absolute_floor(strategy_type: str) -> float:
+    if strategy_type == BREAKOUT_STRATEGY_TYPE:
+        return BREAKOUT_MIN_SCORE
+    if strategy_type == GLOBAL_MOMENTUM_STRATEGY_TYPE:
+        return max(GLOBAL_MIN_SCORE, GLOBAL_MOMENTUM_DYNAMIC_ABSOLUTE_FLOOR)
+    if strategy_type == MAIN_WAVE_STRATEGY_TYPE:
+        return MAIN_WAVE_MIN_SCORE
+    return float("-inf")
+
+
+def _optional_float_value(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if np.isfinite(parsed) else default
+
+
 def apply_strategy_score_gate(df: pd.DataFrame, gate: dict[str, Any] | None = None) -> pd.DataFrame:
     if df.empty or "综合评分" not in df.columns:
         return df
     filtered = df.copy()
     filtered["strategy_type"] = filtered.get("strategy_type", BREAKOUT_STRATEGY_TYPE)
     filtered["strategy_type"] = filtered["strategy_type"].fillna(BREAKOUT_STRATEGY_TYPE)
-    score = _num(filtered, "综合评分").replace([np.inf, -np.inf], 0).fillna(0)
-    is_dipbuy = filtered["strategy_type"].eq(DIPBUY_STRATEGY_TYPE)
-    is_reversal = filtered["strategy_type"].eq(REVERSAL_STRATEGY_TYPE)
-    is_main_wave = filtered["strategy_type"].eq(MAIN_WAVE_STRATEGY_TYPE)
-    is_breakout = filtered["strategy_type"].eq(BREAKOUT_STRATEGY_TYPE) | (~is_dipbuy & ~is_reversal & ~is_main_wave)
-    threshold = pd.Series(BREAKOUT_MIN_SCORE, index=filtered.index, dtype="float64")
-    threshold.loc[is_dipbuy] = DIPBUY_MIN_SCORE
-    threshold.loc[is_reversal] = REVERSAL_MIN_SCORE
-    threshold.loc[is_main_wave] = MAIN_WAVE_MIN_SCORE
-    qualified = (
-        ((is_breakout) & (score >= BREAKOUT_MIN_SCORE))
-        | ((is_dipbuy) & (score >= DIPBUY_MIN_SCORE))
-        | ((is_reversal) & (score >= REVERSAL_MIN_SCORE))
-        | ((is_main_wave) & (score >= MAIN_WAVE_MIN_SCORE))
-    )
-    filtered = filtered[qualified].copy()
-    filtered["生产门槛"] = threshold.loc[filtered.index]
+    threshold = filtered["strategy_type"].map(lambda item: _strategy_min_score(str(item))).astype(float)
+    filtered["生产门槛"] = threshold
     return apply_strategy_sort_score(filtered, gate)
+
+
+def _normalised_score_column(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.Series | None:
+    for col in columns:
+        if col not in df.columns:
+            continue
+        values = _num(df, col).replace([np.inf, -np.inf], np.nan)
+        if values.dropna().empty:
+            continue
+        max_abs = float(values.dropna().abs().max())
+        if max_abs <= 1.5:
+            values = values * 100.0
+        return values.fillna(50.0).clip(0, 100)
+    return None
+
+
+def _theme_heat_score(df: pd.DataFrame) -> pd.Series:
+    existing = _normalised_score_column(
+        df,
+        ("theme_heat_score", "theme_score", "concept_score", "题材评分", "主题评分"),
+    )
+    if existing is not None:
+        return existing
+    if not any(col in df.columns for col in THEME_FACTOR_COLUMNS):
+        return pd.Series(50.0, index=df.index)
+
+    theme_1 = _num(df, "theme_pct_chg_1") * 100.0
+    theme_3 = _num(df, "theme_pct_chg_3") * 100.0
+    theme_trend = _num(df, "rs_theme_ema_5") * 100.0
+    volatility = _num(df, "theme_volatility_5") * 100.0
+    heat = (
+        50.0
+        + theme_1.clip(-8, 10) * 4.0
+        + theme_3.clip(-12, 16) * 2.0
+        + theme_trend.clip(-8, 10) * 2.5
+        - volatility.clip(0, 12) * 0.5
+    )
+    return heat.replace([np.inf, -np.inf], 50.0).fillna(50.0).clip(0, 100)
+
+
+def _strategy_theme_score(df: pd.DataFrame) -> pd.Series:
+    existing = _normalised_score_column(df, ("theme_score", "concept_score", "题材评分", "主题评分"))
+    if existing is not None:
+        return existing
+    heat = _theme_heat_score(df)
+    relative_strength = _num(df, "rs_stock_vs_theme") * 100.0
+    score = heat + relative_strength.clip(-10, 12) * 1.5
+    return score.replace([np.inf, -np.inf], 50.0).fillna(50.0).clip(0, 100)
+
+
+def _theme_laggard_penalty(df: pd.DataFrame, heat_score: pd.Series) -> pd.Series:
+    relative_strength = _num(df, "rs_stock_vs_theme") * 100.0
+    hotness = (heat_score - THEME_HOT_SCORE).clip(lower=0)
+    laggard_depth = (THEME_LAGGARD_RS_FLOOR - relative_strength).clip(lower=0)
+    penalty = (hotness / 30.0 * THEME_LAGGARD_MAX_PENALTY) + (laggard_depth / 10.0 * THEME_LAGGARD_MAX_PENALTY)
+    penalty = penalty.where((heat_score >= THEME_HOT_SCORE) & (relative_strength < THEME_LAGGARD_RS_FLOOR), 0.0)
+    return penalty.replace([np.inf, -np.inf], 0.0).fillna(0.0).clip(0, THEME_LAGGARD_MAX_PENALTY)
 
 
 def apply_strategy_sort_score(df: pd.DataFrame, gate: dict[str, Any] | None = None) -> pd.DataFrame:
@@ -527,11 +930,48 @@ def apply_strategy_sort_score(df: pd.DataFrame, gate: dict[str, Any] | None = No
         modes = scored["market_gate_mode"].fillna("晴天").astype(str)
     is_dipbuy = scored["strategy_type"].eq(DIPBUY_STRATEGY_TYPE)
     is_swing = scored["strategy_type"].isin(SWING_STRATEGY_TYPES)
+    is_breakout = scored["strategy_type"].eq(BREAKOUT_STRATEGY_TYPE)
+    is_reversal = scored["strategy_type"].eq(REVERSAL_STRATEGY_TYPE)
+    is_main_wave = scored["strategy_type"].eq(MAIN_WAVE_STRATEGY_TYPE)
+    is_global = scored["strategy_type"].eq(GLOBAL_MOMENTUM_STRATEGY_TYPE)
     bonus = pd.Series(0.0, index=scored.index)
     bonus.loc[is_dipbuy & modes.isin(["阴天", "震荡"])] = DIPBUY_SENTIMENT_BONUS
     scored["情绪补偿分"] = bonus
     scored["排序评分"] = (base_score + bonus).clip(0, 110)
     scored.loc[is_swing, "排序评分"] = (50 + _num(scored.loc[is_swing], "综合评分").clip(-5, 15) * 5).clip(0, 110)
+    scored.loc[is_global, "排序评分"] = _num(scored.loc[is_global], "global_probability_pct").clip(0, 100)
+
+    theme_score = _strategy_theme_score(scored)
+    theme_heat = _theme_heat_score(scored)
+    theme_alpha = theme_score - 50.0
+    laggard_penalty = _theme_laggard_penalty(scored, theme_heat)
+    reversal_penalty = (theme_heat - 50.0).clip(lower=0) * THEME_REVERSAL_PENALTY_WEIGHT
+    reversal_penalty += (theme_heat >= THEME_EXTREME_HOT_SCORE).astype(float) * THEME_EXTREME_REVERSAL_PENALTY
+
+    scored["theme_score"] = theme_score
+    scored["theme_heat_score"] = theme_heat
+    scored["theme_weight"] = 0.0
+    scored["theme_adjustment"] = 0.0
+    scored["theme_laggard_penalty"] = 0.0
+    scored["theme_reversal_penalty"] = 0.0
+
+    emotion_flow = is_breakout | is_global
+    scored.loc[emotion_flow, "theme_weight"] = THEME_EMOTION_WEIGHT
+    scored.loc[emotion_flow, "theme_adjustment"] = theme_alpha.loc[emotion_flow] * THEME_EMOTION_WEIGHT
+    scored.loc[emotion_flow, "排序评分"] += scored.loc[emotion_flow, "theme_adjustment"]
+
+    main_wave_adjustment = theme_alpha * THEME_MAIN_WAVE_WEIGHT - laggard_penalty
+    scored.loc[is_main_wave, "theme_weight"] = THEME_MAIN_WAVE_WEIGHT
+    scored.loc[is_main_wave, "theme_adjustment"] = main_wave_adjustment.loc[is_main_wave]
+    scored.loc[is_main_wave, "theme_laggard_penalty"] = laggard_penalty.loc[is_main_wave]
+    scored.loc[is_main_wave, "排序评分"] += scored.loc[is_main_wave, "theme_adjustment"]
+
+    scored.loc[is_reversal, "theme_weight"] = -THEME_REVERSAL_PENALTY_WEIGHT
+    scored.loc[is_reversal, "theme_reversal_penalty"] = reversal_penalty.loc[is_reversal]
+    scored.loc[is_reversal, "theme_adjustment"] = -reversal_penalty.loc[is_reversal]
+    scored.loc[is_reversal, "排序评分"] -= reversal_penalty.loc[is_reversal]
+
+    scored["排序评分"] = scored["排序评分"].replace([np.inf, -np.inf], 0).fillna(0).clip(0, 110)
     scored["策略优先级"] = scored["strategy_type"].map(STRATEGY_PRIORITY).fillna(1).astype(float)
     scored["market_gate_mode"] = modes
     return scored
@@ -558,12 +998,235 @@ def _attach_historical_market_modes(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def prepare_historical_playback_candidates(
+    start_date: str = "2024-03-01",
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """Build scored historical candidates with the same feature and model path used by production."""
+    latest_date = end_date or _latest_historical_trade_date()
+    if latest_date is None:
+        return {
+            "candidates": pd.DataFrame(),
+            "trading_dates": [],
+            "start_date": start_date,
+            "end_date": end_date,
+            "model_status": "stock_daily_empty",
+            "repaired_pre_close_count": 0,
+            "repaired_volume_ratio_count": 0,
+        }
+
+    load_start = (pd.Timestamp(start_date) - pd.DateOffset(days=160)).strftime("%Y-%m-%d")
+    raw = _load_historical_daily_rows(load_start, latest_date)
+    repaired_pre_close = _repair_historical_pre_close(raw)
+    repaired_volume_ratio = 0
+    valid_dates = _valid_historical_trading_dates(raw)
+    trading_dates = [day for day in valid_dates if str(start_date) <= day <= str(latest_date)]
+    if not trading_dates:
+        return {
+            "candidates": pd.DataFrame(),
+            "trading_dates": [],
+            "start_date": start_date,
+            "end_date": latest_date,
+            "model_status": "no_valid_trading_dates",
+            "repaired_pre_close_count": repaired_pre_close,
+            "repaired_volume_ratio_count": repaired_volume_ratio,
+        }
+
+    raw = raw[raw["date"].isin(valid_dates)].copy()
+    repaired_volume_ratio = _repair_historical_volume_ratio(raw)
+    features = build_features(raw)
+    features = features[features["date"].isin(trading_dates)].copy()
+    features, global_batch_status = _attach_historical_global_probabilities(features, raw)
+    if features.empty:
+        return {
+            "candidates": pd.DataFrame(),
+            "trading_dates": trading_dates,
+            "start_date": trading_dates[0],
+            "end_date": trading_dates[-1],
+            "model_status": "historical_features_empty; data_source=stock_daily_1500",
+            "repaired_pre_close_count": repaired_pre_close,
+            "repaired_volume_ratio_count": repaired_volume_ratio,
+        }
+    features["historical_playback"] = True
+    scored, model_status = score_candidates(features, production_global_hard_filter=True)
+    scored = _attach_historical_outcomes(scored, raw, valid_dates)
+    model_status = f"{model_status}; {global_batch_status}; data_source=stock_daily_1500"
+    return {
+        "candidates": scored,
+        "trading_dates": trading_dates,
+        "start_date": trading_dates[0],
+        "end_date": trading_dates[-1],
+        "model_status": model_status,
+        "repaired_pre_close_count": repaired_pre_close,
+        "repaired_volume_ratio_count": repaired_volume_ratio,
+    }
+
+
+def _latest_historical_trade_date() -> str | None:
+    with connect() as conn:
+        row = conn.execute("SELECT MAX(date) AS latest_date FROM stock_daily").fetchone()
+    return str(row["latest_date"]) if row and row["latest_date"] else None
+
+
+def _load_historical_daily_rows(start_date: str, end_date: str) -> pd.DataFrame:
+    with connect() as conn:
+        raw = pd.read_sql_query(
+            """
+            SELECT code, name, date, open, high, low, close, pre_close, change_pct,
+                   volume, amount, turnover, volume_ratio
+            FROM stock_daily
+            WHERE date >= ? AND date <= ?
+            ORDER BY date ASC, code ASC
+            """,
+            conn,
+            params=(start_date, end_date),
+        )
+    if raw.empty:
+        return raw
+    raw["code"] = raw["code"].astype(str).str.extract(r"(\d{6})")[0].fillna("")
+    raw["name"] = raw["name"].fillna("")
+    raw["date"] = pd.to_datetime(raw["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    numeric_cols = ["open", "high", "low", "close", "pre_close", "change_pct", "volume", "amount", "turnover", "volume_ratio"]
+    for col in numeric_cols:
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+    return raw.dropna(subset=["code", "date"]).copy()
+
+
+def _attach_historical_global_probabilities(features: pd.DataFrame, raw: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    if features.empty or raw.empty:
+        return features, "historical_global_batch_empty"
+    model, error, feature_cols = _load_global_daily_model()
+    if model is None:
+        return features, error or "historical_global_batch_model_unavailable"
+    try:
+        factors = generate_daily_factors(raw)
+        if factors.empty:
+            return features, "historical_global_batch_no_factors"
+        aligned = _align_global_daily_features(factors, list(feature_cols))
+        probabilities = model.predict_proba(aligned)[:, 1]
+    except Exception as exc:
+        return features, f"historical_global_batch_failed:{exc}"
+
+    factor_dates = _factor_date_series(factors)
+    factor_codes = _normalized_code_series(factors)
+    probability_frame = pd.DataFrame(
+        {
+            "_global_date": factor_dates.astype(str),
+            "_global_code": factor_codes.astype(str).str.zfill(6).str[-6:],
+            "historical_global_probability": probabilities,
+        }
+    )
+    probability_frame = probability_frame.dropna(subset=["_global_date", "_global_code"])
+    probability_frame = probability_frame.drop_duplicates(["_global_date", "_global_code"], keep="last")
+
+    out = features.copy()
+    out["_global_date"] = out["date"].astype(str)
+    out["_global_code"] = out["纯代码"].astype(str).str.zfill(6).str[-6:]
+    out = out.merge(probability_frame, on=["_global_date", "_global_code"], how="left")
+    matched = int(pd.to_numeric(out["historical_global_probability"], errors="coerce").notna().sum())
+    out = out.drop(columns=["_global_date", "_global_code"], errors="ignore")
+    return out, f"historical_global_batch_ready:{matched}/{len(out)}"
+
+
+def _repair_historical_pre_close(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    df.sort_values(["code", "date"], inplace=True)
+    previous_close = pd.to_numeric(df.groupby("code", sort=False)["close"].shift(1), errors="coerce")
+    pre_close = pd.to_numeric(df["pre_close"], errors="coerce")
+    missing = (pre_close.isna() | (pre_close <= 0)) & previous_close.notna() & (previous_close > 0)
+    repaired = int(missing.sum())
+    if repaired:
+        df.loc[missing, "pre_close"] = previous_close.loc[missing]
+    return repaired
+
+
+def _repair_historical_volume_ratio(df: pd.DataFrame, window: int = 5) -> int:
+    if df.empty:
+        return 0
+    df.sort_values(["code", "date"], inplace=True)
+    volume = pd.to_numeric(df["volume"], errors="coerce")
+    volume_ratio = pd.to_numeric(df["volume_ratio"], errors="coerce")
+    avg_volume = df.groupby("code", sort=False)["volume"].transform(lambda values: values.shift(1).rolling(window, min_periods=3).mean())
+    missing = (volume_ratio.isna() | (volume_ratio <= 0)) & avg_volume.notna() & (avg_volume > 0) & volume.notna() & (volume > 0)
+    repaired = int(missing.sum())
+    if repaired:
+        df.loc[missing, "volume_ratio"] = volume.loc[missing] / avg_volume.loc[missing]
+    return repaired
+
+
+def _valid_historical_trading_dates(df: pd.DataFrame) -> list[str]:
+    if df.empty:
+        return []
+    daily = (
+        df.groupby("date", as_index=False)
+        .agg(row_count=("code", "nunique"), amount_sum=("amount", "sum"))
+        .sort_values("date")
+    )
+    daily["weekday"] = pd.to_datetime(daily["date"], errors="coerce").dt.weekday
+    valid = daily[(daily["weekday"] < 5) & (daily["row_count"] >= 1000) & (daily["amount_sum"].fillna(0) > 0)].copy()
+    return valid["date"].astype(str).tolist()
+
+
+def _attach_historical_outcomes(candidates: pd.DataFrame, raw: pd.DataFrame, trading_dates: list[str]) -> pd.DataFrame:
+    if candidates.empty:
+        return candidates
+    next_trade_date = {trading_dates[index]: trading_dates[index + 1] for index in range(len(trading_dates) - 1)}
+    future_dates = {
+        day: trading_dates[index + 1 : index + 4]
+        for index, day in enumerate(trading_dates)
+        if index + 1 < len(trading_dates)
+    }
+    raw_index = raw.set_index(["date", "code"])
+    opens = raw_index["open"]
+    highs = raw_index["high"]
+    closes = raw_index["close"]
+
+    out = candidates.copy()
+    out["next_date"] = out["date"].map(next_trade_date)
+    out["next_open"] = [opens.get((next_date, code), np.nan) for next_date, code in zip(out["next_date"], out["纯代码"])]
+    out["open_premium"] = (pd.to_numeric(out["next_open"], errors="coerce") / out["最新价"] - 1) * 100
+    out["t3_exit_date"] = out["date"].map(lambda day: future_dates.get(str(day), [None])[-1] if len(future_dates.get(str(day), [])) == 3 else None)
+
+    future_highs: list[float] = []
+    t3_closes: list[float] = []
+    for day, code, exit_date in zip(out["date"], out["纯代码"], out["t3_exit_date"]):
+        candidate_dates = future_dates.get(str(day), [])
+        if len(candidate_dates) < 3:
+            future_highs.append(np.nan)
+            t3_closes.append(np.nan)
+            continue
+        high_values = [highs.get((future_day, code), np.nan) for future_day in candidate_dates]
+        numeric_highs = pd.to_numeric(pd.Series(high_values), errors="coerce").dropna()
+        future_highs.append(float(numeric_highs.max()) if len(numeric_highs) == 3 else np.nan)
+        t3_close = float(closes.get((exit_date, code), np.nan)) if exit_date else np.nan
+        t3_closes.append(t3_close)
+
+    out["t3_max_high"] = future_highs
+    out["t3_close"] = t3_closes
+    out["t3_max_gain_pct"] = (pd.to_numeric(out["t3_max_high"], errors="coerce") / out["最新价"] - 1) * 100
+    out["t3_close_return_pct"] = (pd.to_numeric(out["t3_close"], errors="coerce") / out["最新价"] - 1) * 100
+    out["t3_settlement_price"] = out["t3_close"]
+    out["t3_settlement_return_pct"] = out["t3_close_return_pct"]
+    return out
+
+
 def scan_market(
     limit: int = 50,
     persist_snapshot: bool = True,
     cache_prediction: bool = True,
     async_persist: bool = False,
+    target_date: str | None = None,
+    historical_candidates: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
+    if target_date is not None:
+        return _scan_historical_market(
+            target_date=target_date,
+            limit=limit,
+            cache_prediction=cache_prediction,
+            historical_candidates=historical_candidates,
+        )
+
     raw_snapshot = fetch_sina_snapshot()
     if raw_snapshot.empty:
         raise RuntimeError("实时行情源返回空数据")
@@ -581,7 +1244,7 @@ def scan_market(
         return {"created_at": datetime.now().isoformat(timespec="seconds"), "model_status": "ready", "rows": []}
     df, intraday_snapshot = attach_late_pull_trap(df)
 
-    df, model_status = score_candidates(df)
+    df, model_status = score_candidates(df, production_global_hard_filter=True)
     gate = market_risk_gate(df, market_indices)
     if gate["blocked"]:
         payload = {
@@ -604,7 +1267,7 @@ def scan_market(
             "id": None,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "model_status": f"{model_status}; 生产过滤后无合格标的",
-            "strategy": f"生产策略：实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；准涨停未封板、高位爆量、尾盘诱多直接剔除；当前没有股票满足四轨准入门槛。",
+            "strategy": f"生产策略：实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；准涨停未封板、高位爆量、尾盘诱多直接剔除；当前没有股票满足四轨动态底线。",
             "market_gate": gate,
             "intraday_snapshot": intraday_snapshot,
             "rows": [],
@@ -612,16 +1275,15 @@ def scan_market(
         if cache_prediction:
             LATEST_TOP50_PATH.write_text(json.dumps([], ensure_ascii=False, indent=2), encoding="utf-8")
         return payload
-    df = select_strategy_top_picks(df, limit_per_strategy=1)
-    if limit > 0:
-        df = df.head(min(len(df), max(int(limit), len(PRODUCTION_OUTPUT_STRATEGIES))))
+    df = select_strategy_top_picks(df, limit_per_strategy=PRODUCTION_MAX_PICKS_PER_STRATEGY)
+    df = _apply_total_pick_limit(df, limit)
     rows = [_row_to_api(row) for _, row in df.iterrows()]
     snapshot_id = save_prediction_snapshot("quad_xgboost_regressor" if "regressor_ready" in model_status else "rule_fallback", rows) if cache_prediction else None
     payload = {
         "id": snapshot_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_status": model_status,
-        "strategy": f"生产策略：三大军团并行出票，每个策略独立选 Top1；尾盘突破预测次日开盘预期溢价，中线超跌反转/右侧主升浪预测T+3最大涨幅；实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；突破门槛>={BREAKOUT_MIN_SCORE:.1f}，低吸门槛>={DIPBUY_MIN_SCORE:.1f}，反转门槛>={REVERSAL_MIN_SCORE:.1f}%，主升浪门槛>={MAIN_WAVE_MIN_SCORE:.1f}%；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多直接剔除；近3日断头铡刀和上影线强过滤仅约束尾盘突破，波段策略豁免。",
+        "strategy": f"生产策略：当前启用策略各取 Top{PRODUCTION_MAX_PICKS_PER_STRATEGY}，总输出上限 Top{PRODUCTION_TOTAL_PICK_LIMIT}；无达标票时按合规池 99 分位动态下探 1 只并提示风偏；尾盘突破预测次日开盘预期溢价，中线超跌反转/右侧主升浪/全局动量狙击复用 T+3 波段收益口径；实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；突破门槛>={BREAKOUT_MIN_SCORE:.1f}，反转门槛>={REVERSAL_MIN_SCORE:.1f}%，主升浪门槛>={MAIN_WAVE_MIN_SCORE:.1f}%，全局狙击概率>={GLOBAL_MIN_SCORE:.2f}，绝对安全底线>={ABSOLUTE_BOTTOM_PROBA:.2f}；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多直接剔除；近3日断头铡刀和上影线强过滤仅约束尾盘突破，波段策略豁免。",
         "market_gate": gate,
         "intraday_snapshot": intraday_snapshot,
         "rows": rows,
@@ -631,34 +1293,168 @@ def scan_market(
     return payload
 
 
-def select_strategy_top_picks(df: pd.DataFrame, limit_per_strategy: int = 1) -> pd.DataFrame:
-    """Return one independent production pick per strategy, avoiding duplicate stocks per day."""
+def _scan_historical_market(
+    *,
+    target_date: str,
+    limit: int,
+    cache_prediction: bool,
+    historical_candidates: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    trade_date = _normalize_trade_date(target_date)
+    if not trade_date:
+        raise ValueError(f"invalid target_date: {target_date}")
+
+    if historical_candidates is None:
+        prepared = prepare_historical_playback_candidates(start_date=trade_date, end_date=trade_date)
+        candidates = prepared.get("candidates", pd.DataFrame())
+        model_status = str(prepared.get("model_status") or "historical_ready")
+    else:
+        candidates = historical_candidates
+        model_status = "historical_candidates_ready"
+
+    df = candidates[candidates["date"].astype(str).eq(trade_date)].copy() if not candidates.empty and "date" in candidates.columns else pd.DataFrame()
+    if df.empty:
+        return {
+            "id": None,
+            "created_at": f"{trade_date}T14:50:00",
+            "prediction_date": trade_date,
+            "model_status": f"{model_status}; 历史目标日无候选池",
+            "strategy": "V4.4 Historical Playback: production scan_market(target_date) returned empty pool.",
+            "market_gate": {"blocked": True, "mode": "空池", "reasons": ["目标日无有效候选"]},
+            "rows": [],
+        }
+
+    gate = market_risk_gate(df, indices={})
+    if gate["blocked"]:
+        return {
+            "id": None,
+            "created_at": f"{trade_date}T14:50:00",
+            "prediction_date": trade_date,
+            "model_status": f"{model_status}; 历史大盘风控触发，强制空仓",
+            "strategy": "V4.4 Historical Playback: production market_risk_gate blocked the day.",
+            "market_gate": gate,
+            "rows": [],
+        }
+
+    df = apply_production_filters(df, gate)
+    if df.empty:
+        return {
+            "id": None,
+            "created_at": f"{trade_date}T14:50:00",
+            "prediction_date": trade_date,
+            "model_status": f"{model_status}; 历史生产过滤后无合格标的",
+            "strategy": "V4.4 Historical Playback: production filters returned no legal pool.",
+            "market_gate": gate,
+            "rows": [],
+        }
+
+    df = select_strategy_top_picks(df, limit_per_strategy=PRODUCTION_MAX_PICKS_PER_STRATEGY)
+    df = _apply_total_pick_limit(df, limit)
+    rows = [_row_to_api(row) for _, row in df.iterrows()]
+    snapshot_id = save_prediction_snapshot("historical_playback_v44", rows) if cache_prediction else None
+    return {
+        "id": snapshot_id,
+        "created_at": f"{trade_date}T14:50:00",
+        "prediction_date": trade_date,
+        "model_status": model_status,
+        "strategy": f"V4.4 Historical Playback: scan_market(target_date={trade_date}) 复用生产过滤、动态底线、Half-Kelly 仓位和分策略 Top{PRODUCTION_MAX_PICKS_PER_STRATEGY} / 总 Top{PRODUCTION_TOTAL_PICK_LIMIT} 出票上限。",
+        "market_gate": gate,
+        "rows": rows,
+    }
+
+
+def select_strategy_top_picks(df: pd.DataFrame, limit_per_strategy: int = PRODUCTION_MAX_PICKS_PER_STRATEGY) -> pd.DataFrame:
+    """Return tiered production picks per strategy, avoiding duplicate stocks per day."""
+    if df.empty:
+        return df
+    df = filter_paused_strategies(df)
     if df.empty:
         return df
     selected: list[pd.DataFrame] = []
     used_codes: set[str] = set()
+    selection_limit = max(1, int(limit_per_strategy))
     for strategy_type in PRODUCTION_OUTPUT_STRATEGIES:
-        pool = df[df.get("strategy_type", BREAKOUT_STRATEGY_TYPE).eq(strategy_type)].copy()
+        strategy_series = df["strategy_type"] if "strategy_type" in df.columns else pd.Series(BREAKOUT_STRATEGY_TYPE, index=df.index)
+        pool = df[strategy_series.eq(strategy_type)].copy()
         if pool.empty:
             continue
         pool = pool.sort_values(["排序评分", "预期溢价", "综合评分"], ascending=[False, False, False])
-        kept = []
-        for idx, row in pool.iterrows():
-            code = str(row.get("纯代码") or row.get("code") or "")
-            if code and code in used_codes:
-                continue
-            kept.append(idx)
+        score = _strategy_selection_score(pool, strategy_type).replace([np.inf, -np.inf], 0).fillna(0)
+        legal_pool = pool.assign(score=score)
+        min_score = _strategy_min_score(strategy_type)
+        dynamic_floor = max(ABSOLUTE_BOTTOM_PROBA, float(legal_pool["score"].quantile(0.99)))
+        absolute_floor = _strategy_dynamic_absolute_floor(strategy_type)
+        print(
+            f"[AdaptiveFloor] strategy={strategy_type} legal_pool={len(legal_pool)} "
+            f"min_score={min_score:.4f} dynamic_floor={dynamic_floor:.4f} "
+            f"absolute_bottom={ABSOLUTE_BOTTOM_PROBA:.4f} absolute_floor={absolute_floor:.4f}"
+        )
+        qualified_pool = legal_pool[legal_pool["score"] >= min_score].copy()
+        if not qualified_pool.empty:
+            kept = _take_unique_pick_indices(qualified_pool, used_codes, selection_limit)
+            if kept:
+                picked = legal_pool.loc[kept].copy()
+                picked["risk_warning"] = ""
+                picked["selection_tier"] = "base"
+                picked["dynamic_floor"] = dynamic_floor
+                picked["下探底线"] = dynamic_floor
+                selected.append(picked)
+            continue
+
+        fallback_pool = legal_pool[~legal_pool.apply(lambda row: _pick_code(row) in used_codes, axis=1)].copy()
+        if fallback_pool.empty:
+            continue
+        top_idx = fallback_pool.index[0]
+        top_score = float(score.loc[top_idx])
+        if top_score >= dynamic_floor and top_score >= absolute_floor:
+            picked = legal_pool.loc[[top_idx]].copy()
+            picked["risk_warning"] = RISK_WARNING_DYNAMIC_FLOOR
+            picked["selection_tier"] = "dynamic_floor"
+            picked["dynamic_floor"] = dynamic_floor
+            picked["下探底线"] = dynamic_floor
+            picked["absolute_floor"] = absolute_floor
+            code = _pick_code(picked.iloc[0])
             if code:
                 used_codes.add(code)
-            if len(kept) >= max(1, int(limit_per_strategy)):
-                break
-        if kept:
-            selected.append(pool.loc[kept])
+            selected.append(picked)
+        elif _strategy_requires_absolute_floor(strategy_type):
+            print(
+                f"[AdaptiveFloor][BLOCKED] strategy={strategy_type} top_score={top_score:.4f} "
+                f"dynamic_floor={dynamic_floor:.4f} absolute_floor={absolute_floor:.4f}"
+            )
     if not selected:
         return df.iloc[0:0].copy()
     out = pd.concat(selected, ignore_index=False)
     out["策略优先级"] = out.get("策略优先级", out["strategy_type"].map(STRATEGY_PRIORITY).fillna(1)).astype(float)
     return out.sort_values(["策略优先级", "排序评分", "预期溢价", "综合评分"], ascending=[False, False, False, False])
+
+
+def _pick_code(row: pd.Series) -> str:
+    return str(row.get("纯代码") or row.get("code") or "")
+
+
+def _take_unique_pick_indices(pool: pd.DataFrame, used_codes: set[str], limit: int) -> list[Any]:
+    kept: list[Any] = []
+    for idx, row in pool.iterrows():
+        code = _pick_code(row)
+        if code and code in used_codes:
+            continue
+        kept.append(idx)
+        if code:
+            used_codes.add(code)
+        if len(kept) >= limit:
+            break
+    return kept
+
+
+def calculate_suggested_position(probability: float, tier: str) -> float:
+    if str(tier or "") == "dynamic_floor":
+        return DYNAMIC_FLOOR_POSITION
+    probability = float(pd.to_numeric(pd.Series([probability]), errors="coerce").fillna(0.0).iloc[0])
+    probability = float(np.clip(probability, 0.0, 1.0))
+    kelly_fraction = probability - (1.0 - probability) / KELLY_WIN_LOSS_RATIO
+    half_kelly = max(0.0, kelly_fraction * HALF_KELLY_FACTOR)
+    return float(np.clip(half_kelly, BASE_POSITION_MIN, BASE_POSITION_MAX))
 
 
 def market_risk_gate(df: pd.DataFrame, indices: dict[str, dict[str, float | str]] | None = None) -> dict[str, Any]:
@@ -783,6 +1579,7 @@ def _prepare_live_inference_snapshot(snapshot: pd.DataFrame) -> pd.DataFrame:
     main_board_near_limit = change >= LIVE_NEAR_LIMIT_CHANGE_PCT
     main_board_sealed = change >= 9.5
     out["准涨停未封板标记"] = (main_board_near_limit & ~main_board_sealed).astype(float)
+    out["涨停不可交易标记"] = (~_not_limit_up_tradable_mask(out)).astype(float)
     out["live_proxy_factor"] = LIVE_VOLUME_EXTRAPOLATION_FACTOR
     return out
 
@@ -795,6 +1592,30 @@ def _first_existing_num(df: pd.DataFrame, cols: list[str]) -> pd.Series:
         values = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
         result = result.where(result.notna(), values)
     return result
+
+
+def _not_limit_up_tradable_mask(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(False, index=df.index)
+    code_source = df["纯代码"] if "纯代码" in df.columns else df.get("code", pd.Series("", index=df.index))
+    code = code_source.fillna("").astype(str).str.extract(r"(\d{6})", expand=False).fillna("")
+    code = code.where(code.ne(""), code_source.fillna("").astype(str).str.zfill(6).str[-6:])
+    current_price = _first_existing_num(df, ["最新价", "current_price", "now", "price", "trade", "close"])
+    pre_close = _first_existing_num(df, ["昨收", "pre_close"])
+    change_pct = _first_existing_num(df, ["涨跌幅", "change_pct", "pctChg", "change"])
+    computed_change = ((current_price / pre_close.replace(0, np.nan) - 1) * 100).replace([np.inf, -np.inf], np.nan)
+    change_pct = change_pct.where(change_pct.notna(), computed_change)
+    growth_board = code.str.startswith(("30", "68"), na=False)
+    limit_pct = pd.Series(LIMIT_UP_MAIN_BOARD_BLOCK_PCT, index=df.index, dtype="float64")
+    limit_pct.loc[growth_board] = LIMIT_UP_GROWTH_BOARD_BLOCK_PCT
+    exact_limit_ratio = pd.Series(1.10, index=df.index, dtype="float64")
+    exact_limit_ratio.loc[growth_board] = 1.20
+    synthetic_limit_price = (pre_close * exact_limit_ratio).round(2)
+    explicit_limit_price = _first_existing_num(df, ["limit_up_price", "up_limit", "涨停价"])
+    limit_price = explicit_limit_price.where(explicit_limit_price.notna() & (explicit_limit_price > 0), synthetic_limit_price)
+    blocked = (current_price >= limit_price) | (change_pct > limit_pct)
+    valid = current_price.notna() & (current_price > 0) & pre_close.notna() & (pre_close > 0)
+    return (valid & ~blocked.fillna(True)).fillna(False)
 
 
 def _dynamic_win_rate_thresholds(df: pd.DataFrame) -> pd.Series:
@@ -1214,11 +2035,203 @@ def _repair_snapshot_volume_ratio(snapshot: pd.DataFrame) -> int:
     return int(valid.sum())
 
 
+def _position_probability(row: pd.Series) -> float:
+    if str(row.get("strategy_type", "")) == GLOBAL_MOMENTUM_STRATEGY_TYPE:
+        return float(pd.to_numeric(pd.Series([row.get("global_probability")]), errors="coerce").fillna(0.0).iloc[0])
+    win_rate = float(pd.to_numeric(pd.Series([row.get("AI胜率")]), errors="coerce").fillna(0.0).iloc[0])
+    return float(np.clip(win_rate / 100.0, 0.0, 1.0))
+
+
+def attach_pick_theme_fields(item: dict[str, Any], source: Any | None = None) -> dict[str, Any]:
+    out = dict(item)
+    source_obj = source if source is not None else out
+    raw = out.get("raw") if isinstance(out.get("raw"), dict) else {}
+    winner = raw.get("winner") if isinstance(raw.get("winner"), dict) else {}
+    code = _clean_stock_code(
+        _source_get(source_obj, "纯代码")
+        or _source_get(source_obj, "code")
+        or out.get("code")
+        or winner.get("code")
+    )
+    trade_date = str(
+        _source_get(source_obj, "date")
+        or out.get("selection_date")
+        or out.get("date")
+        or winner.get("date")
+        or ""
+    )
+    theme_name = (
+        _safe_text(_source_get(source_obj, "theme_name"))
+        or _safe_text(out.get("theme_name"))
+        or _safe_text(winner.get("theme_name"))
+    )
+    theme_source = (
+        _safe_text(_source_get(source_obj, "theme_source"))
+        or _safe_text(out.get("theme_source"))
+        or _safe_text(winner.get("theme_source"))
+    )
+    if not theme_name and code:
+        theme_name, theme_source = _theme_name_for_code(code)
+    theme_pct_values = [
+        winner.get("theme_pct_chg_3"),
+        winner.get("theme_momentum_3d"),
+        winner.get("theme_momentum"),
+        raw.get("theme_momentum_3d") if isinstance(raw, dict) else None,
+        raw.get("theme_pct_chg_3") if isinstance(raw, dict) else None,
+    ]
+    if source is not None:
+        theme_pct_values = [
+            _source_get(source_obj, "theme_pct_chg_3"),
+            _source_get(source_obj, "theme_momentum_3d"),
+            _source_get(source_obj, "theme_momentum"),
+            *theme_pct_values,
+        ]
+    if _safe_text(out.get("core_theme")) or _safe_text(out.get("theme_name")):
+        theme_pct_values.extend([out.get("theme_pct_chg_3"), out.get("theme_momentum_3d"), out.get("theme_momentum")])
+    theme_pct = _optional_theme_float(*theme_pct_values)
+    if theme_pct is None and code:
+        theme_pct = _latest_theme_pct_chg_3_for_code(code, trade_date)
+    theme_pct = round(float(theme_pct), 6) if theme_pct is not None else 0.0
+    theme_name = theme_name or "-"
+    theme_source = theme_source or ""
+
+    out["theme_name"] = theme_name
+    out["theme_source"] = theme_source
+    out["theme_pct_chg_3"] = theme_pct
+    out["core_theme"] = "" if theme_name == "-" else theme_name
+    out["theme_momentum"] = theme_pct
+    out["theme_momentum_3d"] = theme_pct
+    if isinstance(raw, dict) and isinstance(winner, dict):
+        if not _safe_text(winner.get("theme_name")):
+            winner["theme_name"] = theme_name
+        if not _safe_text(winner.get("theme_source")):
+            winner["theme_source"] = theme_source
+        if _optional_theme_float(winner.get("theme_pct_chg_3")) is None:
+            winner["theme_pct_chg_3"] = theme_pct
+        if not _safe_text(winner.get("core_theme")):
+            winner["core_theme"] = out["core_theme"]
+        if _optional_theme_float(winner.get("theme_momentum")) is None:
+            winner["theme_momentum"] = theme_pct
+        if _optional_theme_float(winner.get("theme_momentum_3d")) is None:
+            winner["theme_momentum_3d"] = theme_pct
+    return out
+
+
+def _source_get(source: Any, key: str) -> Any:
+    if source is None:
+        return None
+    if isinstance(source, pd.Series):
+        return source.get(key)
+    if isinstance(source, dict):
+        return source.get(key)
+    return None
+
+
+def _safe_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and not np.isfinite(value):
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"", "nan", "none", "-"} else text
+
+
+def _optional_theme_float(*values: Any) -> float | None:
+    for value in values:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(parsed):
+            return parsed
+    return None
+
+
+def _clean_stock_code(value: Any) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits[-6:] if len(digits) >= 6 else ""
+
+
+@lru_cache(maxsize=1)
+def _stock_concept_map_cached() -> dict[str, str]:
+    return get_stock_concept_map(refresh=False)
+
+
+@lru_cache(maxsize=1)
+def _stock_sector_map_cached() -> dict[str, str]:
+    return get_stock_sector_map(refresh=False)
+
+
+@lru_cache(maxsize=1)
+def _concept_name_map_cached() -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    try:
+        if CONCEPT_INDEX_PATH.exists():
+            index = pd.read_parquet(CONCEPT_INDEX_PATH, columns=["concept_code", "concept_name"])
+            mapping.update(
+                {
+                    str(row.get("concept_code") or ""): str(row.get("concept_name") or "")
+                    for row in index.to_dict("records")
+                    if row.get("concept_code") and row.get("concept_name")
+                }
+            )
+        if CONCEPT_CATALOG_PATH.exists():
+            catalog = json.loads(CONCEPT_CATALOG_PATH.read_text(encoding="utf-8"))
+            for item in catalog if isinstance(catalog, list) else []:
+                code = str(item.get("concept_code") or "")
+                name = str(item.get("concept_name") or "")
+                if code and name:
+                    mapping.setdefault(code, name)
+    except Exception:
+        return {}
+    return mapping
+
+
+def _theme_name_for_code(code: str) -> tuple[str, str]:
+    clean = _clean_stock_code(code)
+    concept_code = _stock_concept_map_cached().get(clean, "")
+    if concept_code:
+        return _concept_name_map_cached().get(concept_code, concept_code), "concept"
+    sector_name = _stock_sector_map_cached().get(clean, "")
+    if sector_name:
+        return sector_name, "sector"
+    return "-", ""
+
+
+@lru_cache(maxsize=8192)
+def _latest_theme_pct_chg_3_for_code(code: str, trade_date: str = "") -> float | None:
+    clean = _clean_stock_code(code)
+    if not clean:
+        return None
+    path = DATA_DIR / f"{clean}_daily.parquet"
+    if not path.exists():
+        return None
+    try:
+        raw = pd.read_parquet(path)
+        if trade_date:
+            dates = pd.to_datetime(raw.get("datetime", raw.get("date")).astype(str), errors="coerce")
+            cutoff = pd.to_datetime(trade_date, errors="coerce")
+            if pd.notna(cutoff):
+                raw = raw[dates.dt.normalize() <= cutoff.normalize()].copy()
+        factors = generate_daily_factors(raw.tail(120))
+        if factors.empty:
+            return None
+        value = pd.to_numeric(pd.Series([factors.iloc[-1].get("theme_pct_chg_3")]), errors="coerce").iloc[0]
+        return float(value) if pd.notna(value) and np.isfinite(float(value)) else None
+    except Exception:
+        return None
+
+
 def _row_to_api(row: pd.Series) -> dict[str, Any]:
-    return {
+    tier = str(row.get("selection_tier", "base"))
+    strategy_type = str(row.get("strategy_type", BREAKOUT_STRATEGY_TYPE))
+    position_probability = _position_probability(row)
+    suggested_position = calculate_suggested_position(position_probability, tier)
+    absolute_floor = _optional_float_value(row.get("absolute_floor"), _strategy_dynamic_absolute_floor(strategy_type))
+    return attach_pick_theme_fields({
         "code": str(row["纯代码"]),
         "name": str(row["名称"]),
-        "strategy_type": str(row.get("strategy_type", BREAKOUT_STRATEGY_TYPE)),
+        "strategy_type": strategy_type,
         "price": round(float(row["最新价"]), 4),
         "change": round(float(row["涨跌幅"]), 4),
         "volume_ratio": round(float(row["量比"]), 4),
@@ -1226,12 +2239,32 @@ def _row_to_api(row: pd.Series) -> dict[str, Any]:
         "win_rate": round(float(row["AI胜率"]), 4),
         "expected_premium": round(float(row.get("预期溢价", 0)), 4),
         "expected_t3_max_gain_pct": round(float(row.get("预期溢价", 0)), 4) if str(row.get("strategy_type", "")) in SWING_STRATEGY_TYPES else None,
+        "global_probability": round(float(row.get("global_probability", 0)), 6) if str(row.get("strategy_type", "")) == GLOBAL_MOMENTUM_STRATEGY_TYPE else None,
+        "global_probability_pct": round(float(row.get("global_probability_pct", 0)), 4) if str(row.get("strategy_type", "")) == GLOBAL_MOMENTUM_STRATEGY_TYPE else None,
         "risk_score": round(float(row.get("风险评分", 0)), 4),
         "liquidity_score": round(float(row.get("流动性评分", 0)), 4),
         "composite_score": round(float(row.get("综合评分", row["AI胜率"])), 4),
         "sort_score": round(float(row.get("排序评分", row.get("综合评分", row["AI胜率"]))), 4),
         "score_threshold": round(float(row.get("生产门槛", BREAKOUT_MIN_SCORE)), 4),
+        "selection_score": round(float(row.get("score", _strategy_selection_score(pd.DataFrame([row]), str(row.get("strategy_type", BREAKOUT_STRATEGY_TYPE))).iloc[0])), 6),
+        "dynamic_floor": round(float(row.get("dynamic_floor", row.get("下探底线", ABSOLUTE_BOTTOM_PROBA))), 6),
+        "score_floor": round(float(row.get("下探底线", row.get("dynamic_floor", ABSOLUTE_BOTTOM_PROBA))), 6),
+        "absolute_floor": (
+            round(float(absolute_floor), 6)
+            if np.isfinite(float(absolute_floor))
+            else None
+        ),
+        "selection_tier": tier,
+        "risk_warning": str(row.get("risk_warning", "") or ""),
+        "position_probability": round(position_probability, 6),
+        "suggested_position": round(suggested_position, 4),
         "sentiment_bonus": round(float(row.get("情绪补偿分", 0)), 4),
+        "theme_score": round(_optional_float_value(row.get("theme_score"), 50.0), 4),
+        "theme_heat_score": round(_optional_float_value(row.get("theme_heat_score"), 50.0), 4),
+        "theme_weight": round(_optional_float_value(row.get("theme_weight"), 0.0), 4),
+        "theme_adjustment": round(_optional_float_value(row.get("theme_adjustment"), 0.0), 4),
+        "theme_laggard_penalty": round(_optional_float_value(row.get("theme_laggard_penalty"), 0.0), 4),
+        "theme_reversal_penalty": round(_optional_float_value(row.get("theme_reversal_penalty"), 0.0), 4),
         "market_gate_mode": str(row.get("market_gate_mode", "")),
         "tech_features": {
             "body_ratio": round(float(row["实体比例"]), 4),
@@ -1280,4 +2313,14 @@ def _row_to_api(row: pd.Series) -> dict[str, Any]:
             "avg_change": round(float(row.get("market_avg_change", 0)), 4),
             "amount_yi": round(float(row.get("market_amount", 0) or 0) / 100000000, 4),
         },
-    }
+        "date": str(row.get("date", "")),
+        "next_date": str(row.get("next_date")) if pd.notna(row.get("next_date")) else None,
+        "t3_exit_date": str(row.get("t3_exit_date")) if pd.notna(row.get("t3_exit_date")) else None,
+        "next_open": round(float(row.get("next_open")), 4) if pd.notna(row.get("next_open")) else None,
+        "open_premium": round(float(row.get("open_premium")), 4) if pd.notna(row.get("open_premium")) else None,
+        "t3_max_gain_pct": round(float(row.get("t3_max_gain_pct")), 4) if pd.notna(row.get("t3_max_gain_pct")) else None,
+        "t3_close": round(float(row.get("t3_close")), 4) if pd.notna(row.get("t3_close")) else None,
+        "t3_close_return_pct": round(float(row.get("t3_close_return_pct")), 4) if pd.notna(row.get("t3_close_return_pct")) else None,
+        "t3_settlement_price": round(float(row.get("t3_settlement_price")), 4) if pd.notna(row.get("t3_settlement_price")) else None,
+        "t3_settlement_return_pct": round(float(row.get("t3_settlement_return_pct")), 4) if pd.notna(row.get("t3_settlement_return_pct")) else None,
+    }, row)

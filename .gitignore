@@ -17,7 +17,7 @@ quant_dashboard/frontend/node_modules/
 quant_dashboard/frontend/dist/
 
 # Local market data, database and runtime cache
-data/
+/data/
 *.sqlite
 *.sqlite3
 *.db

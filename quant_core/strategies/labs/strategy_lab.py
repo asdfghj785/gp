@@ -16,7 +16,13 @@ from quant_core.engine.backtest import (
 )
 from quant_core.cache_utils import read_dataframe_cache, write_dataframe_cache
 from quant_core.config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE, REVERSAL_MIN_SCORE
-from quant_core.engine.predictor import PROFIT_TARGET_PCT, apply_production_filters, build_features, score_candidates
+from quant_core.engine.predictor import (
+    PROFIT_TARGET_PCT,
+    _attach_historical_global_probabilities,
+    apply_production_filters,
+    build_features,
+    score_candidates,
+)
 from quant_core.storage import init_db
 
 
@@ -116,7 +122,10 @@ def prepare_evaluated_candidates(months: int, refresh: bool = False) -> dict[str
     raw = raw[raw["date"].isin(all_trading_dates)].copy()
     candidates = build_features(raw)
     candidates = candidates[candidates["date"].isin(trading_dates)].copy()
+    candidates, global_batch_status = _attach_historical_global_probabilities(candidates, raw)
+    candidates["historical_playback"] = True
     candidates, model_status = score_candidates(candidates)
+    model_status = f"{model_status}; {global_batch_status}; data_source=stock_daily_1500"
     candidates = _attach_next_open(candidates, raw, trading_dates)
     evaluated = candidates[np.isfinite(candidates["open_premium"])].copy()
     result = {
@@ -148,6 +157,7 @@ def _attach_next_open(candidates: pd.DataFrame, raw: pd.DataFrame, trading_dates
     next_trade_date = {trading_dates[index]: trading_dates[index + 1] for index in range(len(trading_dates) - 1)}
     opens = raw.set_index(["date", "code"])["open"]
     highs = raw.set_index(["date", "code"])["high"]
+    closes = raw.set_index(["date", "code"])["close"]
     out = candidates.copy()
     out["next_date"] = out["date"].map(next_trade_date)
     out["next_open"] = [opens.get((next_date, code), np.nan) for next_date, code in zip(out["next_date"], out["纯代码"])]
@@ -159,16 +169,24 @@ def _attach_next_open(candidates: pd.DataFrame, raw: pd.DataFrame, trading_dates
     }
     out["t3_exit_date"] = out["date"].map(lambda day: future_dates.get(str(day), [None])[-1] if len(future_dates.get(str(day), [])) == 3 else None)
     future_highs: list[float] = []
-    for day, code in zip(out["date"], out["纯代码"]):
+    t3_closes: list[float] = []
+    for day, code, exit_date in zip(out["date"], out["纯代码"], out["t3_exit_date"]):
         candidate_dates = future_dates.get(str(day), [])
         if len(candidate_dates) < 3:
             future_highs.append(np.nan)
+            t3_closes.append(np.nan)
             continue
         values = [highs.get((future_day, code), np.nan) for future_day in candidate_dates]
         numeric = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
         future_highs.append(float(numeric.max()) if len(numeric) == 3 else np.nan)
+        t3_close = float(closes.get((exit_date, code), np.nan)) if exit_date else np.nan
+        t3_closes.append(t3_close)
     out["t3_max_high"] = future_highs
+    out["t3_close"] = t3_closes
     out["t3_max_gain_pct"] = (pd.to_numeric(out["t3_max_high"], errors="coerce") / out["最新价"] - 1) * 100
+    out["t3_close_return_pct"] = (pd.to_numeric(out["t3_close"], errors="coerce") / out["最新价"] - 1) * 100
+    out["t3_settlement_price"] = out["t3_close"]
+    out["t3_settlement_return_pct"] = out["t3_close_return_pct"]
     return out
 
 
@@ -293,8 +311,9 @@ def _daily_pick_rows(df: pd.DataFrame, limit: int) -> list[dict[str, Any]]:
     for _, row in picks.iterrows():
         strategy_type = str(row.get("strategy_type", "尾盘突破"))
         t3_gain = row.get("t3_max_gain_pct")
+        t3_close_return = row.get("t3_settlement_return_pct", row.get("t3_close_return_pct"))
         open_premium = row.get("open_premium")
-        success = bool(t3_gain > 0) if strategy_type in {"中线超跌反转", "右侧主升浪"} and pd.notna(t3_gain) else (bool(open_premium > PROFIT_TARGET_PCT) if pd.notna(open_premium) else None)
+        success = bool(t3_close_return > 0) if strategy_type in {"中线超跌反转", "右侧主升浪", "全局动量狙击"} and pd.notna(t3_close_return) else (bool(open_premium > PROFIT_TARGET_PCT) if pd.notna(open_premium) else None)
         rows.append(
             {
                 "date": str(row["date"]),
@@ -312,6 +331,10 @@ def _daily_pick_rows(df: pd.DataFrame, limit: int) -> list[dict[str, Any]]:
                 "next_open": round(float(row["next_open"]), 4) if pd.notna(row["next_open"]) else None,
                 "open_premium": round(float(row["open_premium"]), 4) if pd.notna(row["open_premium"]) else None,
                 "t3_max_gain_pct": round(float(row["t3_max_gain_pct"]), 4) if pd.notna(row.get("t3_max_gain_pct")) else None,
+                "t3_close": round(float(row["t3_close"]), 4) if pd.notna(row.get("t3_close")) else None,
+                "t3_close_return_pct": round(float(row["t3_close_return_pct"]), 4) if pd.notna(row.get("t3_close_return_pct")) else None,
+                "t3_settlement_price": round(float(row["t3_settlement_price"]), 4) if pd.notna(row.get("t3_settlement_price")) else None,
+                "t3_settlement_return_pct": round(float(row["t3_settlement_return_pct"]), 4) if pd.notna(row.get("t3_settlement_return_pct")) else None,
                 "success": success,
             }
         )

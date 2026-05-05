@@ -21,8 +21,25 @@ def _load_local_env() -> None:
 _load_local_env()
 
 
+def _env_float(name: str, default: str) -> float:
+    return float(os.getenv(name, default))
+
+
+def _env_float_floor(name: str, default: str, floor: float) -> float:
+    return max(_env_float(name, default), floor)
+
+
+def _env_int_floor(name: str, default: str, floor: int) -> int:
+    try:
+        value = int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(value, floor)
+
+
 BASE_DIR = Path(os.getenv("QUANT_BASE_DIR", "/Users/eudis/ths"))
 DATA_DIR = Path(os.getenv("QUANT_DATA_DIR", str(BASE_DIR / "data" / "all_kline")))
+MIN_KLINE_DIR = Path(os.getenv("QUANT_MIN_KLINE_DIR", str(BASE_DIR / "data" / "min_kline")))
 CORE_DB_DIR = Path(os.getenv("QUANT_CORE_DB_DIR", str(BASE_DIR / "data" / "core_db")))
 SQLITE_PATH = Path(os.getenv("QUANT_SQLITE_PATH", str(CORE_DB_DIR / "quant_workstation.sqlite3")))
 MODELS_DIR = Path(os.getenv("QUANT_MODELS_DIR", str(BASE_DIR / "models")))
@@ -31,6 +48,10 @@ PREMIUM_MODEL_PATH = Path(os.getenv("QUANT_PREMIUM_MODEL_PATH", str(MODELS_DIR /
 DIPBUY_PREMIUM_MODEL_PATH = Path(os.getenv("QUANT_DIPBUY_PREMIUM_MODEL_PATH", str(MODELS_DIR / "dipbuy_premium_xgboost.json")))
 REVERSAL_MODEL_PATH = Path(os.getenv("QUANT_REVERSAL_MODEL_PATH", str(MODELS_DIR / "reversal_t3_xgboost.json")))
 MAIN_WAVE_MODEL_PATH = Path(os.getenv("QUANT_MAIN_WAVE_MODEL_PATH", str(MODELS_DIR / "main_wave_t3_xgboost.json")))
+GLOBAL_DAILY_MODEL_PATH = Path(os.getenv("QUANT_GLOBAL_DAILY_MODEL_PATH", str(MODELS_DIR / "xgboost_daily_swing_global_v1.json")))
+GLOBAL_DAILY_META_PATH = Path(os.getenv("QUANT_GLOBAL_DAILY_META_PATH", str(MODELS_DIR / "xgboost_daily_swing_global_v1.meta.json")))
+INTRADAY_EXIT_MODEL_PATH = Path(os.getenv("QUANT_INTRADAY_EXIT_MODEL_PATH", str(MODELS_DIR / "intraday_exit_xgboost.json")))
+INTRADAY_EXIT_META_PATH = Path(os.getenv("QUANT_INTRADAY_EXIT_META_PATH", str(MODELS_DIR / "intraday_exit_xgboost.meta.json")))
 LATEST_TOP50_PATH = Path(os.getenv("QUANT_LATEST_TOP50", str(MODELS_DIR / "latest_top_50.json")))
 INTRADAY_SNAPSHOT_PATH = Path(os.getenv("QUANT_INTRADAY_SNAPSHOT_PATH", str(BASE_DIR / "data" / "intraday" / "price_1430.json")))
 OLLAMA_API = os.getenv("OLLAMA_API", "http://127.0.0.1:11434/api/generate")
@@ -38,12 +59,25 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN", "").strip()
 PROFIT_TARGET_PCT = float(os.getenv("QUANT_PROFIT_TARGET_PCT", "1.00"))
 BREAKOUT_HIGH_TARGET_PCT = float(os.getenv("QUANT_BREAKOUT_HIGH_TARGET_PCT", "2.00"))
-BREAKOUT_MIN_SCORE = float(os.getenv("QUANT_BREAKOUT_MIN_SCORE", os.getenv("QUANT_MIN_COMPOSITE_SCORE", "65.50")))
+BREAKOUT_MIN_SCORE = _env_float_floor("QUANT_BREAKOUT_MIN_SCORE", os.getenv("QUANT_MIN_COMPOSITE_SCORE", "72.00"), 72.00)
 DIPBUY_MIN_SCORE = float(os.getenv("QUANT_DIPBUY_MIN_SCORE", "99.00"))
-REVERSAL_MIN_SCORE = float(os.getenv("QUANT_REVERSAL_MIN_SCORE", "3.00"))
-MAIN_WAVE_MIN_SCORE = float(os.getenv("QUANT_MAIN_WAVE_MIN_SCORE", "3.00"))
+REVERSAL_MIN_SCORE = _env_float_floor("QUANT_REVERSAL_MIN_SCORE", "6.00", 6.00)
+MAIN_WAVE_MIN_SCORE = _env_float_floor("QUANT_MAIN_WAVE_MIN_SCORE", "6.60", 6.60)
+GLOBAL_MIN_SCORE = _env_float_floor("QUANT_GLOBAL_MIN_SCORE", "0.90", 0.90)
 MIN_COMPOSITE_SCORE = BREAKOUT_MIN_SCORE
 LATE_PULL_TRAP_THRESHOLD_PCT = float(os.getenv("QUANT_LATE_PULL_TRAP_THRESHOLD_PCT", "4.00"))
+PRODUCTION_STRATEGY_TYPES = tuple(
+    item.strip()
+    for item in os.getenv("QUANT_PRODUCTION_STRATEGIES", "全局动量狙击,右侧主升浪,尾盘突破").split(",")
+    if item.strip()
+)
+PAUSED_STRATEGY_TYPES = tuple(
+    item.strip()
+    for item in os.getenv("QUANT_PAUSED_STRATEGIES", "右侧主升浪,中线超跌反转").split(",")
+    if item.strip()
+)
+DEPRECATED_PRODUCTION_STRATEGY_TYPES = PAUSED_STRATEGY_TYPES
+PRODUCTION_TOTAL_PICK_LIMIT = _env_int_floor("QUANT_PRODUCTION_TOTAL_PICK_LIMIT", "2", 1)
 
 
 def check_push_config(print_warning: bool = True) -> dict[str, Any]:
@@ -78,4 +112,5 @@ def check_push_config(print_warning: bool = True) -> dict[str, Any]:
 def ensure_dirs() -> None:
     CORE_DB_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    MIN_KLINE_DIR.mkdir(parents=True, exist_ok=True)
     MODELS_DIR.mkdir(parents=True, exist_ok=True)

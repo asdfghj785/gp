@@ -20,7 +20,7 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.command == "save":
-        print(save_today_top_pick(limit=10, force=args.force))
+        print(save_today_top_pick(force=args.force))
     elif args.command == "update-open":
         print(update_pending_open_results(force=args.force))
     elif args.command == "latest":

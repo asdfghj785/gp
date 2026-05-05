@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.eudis.quant.v3-sniper-lock</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/eudis/ths/scripts/shell/run_v3_sniper_lock.sh</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/eudis/ths</string>
+	<key>StandardOutPath</key>
+	<string>/Users/eudis/ths/v3_sniper_lock_agent.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/eudis/ths/v3_sniper_lock_agent_err.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>14</integer>
+		<key>Minute</key>
+		<integer>50</integer>
+	</dict>
+</dict>
+</plist>

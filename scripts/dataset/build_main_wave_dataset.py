@@ -169,11 +169,11 @@ def _build_stock_samples(df: pd.DataFrame, start_date: pd.Timestamp | None, late
     physical_mask = (
         (ma20.shift(1) > ma60.shift(1))
         & (out["pullback_from_60d_high"] >= -15.0)
-        & (out["contraction_amplitude_5d"] <= 15.0)
+        & (out["contraction_amplitude_5d"] <= 12.0)
         & (out["prev_volume_ratio_to_5d"] < 1.0)
         & (out["close"] > platform_max_close)
         & (out["body_pct"] >= 3.5)
-        & (out["volume_burst_ratio"] >= 1.15)
+        & (out["volume_burst_ratio"] >= 1.30)
         & out["t3_max_gain_pct"].notna()
         & out["t3_max_drawdown_pct"].notna()
     )
