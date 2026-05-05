@@ -1,4 +1,152 @@
 {
   "positions": [],
-  "closed_positions": []
+  "closed_positions": [
+    {
+      "code": "603305",
+      "name": "旭升集团",
+      "buy_price": 15.15,
+      "highest_price": 15.15,
+      "volume_alert_triggered": false,
+      "order_book_alert_triggered": false,
+      "buy_date": "2026-04-29",
+      "buy_time": "2026-04-29T14:50:52",
+      "target_date": "2026-04-30",
+      "strategy_type": "尾盘突破",
+      "source": "daily_picks_1450",
+      "source_selection_date": "2026-04-29",
+      "source_pick_id": 386,
+      "monitor_date": "2026-04-30",
+      "exit_reason": "breakout_open_stop",
+      "exit_price": 15.13,
+      "exit_gain_pct": -0.132,
+      "settlement_basis": "t1_open",
+      "superseded_exit_reason": "t3_timeout",
+      "repair_note": "尾盘突破不适用 T+3；按 T+1 开盘核按钮结算",
+      "highest_gain_pct": 0.0,
+      "drawdown_pct": -0.132,
+      "closed_at": "2026-04-30T09:25:05",
+      "push_status": {
+        "code": 200,
+        "msg": "执行成功",
+        "data": "91fc32ce8c9a4f2f9efa44e2b6d63a16",
+        "status": "sent",
+        "attempt": 1
+      },
+      "daily_pick_sync": {
+        "status": "synced",
+        "selection_date": "2026-04-29",
+        "code": "603305",
+        "pick_id": 386,
+        "close_price": 15.13,
+        "close_return_pct": -0.13201320132012473,
+        "close_reason": "核按钮"
+      }
+    },
+    {
+      "code": "603507",
+      "name": "振江股份",
+      "buy_price": 49.64,
+      "highest_price": 53.88,
+      "volume_alert_triggered": false,
+      "order_book_alert_triggered": false,
+      "buy_date": "2026-04-29",
+      "buy_time": "2026-04-29T14:50:52",
+      "target_date": "2026-05-04",
+      "strategy_type": "右侧主升浪",
+      "source": "daily_picks_1450",
+      "source_selection_date": "2026-04-29",
+      "source_pick_id": 384,
+      "monitor_date": "2026-04-30",
+      "highest_price_updated_at": "2026-04-30T09:16:07",
+      "exit_reason": "trailing_take_profit",
+      "exit_price": 48.23,
+      "exit_gain_pct": -2.8405,
+      "highest_gain_pct": 8.5415,
+      "drawdown_pct": -3.712,
+      "closed_at": "2026-04-30T09:19:42",
+      "push_status": {
+        "code": 200,
+        "msg": "执行成功",
+        "data": "a6efc7055cdc4a85b3b522044db339be",
+        "status": "sent",
+        "attempt": 1
+      },
+      "daily_pick_sync": {
+        "status": "synced",
+        "selection_date": "2026-04-29",
+        "code": "603507",
+        "pick_id": 384,
+        "close_price": 48.23,
+        "close_return_pct": -2.840451248992759,
+        "close_reason": "trailing_take_profit"
+      },
+      "trigger_price": 51.88,
+      "trigger_gain_pct": 4.5125,
+      "settlement_basis": "morning_auction_open"
+    },
+    {
+      "code": "001337",
+      "name": "四川黄金",
+      "buy_price": 51.04,
+      "highest_price": 54.7,
+      "volume_alert_triggered": false,
+      "order_book_alert_triggered": true,
+      "buy_date": "2026-04-29",
+      "buy_time": "2026-04-29T14:50:52",
+      "target_date": "2026-05-04",
+      "strategy_type": "中线超跌反转",
+      "source": "daily_picks_1450",
+      "source_selection_date": "2026-04-29",
+      "source_pick_id": 385,
+      "monitor_date": "2026-04-30",
+      "highest_price_updated_at": "2026-04-30T09:58:15",
+      "order_book_alert_date": "2026-04-30",
+      "order_book_alert_at": "2026-04-30T09:49:27",
+      "order_book_alert_snapshot": {
+        "total_buy_vol": 104.0,
+        "total_sell_vol": 942.0,
+        "weibi": -80.1147,
+        "buy_volumes": [
+          4.0,
+          69.0,
+          8.0,
+          22.0,
+          1.0
+        ],
+        "sell_volumes": [
+          23.0,
+          153.0,
+          725.0,
+          2.0,
+          39.0
+        ],
+        "quote_time": "20260430094924"
+      },
+      "exit_reason": "trailing_take_profit",
+      "exit_price": 53.03,
+      "exit_gain_pct": 3.8989,
+      "highest_gain_pct": 7.1708,
+      "drawdown_pct": -3.053,
+      "closed_at": "2026-04-30T10:20:59",
+      "push_status": {
+        "code": 200,
+        "msg": "执行成功",
+        "data": "510931061b2547d4bc544e33e921186d",
+        "status": "sent",
+        "attempt": 1
+      },
+      "daily_pick_sync": {
+        "status": "synced",
+        "selection_date": "2026-04-29",
+        "code": "001337",
+        "pick_id": 385,
+        "close_price": 53.03,
+        "close_return_pct": 3.898902821316619,
+        "close_reason": "trailing_take_profit"
+      }
+    }
+  ],
+  "last_seeded_at": "2026-04-30T09:15:04",
+  "last_seeded_selection_date": "2026-04-29",
+  "monitor_date": "2026-04-30"
 }

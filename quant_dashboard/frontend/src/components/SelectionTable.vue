@@ -131,7 +131,15 @@
       </el-table-column>
       <el-table-column label="状态" width="118">
         <template #default="{ row }">
-          <span :class="stateClass(row)">{{ stateText(row) }}</span>
+          <el-tooltip
+            v-if="hasFiveMinuteExitTooltip(row)"
+            :content="fiveMinuteExitTooltip(row)"
+            placement="top"
+            effect="dark"
+          >
+            <span :class="stateClass(row)">{{ stateText(row) }}</span>
+          </el-tooltip>
+          <span v-else :class="stateClass(row)">{{ stateText(row) }}</span>
         </template>
       </el-table-column>
       <el-table-column label="操作" width="146" fixed="right">
@@ -342,6 +350,21 @@ const exitText = (row) => {
   if (isSwingStrategy(row)) return row.close_date || row.target_date || 'T+3 观察期'
   return row.close_date || row.target_date || row.next_date || 'T+1 开盘'
 }
+const rawSentinel5m = (row) => row?.raw?.sentinel_5m || {}
+const closeTime = (row) => row?.close_time || rawWinner(row)?.close_time || rawSentinel5m(row)?.close_time || ''
+const hasFiveMinuteExitTooltip = (row) => {
+  if (!row?.is_closed || !closeTime(row)) return false
+  const text = [
+    row?.sell_strategy,
+    row?.exit_policy,
+    rawWinner(row)?.sell_strategy,
+    rawWinner(row)?.exit_policy,
+    rawSentinel5m(row)?.sell_strategy,
+    rawSentinel5m(row)?.exit_policy,
+  ].filter(Boolean).join(' ')
+  return text.includes('5m风控')
+}
+const fiveMinuteExitTooltip = (row) => `触发卖出时间：${closeTime(row)}`
 const stateText = (row) => {
   if (row.is_closed) return '已结清'
   if (row.status === 'pending_open') return '待开盘'

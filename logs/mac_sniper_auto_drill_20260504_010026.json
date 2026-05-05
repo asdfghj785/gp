@@ -1,0 +1,400 @@
+{
+  "status": "failed",
+  "message": "Mac Sniper 全自动试射未达到成功判定",
+  "started_at": "2026-05-04 00:59:26",
+  "finished_at": "2026-05-04 01:00:26",
+  "code": "002747",
+  "name": "埃斯顿",
+  "attempts": [
+    {
+      "attempt": 1,
+      "started_at": "2026-05-04 00:59:26",
+      "code": "002747",
+      "name": "埃斯顿",
+      "cash": 117563.93,
+      "position_pct": 0.25,
+      "broker_snapshot": {
+        "status": "synced",
+        "target_window": 1,
+        "available_cash": 7563.93,
+        "order_form": {
+          "code": "002747",
+          "name": "",
+          "limit_price": null,
+          "quantity": null,
+          "current_price": null
+        },
+        "target_positions": [
+          {
+            "code": "002747",
+            "name": "埃斯顿",
+            "market_price": 21.87,
+            "pnl": -1.0,
+            "today_pnl": 107.0,
+            "pnl_pct": -0.046,
+            "actual_quantity": 100.0,
+            "stock_balance": 100.0,
+            "available_quantity": 100.0,
+            "frozen_quantity": 0.0,
+            "cost_price": 21.88,
+            "market_value": 2187.0,
+            "position_pct": 8.606
+          }
+        ],
+        "position_count": 3
+      },
+      "price": 21.87,
+      "price_source": "positions.002747.market_price",
+      "order": {
+        "code": "002747",
+        "current_price": 21.87,
+        "position_pct": 0.25,
+        "available_cash": 117563.93,
+        "reserve_rate": 0.995,
+        "target_amount": 29244.03,
+        "shares": 1300,
+        "estimated_cost": 28431.0
+      },
+      "mac_sniper": {
+        "status": "failed",
+        "code": "002747",
+        "shares": 1300,
+        "limit_price": "21.87",
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "3424:3428: execution error: “System Events”遇到一个错误：不能获得“text field 1 of window 1 of application process \"同花顺\"”。无效的索引。 (-1719)",
+        "hint": "同花顺交易面板定位失败；请确认已打开交易/买入面板，或先用诊断输出校准控件。",
+        "before_snapshot_error": null,
+        "after_snapshot_error": null,
+        "broker_verification": null,
+        "after_snapshot": {
+          "status": null,
+          "target_window": null,
+          "available_cash": null,
+          "order_form": {},
+          "target_positions": [],
+          "position_count": null
+        }
+      },
+      "decision": {
+        "success": false,
+        "status": "retryable_failed",
+        "kind": "failed",
+        "message": "3424:3428: execution error: “System Events”遇到一个错误：不能获得“text field 1 of window 1 of application process \"同花顺\"”。无效的索引。 (-1719)"
+      },
+      "status": "retryable_failed"
+    },
+    {
+      "attempt": 2,
+      "started_at": "2026-05-04 00:59:38",
+      "code": "002747",
+      "name": "埃斯顿",
+      "cash": 117563.93,
+      "position_pct": 0.25,
+      "broker_snapshot": {
+        "status": "synced",
+        "target_window": 2,
+        "available_cash": 7563.93,
+        "order_form": {
+          "code": "002747",
+          "name": "",
+          "limit_price": null,
+          "quantity": null,
+          "current_price": null
+        },
+        "target_positions": [
+          {
+            "code": "002747",
+            "name": "埃斯顿",
+            "market_price": 21.87,
+            "pnl": -1.0,
+            "today_pnl": 107.0,
+            "pnl_pct": -0.046,
+            "actual_quantity": 100.0,
+            "stock_balance": 100.0,
+            "available_quantity": 100.0,
+            "frozen_quantity": 0.0,
+            "cost_price": 21.88,
+            "market_value": 2187.0,
+            "position_pct": 8.606
+          }
+        ],
+        "position_count": 3
+      },
+      "price": 21.87,
+      "price_source": "positions.002747.market_price",
+      "order": {
+        "code": "002747",
+        "current_price": 21.87,
+        "position_pct": 0.25,
+        "available_cash": 117563.93,
+        "reserve_rate": 0.995,
+        "target_amount": 29244.03,
+        "shares": 1300,
+        "estimated_cost": 28431.0
+      },
+      "mac_sniper": {
+        "status": "failed",
+        "code": "002747",
+        "shares": 1300,
+        "limit_price": "21.87",
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "3488:3515: execution error: 价格框写入校验失败:  (-2700)",
+        "hint": "同花顺交易面板定位失败；请确认已打开交易/买入面板，或先用诊断输出校准控件。",
+        "before_snapshot_error": null,
+        "after_snapshot_error": null,
+        "broker_verification": null,
+        "after_snapshot": {
+          "status": null,
+          "target_window": null,
+          "available_cash": null,
+          "order_form": {},
+          "target_positions": [],
+          "position_count": null
+        }
+      },
+      "decision": {
+        "success": false,
+        "status": "retryable_failed",
+        "kind": "failed",
+        "message": "3488:3515: execution error: 价格框写入校验失败:  (-2700)"
+      },
+      "status": "retryable_failed"
+    },
+    {
+      "attempt": 3,
+      "started_at": "2026-05-04 00:59:50",
+      "code": "002747",
+      "name": "埃斯顿",
+      "cash": 117563.93,
+      "position_pct": 0.25,
+      "broker_snapshot": {
+        "status": "synced",
+        "target_window": 2,
+        "available_cash": 7563.93,
+        "order_form": {
+          "code": "002747",
+          "name": "",
+          "limit_price": null,
+          "quantity": null,
+          "current_price": null
+        },
+        "target_positions": [
+          {
+            "code": "002747",
+            "name": "埃斯顿",
+            "market_price": 21.87,
+            "pnl": -1.0,
+            "today_pnl": 107.0,
+            "pnl_pct": -0.046,
+            "actual_quantity": 100.0,
+            "stock_balance": 100.0,
+            "available_quantity": 100.0,
+            "frozen_quantity": 0.0,
+            "cost_price": 21.88,
+            "market_value": 2187.0,
+            "position_pct": 8.606
+          }
+        ],
+        "position_count": 3
+      },
+      "price": 21.87,
+      "price_source": "positions.002747.market_price",
+      "order": {
+        "code": "002747",
+        "current_price": 21.87,
+        "position_pct": 0.25,
+        "available_cash": 117563.93,
+        "reserve_rate": 0.995,
+        "target_amount": 29244.03,
+        "shares": 1300,
+        "estimated_cost": 28431.0
+      },
+      "mac_sniper": {
+        "status": "failed",
+        "code": "002747",
+        "shares": 1300,
+        "limit_price": "21.87",
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "3488:3515: execution error: 价格框写入校验失败:  (-2700)",
+        "hint": "同花顺交易面板定位失败；请确认已打开交易/买入面板，或先用诊断输出校准控件。",
+        "before_snapshot_error": null,
+        "after_snapshot_error": null,
+        "broker_verification": null,
+        "after_snapshot": {
+          "status": null,
+          "target_window": null,
+          "available_cash": null,
+          "order_form": {},
+          "target_positions": [],
+          "position_count": null
+        }
+      },
+      "decision": {
+        "success": false,
+        "status": "retryable_failed",
+        "kind": "failed",
+        "message": "3488:3515: execution error: 价格框写入校验失败:  (-2700)"
+      },
+      "status": "retryable_failed"
+    },
+    {
+      "attempt": 4,
+      "started_at": "2026-05-04 01:00:03",
+      "code": "002747",
+      "name": "埃斯顿",
+      "cash": 117563.93,
+      "position_pct": 0.25,
+      "broker_snapshot": {
+        "status": "synced",
+        "target_window": 2,
+        "available_cash": 7563.93,
+        "order_form": {
+          "code": "002747",
+          "name": "",
+          "limit_price": null,
+          "quantity": null,
+          "current_price": null
+        },
+        "target_positions": [
+          {
+            "code": "002747",
+            "name": "埃斯顿",
+            "market_price": 21.87,
+            "pnl": -1.0,
+            "today_pnl": 107.0,
+            "pnl_pct": -0.046,
+            "actual_quantity": 100.0,
+            "stock_balance": 100.0,
+            "available_quantity": 100.0,
+            "frozen_quantity": 0.0,
+            "cost_price": 21.88,
+            "market_value": 2187.0,
+            "position_pct": 8.606
+          }
+        ],
+        "position_count": 3
+      },
+      "price": 21.87,
+      "price_source": "positions.002747.market_price",
+      "order": {
+        "code": "002747",
+        "current_price": 21.87,
+        "position_pct": 0.25,
+        "available_cash": 117563.93,
+        "reserve_rate": 0.995,
+        "target_amount": 29244.03,
+        "shares": 1300,
+        "estimated_cost": 28431.0
+      },
+      "mac_sniper": {
+        "status": "failed",
+        "code": "002747",
+        "shares": 1300,
+        "limit_price": "21.87",
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "3488:3515: execution error: 价格框写入校验失败:  (-2700)",
+        "hint": "同花顺交易面板定位失败；请确认已打开交易/买入面板，或先用诊断输出校准控件。",
+        "before_snapshot_error": null,
+        "after_snapshot_error": null,
+        "broker_verification": null,
+        "after_snapshot": {
+          "status": null,
+          "target_window": null,
+          "available_cash": null,
+          "order_form": {},
+          "target_positions": [],
+          "position_count": null
+        }
+      },
+      "decision": {
+        "success": false,
+        "status": "retryable_failed",
+        "kind": "failed",
+        "message": "3488:3515: execution error: 价格框写入校验失败:  (-2700)"
+      },
+      "status": "retryable_failed"
+    },
+    {
+      "attempt": 5,
+      "started_at": "2026-05-04 01:00:15",
+      "code": "002747",
+      "name": "埃斯顿",
+      "cash": 117563.93,
+      "position_pct": 0.25,
+      "broker_snapshot": {
+        "status": "synced",
+        "target_window": 2,
+        "available_cash": 7563.93,
+        "order_form": {
+          "code": "002747",
+          "name": "",
+          "limit_price": null,
+          "quantity": null,
+          "current_price": null
+        },
+        "target_positions": [
+          {
+            "code": "002747",
+            "name": "埃斯顿",
+            "market_price": 21.87,
+            "pnl": -1.0,
+            "today_pnl": 107.0,
+            "pnl_pct": -0.046,
+            "actual_quantity": 100.0,
+            "stock_balance": 100.0,
+            "available_quantity": 100.0,
+            "frozen_quantity": 0.0,
+            "cost_price": 21.88,
+            "market_value": 2187.0,
+            "position_pct": 8.606
+          }
+        ],
+        "position_count": 3
+      },
+      "price": 21.87,
+      "price_source": "positions.002747.market_price",
+      "order": {
+        "code": "002747",
+        "current_price": 21.87,
+        "position_pct": 0.25,
+        "available_cash": 117563.93,
+        "reserve_rate": 0.995,
+        "target_amount": 29244.03,
+        "shares": 1300,
+        "estimated_cost": 28431.0
+      },
+      "mac_sniper": {
+        "status": "failed",
+        "code": "002747",
+        "shares": 1300,
+        "limit_price": "21.87",
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "3488:3515: execution error: 价格框写入校验失败:  (-2700)",
+        "hint": "同花顺交易面板定位失败；请确认已打开交易/买入面板，或先用诊断输出校准控件。",
+        "before_snapshot_error": null,
+        "after_snapshot_error": null,
+        "broker_verification": null,
+        "after_snapshot": {
+          "status": null,
+          "target_window": null,
+          "available_cash": null,
+          "order_form": {},
+          "target_positions": [],
+          "position_count": null
+        }
+      },
+      "decision": {
+        "success": false,
+        "status": "retryable_failed",
+        "kind": "failed",
+        "message": "3488:3515: execution error: 价格框写入校验失败:  (-2700)"
+      },
+      "status": "retryable_failed"
+    }
+  ]
+}

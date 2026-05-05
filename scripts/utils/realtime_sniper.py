@@ -22,7 +22,7 @@ def send_wechat_msg(title: str, content: str) -> None:
 def get_realtime_recommendation() -> None:
     print(f"尾盘策略启动: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     try:
-        result = scan_market(limit=10, persist_snapshot=True, cache_prediction=True, async_persist=False)
+        result = scan_market(limit=1, persist_snapshot=True, cache_prediction=True, async_persist=False)
     except Exception as exc:
         send_wechat_msg("量化策略异常", f"实时预测失败: {exc}")
         return
@@ -59,7 +59,7 @@ def get_realtime_recommendation() -> None:
 成交额: {gate.get('market_amount_yi', 0):.0f} 亿
 14:30快照: {intraday.get('status')} | 拦截: {intraday.get('trapped_count', 0)}
 
-策略: 尾盘突破/首阴低吸双轨模型按预期溢价排序；目标为次日开盘溢价覆盖1.0%成本缓冲；晴天60%、阴天75%、尾盘拉升超过阈值直接剔除。"""
+策略: 当前启用军团分档排序后仅推送全局 Top1；目标为次日开盘溢价覆盖1.0%成本缓冲；晴天60%、阴天75%、尾盘拉升超过阈值直接剔除。"""
     send_wechat_msg(f"尾盘候选: {winner['name']} ({winner['composite_score']:.1f})", content)
 
 

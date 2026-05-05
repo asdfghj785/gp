@@ -1,0 +1,119 @@
+{
+  "status": "success",
+  "success_kind": "off_hours_submitted_unfilled",
+  "message": "休市试射链路已完整填单并提交；持仓未增加，未写本地成交流水。",
+  "started_at": "2026-05-04 01:01:39",
+  "finished_at": "2026-05-04 01:01:56",
+  "code": "002747",
+  "name": "埃斯顿",
+  "attempts": [
+    {
+      "attempt": 1,
+      "started_at": "2026-05-04 01:01:39",
+      "code": "002747",
+      "name": "埃斯顿",
+      "cash": 117563.93,
+      "position_pct": 0.25,
+      "broker_snapshot": {
+        "status": "synced",
+        "target_window": 2,
+        "available_cash": 7563.93,
+        "order_form": {
+          "code": "002747",
+          "name": "",
+          "limit_price": 21.87,
+          "quantity": null,
+          "current_price": 21.87
+        },
+        "target_positions": [
+          {
+            "code": "002747",
+            "name": "埃斯顿",
+            "market_price": 21.87,
+            "pnl": -1.0,
+            "today_pnl": 107.0,
+            "pnl_pct": -0.046,
+            "actual_quantity": 100.0,
+            "stock_balance": 100.0,
+            "available_quantity": 100.0,
+            "frozen_quantity": 0.0,
+            "cost_price": 21.88,
+            "market_value": 2187.0,
+            "position_pct": 8.606
+          }
+        ],
+        "position_count": 3
+      },
+      "price": 21.87,
+      "price_source": "order_form.current_price",
+      "order": {
+        "code": "002747",
+        "current_price": 21.87,
+        "position_pct": 0.25,
+        "available_cash": 117563.93,
+        "reserve_rate": 0.995,
+        "target_amount": 29244.03,
+        "shares": 1300,
+        "estimated_cost": 28431.0
+      },
+      "mac_sniper": {
+        "status": "submitted_unverified",
+        "code": "002747",
+        "shares": 1300,
+        "limit_price": "21.87",
+        "returncode": null,
+        "stdout": "",
+        "stderr": "",
+        "hint": null,
+        "before_snapshot_error": "",
+        "after_snapshot_error": "",
+        "broker_verification": {
+          "confirmed": false,
+          "code": "002747",
+          "requested_shares": 1300,
+          "before_quantity": 100,
+          "after_quantity": 100,
+          "filled_delta": 0,
+          "reason": "position_quantity_not_increased"
+        },
+        "after_snapshot": {
+          "status": "synced",
+          "target_window": 2,
+          "available_cash": 7563.93,
+          "order_form": {
+            "code": "",
+            "name": "",
+            "limit_price": null,
+            "quantity": null,
+            "current_price": null
+          },
+          "target_positions": [
+            {
+              "code": "002747",
+              "name": "埃斯顿",
+              "market_price": 21.87,
+              "pnl": -1.0,
+              "today_pnl": 107.0,
+              "pnl_pct": -0.046,
+              "actual_quantity": 100.0,
+              "stock_balance": 100.0,
+              "available_quantity": 100.0,
+              "frozen_quantity": 0.0,
+              "cost_price": 21.88,
+              "market_value": 2187.0,
+              "position_pct": 8.606
+            }
+          ],
+          "position_count": 3
+        }
+      },
+      "decision": {
+        "success": true,
+        "status": "success",
+        "kind": "off_hours_submitted_unfilled",
+        "message": "休市试射链路已完整填单并提交；持仓未增加，未写本地成交流水。"
+      },
+      "status": "success"
+    }
+  ]
+}
