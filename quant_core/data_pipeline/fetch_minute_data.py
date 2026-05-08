@@ -6,10 +6,10 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import pandas as pd
-from jqdatasdk import auth, get_price
 
-from quant_core.config import MIN_KLINE_DIR
+from quant_core.config import JQ_FETCH_ENABLED, MIN_KLINE_DIR
 from quant_core.data_pipeline.tencent_engine import get_tencent_m5
+from quant_core.storage import upsert_minute_5m_rows
 
 
 SUPPORTED_PERIODS = {"1", "5", "15", "30", "60"}
@@ -17,15 +17,20 @@ PRICE_FIELDS = ["open", "close", "high", "low", "volume", "money"]
 REQUIRED_COLUMNS = ["datetime", "open", "high", "low", "close", "volume", "money"]
 JQ_DELAY_CUTOFF = datetime(2026, 1, 25, 15, 0, 0)
 _JQ_AUTHED = False
+JQ_DISABLED_MESSAGE = "聚宽分钟线获取已停用；默认仅保留腾讯热数据与本地历史缓存。"
 
 
 def init_jq(username: str | None = None, password: str | None = None, force: bool = False) -> None:
     """Authenticate jqdatasdk once for the current process."""
+    if not JQ_FETCH_ENABLED:
+        raise RuntimeError(JQ_DISABLED_MESSAGE)
+
     global _JQ_AUTHED
     if _JQ_AUTHED and not force:
         return
 
     import os
+    from jqdatasdk import auth
 
     user = (username or os.getenv("JQ_USERNAME") or "").strip()
     pwd = (password or os.getenv("JQ_PASSWORD") or "").strip()
@@ -74,6 +79,17 @@ def smart_fetch_minute(
         raise ValueError(f"开始时间不能晚于结束时间：{start_dt} > {end_dt}")
 
     frames: list[pd.DataFrame] = []
+    if not JQ_FETCH_ENABLED:
+        if start_dt > JQ_DELAY_CUTOFF:
+            frames.append(fetch_from_tencent(safe_code, safe_period, start_dt, end_dt))
+        elif end_dt > JQ_DELAY_CUTOFF:
+            tencent_start = max(start_dt, datetime.combine((JQ_DELAY_CUTOFF + timedelta(days=1)).date(), dt_time(9, 30)))
+            if tencent_start <= end_dt:
+                frames.append(fetch_from_tencent(safe_code, safe_period, tencent_start, end_dt))
+        if not frames:
+            return normalize_minute_frame(pd.DataFrame(), code=safe_code, period=safe_period)
+        return normalize_minute_frame(frames[0], code=safe_code, period=safe_period)
+
     if end_dt <= JQ_DELAY_CUTOFF:
         frames.append(fetch_from_jq(safe_code, safe_period, start_dt, end_dt))
     elif start_dt > JQ_DELAY_CUTOFF:
@@ -101,6 +117,8 @@ def fetch_from_jq(
 ) -> pd.DataFrame:
     """Fetch delayed historical minute data from JoinQuant."""
     init_jq()
+    from jqdatasdk import get_price
+
     safe_code = normalize_stock_code(code)
     jq_code = normalize_code(safe_code)
     safe_period = normalize_period(period)
@@ -158,6 +176,7 @@ def save_stock_min_data(
     safe_code = normalize_stock_code(code)
     df = get_stock_min_data(safe_code, period=period, start_date=start_date, end_date=end_date)
     path = minute_parquet_path(safe_code, period=period, output_root=output_root)
+    db_rows = upsert_minute_5m_rows(df, code=safe_code) if normalize_period(period) == "5" and not df.empty else 0
     written_rows = write_minute_parquet(df, path, code=safe_code, period=period, merge_existing=merge_existing)
     return {
         "code": safe_code,
@@ -166,6 +185,7 @@ def save_stock_min_data(
         "period": f"{normalize_period(period)}m",
         "path": str(path),
         "fetched_rows": len(df),
+        "minute_db_upserted_rows": db_rows,
         "written_rows": written_rows,
         "status": "saved" if written_rows else "empty",
     }

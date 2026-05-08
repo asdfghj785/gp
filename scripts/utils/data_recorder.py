@@ -16,24 +16,25 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from quant_core.data_pipeline.trading_calendar import latest_trading_day_on_or_before
+from quant_core.execution.pushplus_tasks import send_pushplus
 
 # ================= 配置区 =================
 # 锁定你之前的 Parquet 历史数据目录
 DATA_DIR = "/Users/eudis/ths/data/all_kline"
-PUSH_TOKEN = os.getenv("PUSHPLUS_TOKEN", "").strip()
 # ==========================================
 
 def notify(msg):
     """同步结果推送"""
-    if not PUSH_TOKEN:
-        print("未配置 PUSHPLUS_TOKEN，跳过 PushPlus 推送。")
-        return
-    url = "http://www.pushplus.plus/send"
-    data = {"token": PUSH_TOKEN, "title": "📊 K线数据同步报告", "content": msg}
-    try:
-        requests.post(url, json=data, timeout=10)
-    except:
-        pass
+    result = send_pushplus("📊 K线数据同步报告", msg)
+    print(
+        {
+            "task": "data_recorder.notify",
+            "status": result.get("status"),
+            "token_count": result.get("token_count"),
+            "sent_count": result.get("sent_count"),
+            "failed_count": result.get("failed_count"),
+        }
+    )
 
 def fetch_all_stock_data_sina():
     """使用新浪节点获取全市场收盘快照（穿透海外IP封锁）"""

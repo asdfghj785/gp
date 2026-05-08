@@ -24,7 +24,7 @@ DEFAULT_START_DATE = "2024-03-01"
 
 def rebuild_historical_picks(start_date: str = DEFAULT_START_DATE, end_date: str | None = None) -> dict[str, Any]:
     print(
-        f"开始 V4.4 Historical Playback：清空 daily_picks 后从 {start_date} 回放到最近有效交易日。",
+        f"开始 Production Historical Playback：清空 daily_picks 后从 {start_date} 回放到最近有效交易日。",
         flush=True,
     )
     deleted = clear_daily_picks()
@@ -74,7 +74,11 @@ def rebuild_historical_picks(start_date: str = DEFAULT_START_DATE, end_date: str
             missing_settlement = strategy_type in SWING_STRATEGY_TYPES and _swing_settlement_return(winner) is None
             missing_open = strategy_type not in SWING_STRATEGY_TYPES and winner.get("next_open") is None
 
-            pick = _pick_from_scan_winner(winner, scan)
+            pick = _pick_from_scan_winner(
+                winner,
+                scan,
+                is_shadow_test=missing_settlement or missing_open,
+            )
             row_id = save_daily_pick(pick)
             if row_id:
                 inserted += 1
@@ -124,7 +128,7 @@ def rebuild_historical_picks(start_date: str = DEFAULT_START_DATE, end_date: str
                         close_signal={
                             "action": close_reason,
                             "level": "time",
-                            "instruction": "Historical Playback 统一使用 T+3 当天 15:00 收盘价闭环；T+3 最大浮盈只作潜力参考，不参与盈亏统计。",
+                            "instruction": "Production Historical Playback 统一调用 scan_market(target_date)；全局动量狙击使用 T+3 当天 15:00 收盘价闭环，尾盘突破使用 T+1 开盘溢价闭环。",
                             "t3_max_gain_pct": winner.get("t3_max_gain_pct"),
                             "t3_close_return_pct": winner.get("t3_close_return_pct"),
                             "t3_settlement_return_pct": winner.get("t3_close_return_pct"),
@@ -163,7 +167,7 @@ def rebuild_historical_picks(start_date: str = DEFAULT_START_DATE, end_date: str
         model_status=str(prepared.get("model_status") or "ready"),
     )
     print(
-        "V4.4 Historical Playback 完成："
+        "Production Historical Playback 完成："
         f"出手 {result['trade_count']} 次，"
         f"已评估 {result['evaluated_count']} 次，"
         f"胜率 {result['win_rate']:.2f}%，"
@@ -173,7 +177,7 @@ def rebuild_historical_picks(start_date: str = DEFAULT_START_DATE, end_date: str
     return result
 
 
-def _pick_from_scan_winner(winner: dict[str, Any], scan: dict[str, Any]) -> dict[str, Any]:
+def _pick_from_scan_winner(winner: dict[str, Any], scan: dict[str, Any], *, is_shadow_test: bool = False) -> dict[str, Any]:
     selection_date = str(scan.get("prediction_date") or winner.get("date"))
     strategy_type = str(winner.get("strategy_type") or "尾盘突破")
     target_date = _target_date_for_replay(selection_date, strategy_type, winner)
@@ -190,7 +194,7 @@ def _pick_from_scan_winner(winner: dict[str, Any], scan: dict[str, Any]) -> dict
         "snapshot_time": "14:50:00",
         "snapshot_price": float(winner.get("price") or 0),
         "snapshot_vol_ratio": float(winner.get("volume_ratio") or 0),
-        "is_shadow_test": False,
+        "is_shadow_test": is_shadow_test,
         "t3_max_gain_pct": float(winner["t3_max_gain_pct"]) if strategy_type in SWING_STRATEGY_TYPES and winner.get("t3_max_gain_pct") is not None else None,
         "suggested_position": winner.get("suggested_position"),
         "tier": winner.get("selection_tier") or "base",
@@ -210,7 +214,7 @@ def _pick_from_scan_winner(winner: dict[str, Any], scan: dict[str, Any]) -> dict
 
 def _target_date_for_replay(selection_date: str, strategy_type: str, winner: dict[str, Any]) -> str:
     if strategy_type in SWING_STRATEGY_TYPES:
-        explicit = winner.get("t3_exit_date") or winner.get("next_date")
+        explicit = winner.get("t3_exit_date")
         if explicit:
             return str(explicit)[:10]
         return nth_trading_day(pd.Timestamp(selection_date).date(), 3).isoformat()

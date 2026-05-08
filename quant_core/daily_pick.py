@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time as dt_time
 from typing import Any
 
 from quant_core.data_pipeline.market import fetch_sina_snapshot
@@ -18,6 +18,8 @@ from .storage import (
 
 
 SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪", "全局动量狙击"}
+PUSH_LOCK_TIME = dt_time(14, 50)
+PUSH_LOCK_END_TIME = dt_time(15, 5)
 
 
 def is_weekday(day: date | None = None) -> bool:
@@ -36,6 +38,13 @@ def save_today_top_pick(limit: int = PRODUCTION_TOTAL_PICK_LIMIT, force: bool = 
     today = date.today()
     if not force and not is_weekday(today):
         return {"status": "skipped", "reason": "非工作日不保存 14:50 推送标的", "selection_date": today.isoformat()}
+    if not force:
+        day_picks = _real_shadow_picks(get_daily_picks(today.isoformat()))
+        if day_picks:
+            return _existing_lock_result(today, day_picks, "今日 14:50 推送标的已锁定，不再重新扫描")
+        window_reason = _save_window_block_reason()
+        if window_reason:
+            return {"status": "skipped", "reason": window_reason, "selection_date": today.isoformat()}
 
     scan = scan_market(limit=limit, persist_snapshot=True, cache_prediction=False, async_persist=False)
     rows = scan.get("rows", [])
@@ -58,14 +67,31 @@ def save_pushed_top_picks(winners: list[dict[str, Any]], scan: dict[str, Any], f
     today = date.today()
     if not force and not is_weekday(today):
         return {"status": "skipped", "reason": "非工作日不保存 14:50 推送标的", "selection_date": today.isoformat()}
+    day_picks = _real_shadow_picks(get_daily_picks(today.isoformat()))
+    if not force:
+        window_reason = _save_window_block_reason()
+        if window_reason:
+            return _existing_lock_result(today, day_picks, window_reason) if day_picks else {
+                "status": "skipped",
+                "reason": window_reason,
+                "selection_date": today.isoformat(),
+            }
 
     selected_at = datetime.now().isoformat(timespec="seconds")
     saved: list[dict[str, Any]] = []
     existing: list[dict[str, Any]] = []
     for winner in winners:
         pick = _pick_from_winner(winner, scan, selected_at)
+        if not force:
+            matched_strategy = next(
+                (item for item in day_picks if item.get("strategy_type") == pick["strategy_type"]),
+                None,
+            )
+            if matched_strategy:
+                existing.append(matched_strategy)
+                continue
         inserted_id = save_daily_pick(pick)
-        day_picks = get_daily_picks(today.isoformat())
+        day_picks = _real_shadow_picks(get_daily_picks(today.isoformat()))
         matched = next(
             (
                 item
@@ -91,10 +117,40 @@ def save_pushed_top_picks(winners: list[dict[str, Any]], scan: dict[str, Any], f
     }
 
 
+def _save_window_block_reason(now: datetime | None = None) -> str | None:
+    current_time = (now or datetime.now()).time()
+    if current_time < PUSH_LOCK_TIME:
+        return "未到 14:50，不保存 14:50 推送标的"
+    if current_time > PUSH_LOCK_END_TIME:
+        return "已过 15:05 锁定窗口，不允许盘后预测写入真实影子持仓"
+    return None
+
+
+def _real_shadow_picks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in rows if row.get("is_shadow_test")]
+
+
+def _existing_lock_result(today: date, rows: list[dict[str, Any]], reason: str) -> dict[str, Any]:
+    return {
+        "status": "exists",
+        "reason": reason,
+        "selection_date": today.isoformat(),
+        "saved": [],
+        "existing": rows,
+        "count": 0,
+        "existing_count": len(rows),
+    }
+
+
 def _pick_from_winner(winner: dict[str, Any], scan: dict[str, Any], selected_at: str) -> dict[str, Any]:
     today = date.today()
     winner = _winner_theme_contract(dict(winner))
     strategy_type = winner.get("strategy_type", "尾盘突破")
+    production_model = winner.get("production_model") or scan.get("production_model") or {}
+    if strategy_type == "全局动量狙击" and isinstance(production_model, dict):
+        winner.setdefault("model_version", production_model.get("version"))
+        winner.setdefault("selection_mode", production_model.get("selection_mode") or scan.get("selection_mode"))
+        winner.setdefault("production_model", production_model)
     target_date = nth_trading_day(today, 3) if strategy_type in SWING_STRATEGY_TYPES else next_trading_day(today)
     return {
         "selection_date": today.isoformat(),
@@ -121,6 +177,10 @@ def _pick_from_winner(winner: dict[str, Any], scan: dict[str, Any], selected_at:
             "scan_id": scan.get("id"),
             "scan_created_at": scan.get("created_at"),
             "strategy": scan.get("strategy"),
+            "production_model": production_model,
+            "selection_mode": scan.get("selection_mode"),
+            "threshold": scan.get("threshold"),
+            "top_k": scan.get("top_k"),
             "market_gate": scan.get("market_gate"),
             "intraday_snapshot": scan.get("intraday_snapshot"),
         },

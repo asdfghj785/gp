@@ -4,13 +4,14 @@ import ast
 import json
 import math
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Iterable, List, Optional
 
 import requests
 from bs4 import BeautifulSoup
@@ -27,13 +28,22 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from quant_core.config import (
-    MAIN_WAVE_MIN_SCORE,
+    GLOBAL_DAILY_META_PATH,
+    GLOBAL_DAILY_MODEL_PATH,
+    GLOBAL_MIN_SCORE,
+    JQ_FETCH_ENABLED,
     MIN_KLINE_DIR,
     OLLAMA_API,
     OLLAMA_MODEL,
     PAUSED_STRATEGY_TYPES,
-    REVERSAL_MIN_SCORE,
+    SQLITE_PATH,
     check_push_config,
+)
+from quant_core.pushplus_tokens import (
+    create_pushplus_token,
+    delete_pushplus_token,
+    list_pushplus_tokens,
+    update_pushplus_token,
 )
 from quant_core.data_pipeline.fetch_minute_data import save_stock_min_data
 from quant_core.engine.backtest import top_pick_open_backtest
@@ -43,7 +53,7 @@ from quant_core.cache_utils import read_json_cache, write_json_cache
 from quant_core.daily_pick import list_daily_pick_results, update_pending_open_results
 from quant_core.failure_analysis import analyze_prediction_failures
 from quant_core.data_pipeline.market_sync import latest_sync, run_market_close_sync, sync_history
-from quant_core.engine.predictor import attach_pick_theme_fields, scan_market
+from quant_core.engine.predictor import PRODUCTION_OUTPUT_STRATEGIES, attach_pick_theme_fields, scan_market
 from quant_core.execution.mac_sniper import aim_and_fire, read_trade_panel_snapshot
 from quant_core.execution.position_sizer import (
     InsufficientFundsError,
@@ -60,7 +70,9 @@ from quant_core.storage import (
     latest_prediction_snapshot,
     list_validation_reports,
     recent_daily_rows,
+    recent_minute_5m_rows,
 )
+from quant_core.sentinel_cache import daily_picks_signature, validate_sentinel_payload
 from quant_core.strategies.labs.strategy_lab import run_strategy_lab
 from quant_core.up_reason_analysis import analyze_next_day_up_reasons
 from quant_core.validation import validate_one_code, validate_repository
@@ -79,6 +91,11 @@ app.add_middleware(
 app.include_router(v3_dashboard_router)
 app.include_router(v3_sniper_router)
 app.include_router(v4_sniper_router)
+
+V6_SNIPER_MODEL_VERSION = "v6_0_extreme_burst"
+V6_SNIPER_MODEL_LABEL = "V6.0 极寒爆发大脑"
+V6_SNIPER_SELECTION_MODE = "v6_extreme_top1_p60"
+V6_SNIPER_SNAPSHOT_STRATEGY = "v6_extreme_burst_production"
 
 
 class AnalyzeRequest(BaseModel):
@@ -118,23 +135,95 @@ class ShadowTestOrderRequest(BaseModel):
     available_cash: Optional[float] = None
 
 
+class PushPlusTokenCreateRequest(BaseModel):
+    name: str
+    token: str
+    enabled: bool = True
+    note: Optional[str] = ""
+
+
+class PushPlusTokenUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    token: Optional[str] = None
+    enabled: Optional[bool] = None
+    note: Optional[str] = None
+
+
+class PushPlusTestRequest(BaseModel):
+    title: str = "PushPlus token 测试"
+    content: str = "量化工作站 PushPlus 多 token 推送测试。"
+
+
 _scheduler_started = False
 _last_pick_date = ""
 _last_open_update_date = ""
 IGNORE_BROKER_CASH_FOR_TEST_ORDER = False
-SENTINEL_5M_DEFAULT_START_DATE = "2025-10-01"
-SENTINEL_5M_DEFAULT_END_DATE = "2026-01-28"
+SENTINEL_5M_DEFAULT_START_DATE = "2024-04-09"
 SENTINEL_5M_SCRIPT = BASE_DIR / "scripts" / "backtest" / "simulate_sentinel_5m.py"
 SENTINEL_5M_CACHE_DIR = BASE_DIR / "data" / "strategy_cache"
 SENTINEL_5M_LATEST_CACHE = SENTINEL_5M_CACHE_DIR / "sentinel_5m_backtest_latest.json"
-SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪", "全局动量狙击"}
+LEDGER_COMPLETE_5M_START_DATE = "2025-01-01"
+LEDGER_ST_LIMIT_UP_BLOCK_PCT = 4.8
+LEDGER_ST_LIMIT_MIN_5M_VOLUME_LOTS = 500.0
+LEDGER_ST_LIMIT_MIN_15M_VOLUME_LOTS = 1500.0
+ST_BREAKOUT_STRATEGY_TYPE = "尾盘突破-ST特情"
+GLOBAL_SNIPER_STRATEGY_TYPE = "全局动量狙击"
+SWING_STRATEGY_TYPES = {"全局动量狙击"}
+LIVE_SENTINEL_EXIT_POLICY_LABELS = {
+    "intraday_disaster_stop": "5m实时巡逻兵：日内防爆止损",
+    "trailing_take_profit": "5m实时巡逻兵：追踪止盈触发",
+    "eod_structural_stop": "5m实时巡逻兵：尾盘结构止损",
+    "t3_timeout": "5m实时巡逻兵：T+3超时清仓",
+}
 LEDGER_STRATEGY_PRIORITY = {
     "全局动量狙击": 4,
     "右侧主升浪": 3,
     "中线超跌反转": 2,
     "尾盘突破": 1,
+    "尾盘突破-ST特情": 0.8,
     "首阴低吸": 0,
 }
+ACTIVE_BUY_STRATEGY_TYPES = set(PRODUCTION_OUTPUT_STRATEGIES)
+
+
+def _strategy_sort_key(strategy: str) -> tuple[float, str]:
+    return (float(LEDGER_STRATEGY_PRIORITY.get(strategy, -1)), strategy)
+
+
+def _unique_strategy_types(values: Iterable[Any]) -> list[str]:
+    seen: set[str] = set()
+    strategies: list[str] = []
+    for value in values:
+        strategy = str(value or "").strip()
+        if not strategy or strategy in seen:
+            continue
+        seen.add(strategy)
+        strategies.append(strategy)
+    return sorted(strategies, key=_strategy_sort_key, reverse=True)
+
+
+def _attach_strategy_contract(payload: dict[str, Any]) -> dict[str, Any]:
+    out = dict(payload)
+    rows = out.get("rows") or []
+    observed = _unique_strategy_types(row.get("strategy_type") for row in rows if isinstance(row, dict))
+    active = _unique_strategy_types(PRODUCTION_OUTPUT_STRATEGIES)
+    paused = _unique_strategy_types(PAUSED_STRATEGY_TYPES)
+    display = _unique_strategy_types([*active, *observed])
+    existing_contract = out.get("strategy_contract") if isinstance(out.get("strategy_contract"), dict) else {}
+    contract = dict(existing_contract)
+    contract.setdefault("schema_version", "strategy_contract.v1")
+    contract.setdefault("source", "backend")
+    contract["dashboard_contract_schema_version"] = "dashboard_strategy_contract.v1"
+    contract["active_strategy_types"] = active
+    contract["paused_strategy_types"] = paused
+    contract["observed_strategy_types"] = observed
+    contract["display_strategy_types"] = display
+    out["active_strategy_types"] = active
+    out["paused_strategy_types"] = paused
+    out["observed_strategy_types"] = observed
+    out["strategy_types"] = display
+    out["strategy_contract"] = contract
+    return out
 
 
 @app.on_event("startup")
@@ -155,6 +244,83 @@ def health() -> dict[str, Any]:
         "service": "quant_dashboard",
         "pushplus": pushplus,
     }
+
+
+@app.get("/api/pushplus/tokens")
+def pushplus_tokens() -> dict[str, Any]:
+    try:
+        tokens = list_pushplus_tokens(include_env=True)
+        active_count = sum(1 for item in tokens if item.get("enabled"))
+        return {
+            "status": "ready",
+            "tokens": tokens,
+            "summary": {
+                "total_count": len(tokens),
+                "active_count": active_count,
+                "db_count": sum(1 for item in tokens if item.get("source") == "db"),
+                "env_count": sum(1 for item in tokens if item.get("source") == "env"),
+            },
+            "security": {
+                "token_plaintext_returned": False,
+                "mask_rule": "前4位...后4位",
+            },
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/pushplus/tokens")
+def pushplus_token_create(payload: PushPlusTokenCreateRequest) -> dict[str, Any]:
+    try:
+        token = create_pushplus_token(payload.name, payload.token, payload.enabled, payload.note or "")
+        return {"status": "created", "token": token}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.put("/api/pushplus/tokens/{token_id}")
+def pushplus_token_update(token_id: str, payload: PushPlusTokenUpdateRequest) -> dict[str, Any]:
+    try:
+        token = update_pushplus_token(
+            token_id,
+            name=payload.name,
+            token=payload.token,
+            enabled=payload.enabled,
+            note=payload.note,
+        )
+        return {"status": "updated", "token": token}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"PushPlus token 不存在：{token_id}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.delete("/api/pushplus/tokens/{token_id}")
+def pushplus_token_delete(token_id: str) -> dict[str, Any]:
+    try:
+        token = delete_pushplus_token(token_id)
+        return {"status": "deleted", "token": token}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"PushPlus token 不存在：{token_id}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/pushplus/test")
+def pushplus_test(payload: PushPlusTestRequest) -> dict[str, Any]:
+    try:
+        from quant_core.execution.pushplus_tasks import send_pushplus
+
+        result = send_pushplus(payload.title, payload.content)
+        return {"status": result.get("status", "unknown"), "pushplus": result}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/sniper/status")
@@ -512,6 +678,41 @@ def history_min(
 ) -> dict[str, Any]:
     clean_code = _normalize_stock_code(code)
     refresh_result = _refresh_minute_kline(clean_code, period) if refresh else None
+    if period == "5":
+        minute_rows = recent_minute_5m_rows(clean_code, limit=limit)
+        if not minute_rows:
+            suffix = f"；刷新结果：{refresh_result}" if refresh_result else ""
+            raise HTTPException(status_code=404, detail=f"统一分钟表中没有 {clean_code} 的 5 分钟线{suffix}")
+        rows = [
+            {
+                "datetime": item.get("datetime"),
+                "open": _safe_number(item.get("open")),
+                "high": _safe_number(item.get("high")),
+                "low": _safe_number(item.get("low")),
+                "close": _safe_number(item.get("close")),
+                "volume": _safe_number(item.get("volume")),
+                "money": _safe_number(item.get("amount")),
+                "amount": _safe_number(item.get("amount")),
+            }
+            for item in minute_rows
+        ]
+        source_counts = {}
+        for item in minute_rows:
+            key = str(item.get("source") or "unknown")
+            source_counts[key] = source_counts.get(key, 0) + 1
+        return {
+            "code": clean_code,
+            "period": "5m",
+            "path": str(SQLITE_PATH) if "SQLITE_PATH" in globals() else "",
+            "paths": [],
+            "count": len(rows),
+            "latest_datetime": rows[-1]["datetime"] if rows else None,
+            "refresh": refresh_result,
+            "read_errors": [],
+            "source_counts": source_counts,
+            "storage": "sqlite.stock_minute_5m",
+            "rows": rows,
+        }
     paths = _minute_kline_paths(clean_code, period)
     frames: list[pd.DataFrame] = []
     read_errors: list[str] = []
@@ -583,17 +784,97 @@ def history_min(
 def radar_cache() -> dict[str, Any]:
     cached = latest_prediction_snapshot()
     if cached is None:
-        return {"id": None, "created_at": "", "model_status": "no_cache", "rows": []}
+        return _attach_production_sniper_contract({"id": None, "created_at": "", "model_status": "no_cache", "rows": []})
+    clean, reason = _is_clean_v6_radar_snapshot(cached)
+    if not clean:
+        return _attach_production_sniper_contract(
+            {
+                "id": cached.get("id"),
+                "created_at": cached.get("created_at") or "",
+                "model_status": "stale_cache_blocked_v6_clean_contract",
+                "rows": [],
+                "cache": {
+                    "hit": False,
+                    "stale": True,
+                    "reason": reason,
+                    "blocked_strategy": cached.get("strategy"),
+                },
+            }
+        )
     cached["rows"] = cached.get("rows", [])[:12]
-    return _attach_theme_contract(cached)
+    return _attach_production_sniper_contract(_attach_theme_contract(cached))
 
 
 @app.get("/api/radar/scan")
 def radar_scan(limit: int = Query(default=12, ge=1, le=50)) -> dict[str, Any]:
     try:
-        return _attach_theme_contract(scan_market(limit=limit, persist_snapshot=True, cache_prediction=True, async_persist=True))
+        return _attach_production_sniper_contract(
+            _attach_theme_contract(scan_market(limit=limit, persist_snapshot=True, cache_prediction=True, async_persist=True))
+        )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _production_sniper_contract() -> dict[str, Any]:
+    deployed_at = ""
+    feature_count = None
+    meta_version = ""
+    metrics: dict[str, Any] = {}
+    try:
+        deployed_at = datetime.fromtimestamp(GLOBAL_DAILY_MODEL_PATH.stat().st_mtime).isoformat(timespec="seconds")
+    except Exception:
+        deployed_at = ""
+    try:
+        meta = json.loads(GLOBAL_DAILY_META_PATH.read_text(encoding="utf-8"))
+        feature_count = len(meta.get("feature_columns") or [])
+        meta_version = str(meta.get("deployment_status") or meta.get("model_version") or "")
+        metrics = meta.get("metrics") or {}
+    except Exception:
+        feature_count = None
+        meta_version = ""
+        metrics = {}
+    return {
+        "version": V6_SNIPER_MODEL_VERSION,
+        "label": V6_SNIPER_MODEL_LABEL,
+        "path": str(GLOBAL_DAILY_MODEL_PATH),
+        "meta_path": str(GLOBAL_DAILY_META_PATH),
+        "meta_version": meta_version,
+        "deployed_at": deployed_at,
+        "feature_count": feature_count,
+        "threshold": GLOBAL_MIN_SCORE,
+        "top_k": 1,
+        "selection_mode": V6_SNIPER_SELECTION_MODE,
+        "metrics": metrics,
+        "data_contract": {
+            "snapshot_anchor": "14:50 snapshot_price/snapshot_time",
+            "feature_timing": "T日 high/low/close/volume + 历史滚动窗口；不读取 T+1/T+3",
+            "blocked_legacy_sources": ["old_global_model_cache", "v4_theme_alpha_locks", "top_pick_backtest_m12"],
+        },
+    }
+
+
+def _attach_production_sniper_contract(payload: dict[str, Any]) -> dict[str, Any]:
+    out = dict(payload)
+    contract = _production_sniper_contract()
+    out["production_model"] = contract
+    out.setdefault("selection_mode", V6_SNIPER_SELECTION_MODE)
+    out.setdefault("threshold", GLOBAL_MIN_SCORE)
+    out.setdefault("top_k", 1)
+    out["clean_data_contract"] = contract["data_contract"]
+    return out
+
+
+def _is_clean_v6_radar_snapshot(cached: dict[str, Any]) -> tuple[bool, str]:
+    if str(cached.get("strategy") or "") != V6_SNIPER_SNAPSHOT_STRATEGY:
+        return False, "latest prediction_snapshots row was not generated by the V6 production scanner"
+    try:
+        created_at = datetime.fromisoformat(str(cached.get("created_at") or ""))
+        deployed_at = datetime.fromtimestamp(GLOBAL_DAILY_MODEL_PATH.stat().st_mtime)
+        if created_at < deployed_at:
+            return False, "latest prediction snapshot predates the V6 production model file"
+    except Exception:
+        return False, "snapshot timestamp could not be verified against V6 deployment time"
+    return True, "clean_v6_cache"
 
 
 @app.get("/api/daily-picks")
@@ -601,15 +882,39 @@ def daily_picks(
     limit: int = Query(default=5000, ge=1, le=10000),
     shadow_only: bool = Query(default=False),
     view: str = Query(default="strategy_top1"),
+    start_date: Optional[str] = Query(default=None),
+    coverage: str = Query(default="all"),
+    exclude_st_limit_up: bool = Query(default=False),
 ) -> dict[str, Any]:
     result = list_daily_pick_results(limit=limit, shadow_only=shadow_only)
     source_rows = result.get("rows", [])
     result["source_raw_count"] = len(source_rows)
-    result["rows"] = _filter_paused_strategy_rows(source_rows)
+    if view in {"actionable", "strategy_top1", "daily_top1"}:
+        before_shadow_scope = len(source_rows)
+        source_rows = _filter_real_shadow_rows(source_rows)
+        result["shadow_scope"] = {
+            "source_count": before_shadow_scope,
+            "display_count": len(source_rows),
+            "removed_non_shadow": before_shadow_scope - len(source_rows),
+            "rule": "真实影子账本只展示 is_shadow_test=1 的 14:50 锁定票；历史回放、盘后误扫或隔离行不参与 Top1 折叠。",
+        }
+    active_rows = _filter_paused_strategy_rows(source_rows)
+    result["paused_strategy_count"] = len(source_rows) - len(active_rows)
+    result["rows"], ledger_model_scope = _apply_v6_ledger_model_scope(active_rows)
+    result["ledger_model_scope"] = ledger_model_scope
     result["rows"], exit_policy_meta = _attach_unified_exit_policy(result.get("rows", []))
     result["exit_policy"] = exit_policy_meta
+    scoped_rows, ledger_scope = _apply_ledger_display_scope(
+        result.get("rows", []),
+        start_date=start_date,
+        coverage=coverage,
+        exclude_st_limit_up=exclude_st_limit_up,
+    )
+    ledger_scope["removed_legacy_global"] = ledger_model_scope.get("removed_legacy_global", 0)
+    result["rows"] = scoped_rows
+    result["ledger_scope"] = ledger_scope
     result["paused_strategy_types"] = list(PAUSED_STRATEGY_TYPES)
-    result["paused_strategy_count"] = len(source_rows) - len(result.get("rows", []))
+    result["active_strategy_types"] = list(PRODUCTION_OUTPUT_STRATEGIES)
     if view in {"actionable", "strategy_top1"}:
         result["raw_count"] = len(result.get("rows", []))
         result["rows"] = _apply_current_strategy_rules(result.get("rows", []))
@@ -630,7 +935,13 @@ def daily_picks(
     result = _attach_daily_pick_theme_contract(result)
     for row in result.get("rows", []):
         row.setdefault("t3_max_gain_pct", None)
+    result = _attach_strategy_contract(result)
+    result = _attach_production_sniper_contract(result)
     return result
+
+
+def _filter_real_shadow_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in rows if row.get("is_shadow_test")]
 
 
 @app.get("/api/explain/models")
@@ -655,21 +966,203 @@ def _apply_current_strategy_rules(rows: list[dict[str, Any]]) -> list[dict[str, 
     out: list[dict[str, Any]] = []
     for row in rows:
         strategy = str(row.get("strategy_type") or "")
-        if strategy in PAUSED_STRATEGY_TYPES:
-            continue
-        if strategy == "右侧主升浪" and _pick_score(row) < MAIN_WAVE_MIN_SCORE:
-            continue
-        if strategy == "中线超跌反转" and _pick_score(row) < REVERSAL_MIN_SCORE:
+        if strategy not in ACTIVE_BUY_STRATEGY_TYPES:
             continue
         out.append(row)
     return out
 
 
+def _apply_v6_ledger_model_scope(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    scoped: list[dict[str, Any]] = []
+    removed_legacy_global = 0
+    for row in rows:
+        item = dict(row)
+        strategy = str(item.get("strategy_type") or "")
+        if strategy != GLOBAL_SNIPER_STRATEGY_TYPE:
+            scoped.append(item)
+            continue
+        if _is_clean_v6_global_ledger_row(item):
+            item.setdefault("model_version", V6_SNIPER_MODEL_VERSION)
+            item.setdefault("selection_mode", V6_SNIPER_SELECTION_MODE)
+            scoped.append(item)
+            continue
+        removed_legacy_global += 1
+    return scoped, {
+        "model_version": V6_SNIPER_MODEL_VERSION,
+        "model_label": V6_SNIPER_MODEL_LABEL,
+        "selection_mode": V6_SNIPER_SELECTION_MODE,
+        "threshold": GLOBAL_MIN_SCORE,
+        "global_strategy_type": GLOBAL_SNIPER_STRATEGY_TYPE,
+        "source_count": len(rows),
+        "display_count": len(scoped),
+        "removed_legacy_global": removed_legacy_global,
+        "rule": "影子账本默认隔离旧全局狙击记录；只有 V6.0 极寒爆发生产模型写入的全局狙击行进入当前账本视图，其他策略保留原生产口径。",
+    }
+
+
+def _is_clean_v6_global_ledger_row(row: dict[str, Any]) -> bool:
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    winner = raw.get("winner") if isinstance(raw.get("winner"), dict) else {}
+    production_model = {}
+    for candidate in (
+        row.get("production_model"),
+        winner.get("production_model"),
+        raw.get("production_model"),
+    ):
+        if isinstance(candidate, dict):
+            production_model = candidate
+            break
+    version = str(
+        row.get("model_version")
+        or winner.get("model_version")
+        or production_model.get("version")
+        or ""
+    )
+    selection_mode = str(
+        row.get("selection_mode")
+        or winner.get("selection_mode")
+        or raw.get("selection_mode")
+        or production_model.get("selection_mode")
+        or ""
+    )
+    return version == V6_SNIPER_MODEL_VERSION and selection_mode == V6_SNIPER_SELECTION_MODE
+
+
+def _apply_ledger_display_scope(
+    rows: list[dict[str, Any]],
+    start_date: Optional[str],
+    coverage: str,
+    exclude_st_limit_up: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    resolved_start = str(start_date or "").strip()[:10]
+    coverage_mode = str(coverage or "all").strip().lower()
+    if coverage_mode not in {"all", "complete_5m"}:
+        raise HTTPException(status_code=422, detail="coverage 只能是 all 或 complete_5m")
+
+    scoped: list[dict[str, Any]] = []
+    removed_before_start = 0
+    removed_incomplete_5m = 0
+    removed_st_limit_up = 0
+    for row in rows:
+        item = dict(row)
+        selection_date = str(item.get("selection_date") or item.get("date") or "")[:10]
+        if resolved_start and selection_date and selection_date < resolved_start:
+            removed_before_start += 1
+            continue
+        is_closed = _ledger_row_is_closed(item)
+        if coverage_mode == "complete_5m" and is_closed and _ledger_coverage_status(item) != "covered":
+            removed_incomplete_5m += 1
+            continue
+        if exclude_st_limit_up and _is_st_limit_up_unbuyable_pick(item):
+            removed_st_limit_up += 1
+            continue
+        scoped.append(item)
+
+    return scoped, {
+        "start_date": resolved_start or "",
+        "coverage": coverage_mode,
+        "exclude_st_limit_up": bool(exclude_st_limit_up),
+        "source_count": len(rows),
+        "display_count": len(scoped),
+        "removed_before_start": removed_before_start,
+        "removed_incomplete_5m": removed_incomplete_5m,
+        "removed_st_limit_up": removed_st_limit_up,
+        "removed_legacy_global": 0,
+        "rule": "前端账本按 start_date + complete_5m 过滤已结算历史样本；未结算持仓保留展示。ST 特情按当前有效涨跌幅规则过滤涨停封死或尾盘成交机会不足样本。",
+    }
+
+
+def _ledger_row_is_closed(row: dict[str, Any]) -> bool:
+    value = row.get("is_closed")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "closed"}
+
+
+def _ledger_coverage_status(row: dict[str, Any]) -> str:
+    for value in (
+        row.get("coverage_status"),
+        (row.get("raw") or {}).get("coverage_status") if isinstance(row.get("raw"), dict) else None,
+    ):
+        if value:
+            return str(value)
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    for key in ("close_signal", "sentinel_5m"):
+        nested = raw.get(key) if isinstance(raw.get(key), dict) else {}
+        if nested.get("coverage_status"):
+            return str(nested.get("coverage_status"))
+    return ""
+
+
+def _is_st_limit_up_unbuyable_pick(row: dict[str, Any]) -> bool:
+    strategy = str(row.get("strategy_type") or "")
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    winner = raw.get("winner") if isinstance(raw.get("winner"), dict) else {}
+    name = str(row.get("name") or winner.get("name") or "").upper()
+    is_st = strategy == ST_BREAKOUT_STRATEGY_TYPE or "ST" in name
+    if not is_st:
+        return False
+    selection_date = str(row.get("selection_date") or row.get("date") or "")[:10]
+    code = _normalize_code_key(row.get("code") or winner.get("code"))
+    if not code or not selection_date:
+        return False
+    if _st_1450_flat_low_liquidity_limit(code, selection_date):
+        return True
+    return False
+
+
+def _st_1450_flat_low_liquidity_limit(code: str, selection_date: str) -> bool:
+    try:
+        with sqlite3.connect(SQLITE_PATH) as conn:
+            row = conn.execute(
+                """
+                SELECT m.open, m.high, m.low, m.close, m.volume, sd.pre_close
+                FROM stock_minute_5m m
+                LEFT JOIN stock_daily sd ON sd.code = m.code AND sd.date = ?
+                WHERE m.code = ? AND m.datetime = ?
+                LIMIT 1
+                """,
+                (selection_date, code, f"{selection_date} 14:50:00"),
+            ).fetchone()
+            volume_15m_row = conn.execute(
+                """
+                SELECT COALESCE(SUM(volume), 0)
+                FROM stock_minute_5m
+                WHERE code = ?
+                  AND datetime IN (?, ?, ?)
+                """,
+                (
+                    code,
+                    f"{selection_date} 14:40:00",
+                    f"{selection_date} 14:45:00",
+                    f"{selection_date} 14:50:00",
+                ),
+            ).fetchone()
+    except Exception:
+        return False
+    if not row:
+        return False
+    try:
+        open_price, high_price, low_price, close_price, volume, pre_close = [float(item or 0) for item in row]
+        last_15m_volume = float((volume_15m_row or [0])[0] or 0)
+    except (TypeError, ValueError):
+        return False
+    if pre_close <= 0:
+        return False
+    ratio = 1.10 if selection_date >= "2026-07-06" else 1.05
+    limit_price = round(pre_close * ratio, 2)
+    flat_limit = min(open_price, high_price, low_price, close_price) >= limit_price - 1e-6
+    weak_tail_liquidity = (
+        volume < LEDGER_ST_LIMIT_MIN_5M_VOLUME_LOTS
+        or last_15m_volume < LEDGER_ST_LIMIT_MIN_15M_VOLUME_LOTS
+    )
+    return bool(flat_limit and weak_tail_liquidity)
+
+
 def _filter_paused_strategy_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not PAUSED_STRATEGY_TYPES:
-        return list(rows)
-    paused = set(PAUSED_STRATEGY_TYPES)
-    return [row for row in rows if str(row.get("strategy_type") or "") not in paused]
+    return [row for row in rows if str(row.get("strategy_type") or "") in ACTIVE_BUY_STRATEGY_TYPES]
 
 
 def _attach_daily_pick_theme_contract(payload: dict[str, Any]) -> dict[str, Any]:
@@ -702,6 +1195,12 @@ def _attach_daily_pick_theme_contract(payload: dict[str, Any]) -> dict[str, Any]
         item["theme_pct_chg_3"] = theme_pct
         item["theme_momentum_3d"] = theme_pct
         item["theme_momentum"] = theme_pct
+        item["model_version"] = item.get("model_version") or winner.get("model_version")
+        item["selection_mode"] = item.get("selection_mode") or winner.get("selection_mode") or raw.get("selection_mode")
+        if "production_model" not in item:
+            production_model = winner.get("production_model") or raw.get("production_model")
+            if isinstance(production_model, dict):
+                item["production_model"] = production_model
         rows.append(item)
     out["rows"] = rows
     return out
@@ -709,6 +1208,7 @@ def _attach_daily_pick_theme_contract(payload: dict[str, Any]) -> dict[str, Any]
 
 def _attach_unified_exit_policy(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     sentinel_rows, source_paths, cache_error = _load_sentinel_5m_rows_for_ledger()
+    cache_meta = _latest_sentinel_5m_cache_meta(source_paths)
     by_pick_id: dict[int, dict[str, Any]] = {}
     by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in sentinel_rows:
@@ -746,16 +1246,47 @@ def _attach_unified_exit_policy(rows: list[dict[str, Any]]) -> tuple[list[dict[s
         "matched_count": matched,
         "unmatched_count": len(rows) - matched,
         "row_count": len(rows),
-        "rule": "daily_picks 出票事实为底座；若 sentinel_5m 回测缓存覆盖同一 pick，则卖出策略、结算价和收益统一以后者为准。",
+        **cache_meta,
+        "rule": "daily_picks 出票事实为底座；完整 5m 覆盖的 pick 统一按 sentinel_5m 卖出策略结算；无完整 5m 覆盖时，全局狙击按 T+3 收盘兜底，尾盘突破/ST特情按 T+1 开盘兜底。",
     }
     return out, meta
 
 
+def _latest_sentinel_5m_cache_meta(source_paths: list[Path]) -> dict[str, Any]:
+    if not source_paths:
+        return {}
+    preferred = next((path for path in reversed(source_paths) if path.name == SENTINEL_5M_LATEST_CACHE.name), source_paths[-1])
+    try:
+        payload = json.loads(preferred.read_text(encoding="utf-8"))
+    except Exception:
+        return {"coverage_start_date": SENTINEL_5M_DEFAULT_START_DATE, "latest_cache_path": str(preferred)}
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    return {
+        "coverage_start_date": payload.get("start_date") or summary.get("start_date") or SENTINEL_5M_DEFAULT_START_DATE,
+        "coverage_end_date": payload.get("end_date") or summary.get("end_date") or "",
+        "latest_cache_path": str(preferred),
+        "latest_cache_created_at": payload.get("created_at") or "",
+        "sentinel_total_count": summary.get("total_count"),
+        "sentinel_any_5m_count": summary.get("any_5m_count"),
+        "sentinel_covered_count": summary.get("covered_count"),
+        "sentinel_daily_t3_fallback_count": summary.get("daily_t3_fallback_count"),
+        "sentinel_next_open_fallback_count": summary.get("next_open_fallback_count"),
+        "sentinel_no_complete_5m_fallback_count": summary.get("no_complete_5m_fallback_count"),
+        "sentinel_evaluated_count": summary.get("evaluated_count"),
+        "sentinel_win_rate": summary.get("win_rate"),
+        "sentinel_mean_yield": summary.get("mean_yield"),
+        "sentinel_incomplete_count": summary.get("incomplete_count"),
+    }
+
+
 def _load_sentinel_5m_rows_for_ledger() -> tuple[list[dict[str, Any]], list[Path], str]:
-    cache_paths = sorted(
-        SENTINEL_5M_CACHE_DIR.glob("sentinel_5m_backtest_*.json"),
-        key=lambda path: (path.name == SENTINEL_5M_LATEST_CACHE.name, path.stat().st_mtime),
-    )
+    if SENTINEL_5M_LATEST_CACHE.exists():
+        cache_paths = [SENTINEL_5M_LATEST_CACHE]
+    else:
+        cache_paths = sorted(
+            SENTINEL_5M_CACHE_DIR.glob("sentinel_5m_backtest_*.json"),
+            key=lambda path: path.stat().st_mtime,
+        )[-1:]
     if not cache_paths:
         return [], [], "sentinel_5m_backtest cache not found"
 
@@ -772,6 +1303,10 @@ def _load_sentinel_5m_rows_for_ledger() -> tuple[list[dict[str, Any]], list[Path
         if not isinstance(payload, dict):
             errors.append(f"{cache_path.name}: payload is not an object")
             continue
+        valid_cache, validation = validate_sentinel_payload(payload)
+        if not valid_cache:
+            errors.append(f"{cache_path.name}: {validation.get('reason')}；等待手动按最新策略重算")
+            continue
         payload = _filter_paused_strategy_payload(payload)
         rows = payload.get("rows")
         if not isinstance(rows, list):
@@ -784,14 +1319,18 @@ def _load_sentinel_5m_rows_for_ledger() -> tuple[list[dict[str, Any]], list[Path
             pick_id = _optional_int(row.get("pick_id"))
             if pick_id is not None:
                 rows_by_pick_id[pick_id] = row
-                continue
             key = _exit_policy_match_key(row)
             if key:
                 rows_by_key[key] = row
 
     merged = list(rows_by_pick_id.values())
     known_keys = {_exit_policy_match_key(row) for row in merged}
-    merged.extend(row for key, row in rows_by_key.items() if key not in known_keys)
+    known_pick_ids = set(rows_by_pick_id)
+    merged.extend(
+        row
+        for key, row in rows_by_key.items()
+        if key not in known_keys and _optional_int(row.get("pick_id")) not in known_pick_ids
+    )
     return merged, used_paths, "；".join(errors)
 
 
@@ -808,7 +1347,7 @@ def _merge_sentinel_exit_policy(row: dict[str, Any], sentinel: dict[str, Any]) -
         sentinel_sell_strategy = "5m数据缺失：等待真实账本闭环"
         sentinel_exit_policy = sentinel_sell_strategy
     elif coverage_status == "open_or_incomplete":
-        sentinel_sell_strategy = "5m数据未覆盖到结算点：等待真实账本闭环"
+        sentinel_sell_strategy = sentinel_sell_strategy or "5m已回放至最新本地数据：未触发卖出，继续持仓"
         sentinel_exit_policy = sentinel_sell_strategy
     sentinel_payload = {
         "source": "sentinel_5m_backtest",
@@ -827,6 +1366,19 @@ def _merge_sentinel_exit_policy(row: dict[str, Any], sentinel: dict[str, Any]) -
         "bars_replayed": sentinel.get("bars_replayed"),
         "warning": sentinel.get("warning"),
     }
+    close_signal = raw.get("close_signal") if isinstance(raw.get("close_signal"), dict) else {}
+    close_signal_source = str(close_signal.get("source") or "")
+    if item.get("is_closed") and close_signal_source in {"live_sentinel", "sentinel_5m_backtest"}:
+        raw["sentinel_5m"] = sentinel_payload
+        preserved = _attach_daily_pick_exit_policy(item)
+        preserved_raw = dict(preserved.get("raw") or {})
+        preserved_raw["sentinel_5m"] = sentinel_payload
+        preserved_raw["exit_policy_source"] = close_signal_source
+        preserved["raw"] = preserved_raw
+        preserved["exit_policy_source"] = close_signal_source
+        preserved["evaluation_source"] = close_signal_source
+        preserved["ledger_exit_policy"] = preserved.get("sell_strategy") or preserved.get("exit_policy") or preserved.get("close_reason")
+        return preserved
     raw["sentinel_5m"] = sentinel_payload
     raw["exit_policy_source"] = "sentinel_5m_backtest"
 
@@ -883,6 +1435,7 @@ def _attach_daily_pick_exit_policy(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     raw = dict(item.get("raw") or {})
     winner = dict(raw.get("winner") or {})
+    close_signal = raw.get("close_signal") if isinstance(raw.get("close_signal"), dict) else {}
     policy = (
         item.get("sell_strategy")
         or item.get("exit_policy")
@@ -890,6 +1443,10 @@ def _attach_daily_pick_exit_policy(row: dict[str, Any]) -> dict[str, Any]:
         or winner.get("exit_policy")
         or item.get("close_reason")
     )
+    if close_signal:
+        signal_policy = _live_sentinel_exit_policy_label(close_signal)
+        if signal_policy:
+            policy = signal_policy
     if not policy:
         strategy = str(item.get("strategy_type") or winner.get("strategy_type") or "")
         if item.get("is_closed"):
@@ -909,6 +1466,16 @@ def _attach_daily_pick_exit_policy(row: dict[str, Any]) -> dict[str, Any]:
     raw["exit_policy_source"] = "daily_picks"
     item["raw"] = raw
     return item
+
+
+def _live_sentinel_exit_policy_label(close_signal: dict[str, Any]) -> str:
+    source = str(close_signal.get("source") or "")
+    if source != "live_sentinel":
+        return ""
+    action = str(close_signal.get("action") or close_signal.get("sell_strategy") or "").strip()
+    if not action:
+        return "5m实时巡逻兵：真实卖出闭环"
+    return LIVE_SENTINEL_EXIT_POLICY_LABELS.get(action, f"5m实时巡逻兵：{action}")
 
 
 def _exit_policy_match_key(row: dict[str, Any]) -> Optional[tuple[str, str, str]]:
@@ -1079,11 +1646,12 @@ def intraday_exit_backtest(months: int = Query(default=12, ge=1, le=12), refresh
 @app.get("/api/backtest/sentinel-5m")
 def sentinel_5m_backtest(
     start_date: str = Query(default=SENTINEL_5M_DEFAULT_START_DATE),
-    end_date: str = Query(default=SENTINEL_5M_DEFAULT_END_DATE),
+    end_date: Optional[str] = Query(default=None),
     refresh: bool = Query(default=False),
 ) -> dict[str, Any]:
     try:
-        return _attach_theme_contract(_load_sentinel_5m_backtest(start_date, end_date, refresh=refresh))
+        resolved_end_date = end_date or datetime.now().date().isoformat()
+        return _attach_theme_contract(_load_sentinel_5m_backtest(start_date, resolved_end_date, refresh=refresh))
     except HTTPException:
         raise
     except Exception as exc:
@@ -1125,6 +1693,64 @@ def up_reason_analysis(months: int = Query(default=12, ge=2, le=24), refresh: bo
             refresh,
             lambda: analyze_next_day_up_reasons(months=months, refresh=refresh),
         )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/backtest/sentinel-5m-ledger")
+def sentinel_5m_backtest_ledger(
+    start_date: str = Query(default=LEDGER_COMPLETE_5M_START_DATE),
+    end_date: Optional[str] = Query(default=None),
+    refresh: bool = Query(default=False),
+) -> dict[str, Any]:
+    resolved_start = _normalize_iso_date(start_date, "start_date")
+    resolved_end = _normalize_iso_date(end_date or date.today().isoformat(), "end_date")
+    try:
+        payload = _load_sentinel_5m_backtest(SENTINEL_5M_DEFAULT_START_DATE, resolved_end, refresh=refresh)
+        rows = [
+            dict(row)
+            for row in payload.get("rows", [])
+            if isinstance(row, dict)
+            and str(row.get("selection_date") or row.get("date") or "")[:10] >= resolved_start
+            and bool(row.get("is_closed"))
+            and str(row.get("coverage_status") or "") == "covered"
+            and _row_yield_pct(row) is not None
+        ]
+        rows.sort(
+            key=lambda row: (
+                str(row.get("selection_date") or row.get("date") or ""),
+                _strategy_sort_key(str(row.get("strategy_type") or ""))[0],
+                str(row.get("code") or ""),
+            ),
+            reverse=True,
+        )
+        summary = _settled_5m_backtest_summary(rows)
+        cache = payload.get("cache") or {}
+        refresh_required = bool(cache.get("refresh_required") or cache.get("stale"))
+        if refresh_required:
+            summary["status"] = "cache_stale"
+            summary["cache_invalid_reason"] = cache.get("signature_reason")
+            summary["cached_row_count"] = cache.get("cached_row_count")
+        result = {
+            "status": "cache_stale" if refresh_required else "ready",
+            "rows": rows,
+            "summary": summary,
+            "scope": {
+                "start_date": resolved_start,
+                "end_date": resolved_end,
+                "source_start_date": SENTINEL_5M_DEFAULT_START_DATE,
+                "source_count": len(payload.get("rows", []) or []),
+                "display_count": len(rows),
+                "coverage_status": "covered",
+                "settlement": "closed_only",
+                "rule": "只展示已结算且 coverage_status=covered 的 5m 回测样本；缓存签名包含当前买入策略契约和 5m 卖出策略契约，策略实装后旧缓存自动失效，页面普通刷新不自动重算，需手动按最新策略重算。",
+            },
+            "cache": cache,
+            "strategy_contract": (payload.get("daily_picks_signature") or {}).get("contract") or {},
+            "active_strategy_types": payload.get("active_strategy_types") or list(PRODUCTION_OUTPUT_STRATEGIES),
+            "paused_strategy_types": payload.get("paused_strategy_types") or list(PAUSED_STRATEGY_TYPES),
+        }
+        return _attach_strategy_contract(_attach_theme_contract(result))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -1312,6 +1938,43 @@ def _jq_minute_fetch_status() -> dict[str, Any]:
     progress_path = data_dir / "jq_cold_5m_progress.json"
     progress = _read_json_object(progress_path)
     progress_stats = _jq_progress_stats(progress)
+    if not JQ_FETCH_ENABLED:
+        last_fetch_at = _mtime_text(summary_path) or progress_stats.get("latest_updated_at") or ""
+        return {
+            "name": "聚宽冷数据 5m",
+            "source": "disabled",
+            "status": "disabled",
+            "status_label": "已停用",
+            "disabled": True,
+            "disabled_reason": "聚宽冷数据获取已屏蔽；保留本地历史缓存，新增分钟热数据走腾讯/Ashare 归档。",
+            "run_date": last_fetch_at[:10] if last_fetch_at else "",
+            "last_fetch_at": last_fetch_at,
+            "period": summary.get("period") or "5m",
+            "range": "已停止新增",
+            "universe": _safe_int(summary.get("universe")),
+            "success": _safe_int(summary.get("success")),
+            "failed": 0,
+            "skipped": _safe_int(summary.get("skipped")),
+            "stopped_by_quota": False,
+            "quota_spare": None,
+            "quota_total": None,
+            "progress_codes": progress_stats.get("codes"),
+            "progress_segments": progress_stats.get("segments"),
+            "progress_segments_raw": progress_stats.get("raw_segments"),
+            "progress_segments_duplicate": progress_stats.get("duplicate_segments"),
+            "progress_segments_per_code": None,
+            "progress_total_segments": None,
+            "progress_equivalent_codes": None,
+            "progress_pct": None,
+            "eta_rate_codes_per_day": None,
+            "eta_remaining_codes": None,
+            "eta_days": None,
+            "eta_date": "",
+            "eta_basis": "聚宽获取已停用，不再估算补齐时间。",
+            "summary_file": summary_path.name if summary_path else "",
+            "progress_file": progress_path.name if progress_path.exists() else "",
+        }
+
     quota = _latest_jq_quota()
     forecast = _jq_completion_forecast(progress, summary, progress_stats)
     last_fetch_at = _mtime_text(summary_path) or progress_stats.get("latest_updated_at") or ""
@@ -1366,18 +2029,29 @@ def _jq_minute_fetch_status() -> dict[str, Any]:
 
 def _ashare_minute_fetch_status() -> dict[str, Any]:
     data_dir = MIN_KLINE_DIR / "5m"
-    summary_path = _latest_file(data_dir, "ashare_summary_*.json")
+    summary_path = _latest_file(data_dir, "ashare_backfill_all_summary_*.json") or _latest_file(data_dir, "ashare_summary_*.json")
     summary = _read_json_object(summary_path)
     if not summary:
         summary = _latest_ashare_log_summary()
     log_path = BASE_DIR / "logs" / "daily_ashare_archiver.log"
+    running = _ashare_running_state(log_path)
     last_fetch_at = str(summary.get("finished_at") or "") or _mtime_text(summary_path) or _mtime_text(log_path) or ""
     universe = _safe_int(summary.get("universe"))
     success = _safe_int(summary.get("success"))
     failed = _safe_int(summary.get("failed"))
     status = "missing"
     status_label = "未发现运行记录"
-    if summary:
+    if running.get("running"):
+        status = "running"
+        progress_pct = running.get("progress_pct")
+        if running.get("progress_current"):
+            status_label = f"运行中 {progress_pct:.1f}%" if isinstance(progress_pct, (int, float)) else "运行中"
+        else:
+            status_label = "启动中"
+        universe = _safe_int(running.get("progress_total")) or universe
+        success = _safe_int(running.get("progress_current")) or success
+        last_fetch_at = str(running.get("updated_at") or last_fetch_at)
+    elif summary:
         if failed:
             status = "partial"
             status_label = "部分失败"
@@ -1389,19 +2063,91 @@ def _ashare_minute_fetch_status() -> dict[str, Any]:
             status_label = "未覆盖全量"
     return {
         "name": "Ashare/Tencent 热数据 5m",
-        "source": summary.get("source") or "tencent.m5",
+        "source": summary.get("source") or ("tencent_daily_qfq_all_backfill" if summary.get("daily_inserted_rows") else "tencent.m5"),
         "status": status,
         "status_label": status_label,
         "run_date": last_fetch_at[:10] if last_fetch_at else "",
         "last_fetch_at": last_fetch_at,
-        "period": summary.get("period") or "5m",
+        "period": summary.get("period") or ("daily+5m" if summary.get("daily_inserted_rows") is not None else "5m"),
         "universe": universe,
         "success": success,
         "failed": failed,
-        "count": _safe_int(summary.get("count")),
+        "count": _safe_int(summary.get("count") or summary.get("m5_db_upserted_rows") or summary.get("daily_inserted_rows")),
+        "daily_rows": _safe_int(summary.get("daily_inserted_rows")),
+        "m5_rows": _safe_int(summary.get("m5_db_upserted_rows") or summary.get("m5_fetched_rows")),
+        "running": bool(running.get("running")),
+        "pid": running.get("pid"),
+        "progress_current": _safe_int(running.get("progress_current")),
+        "progress_total": _safe_int(running.get("progress_total")),
+        "progress_pct": running.get("progress_pct"),
+        "progress_code": running.get("progress_code") or "",
+        "progress_mode": running.get("progress_mode") or "",
+        "latest_progress_line": running.get("latest_progress_line") or "",
         "summary_file": summary_path.name if summary_path else "",
         "log_file": log_path.name if log_path.exists() else "",
     }
+
+
+def _ashare_running_state(log_path: Path) -> dict[str, Any]:
+    proc = _find_ashare_process()
+    if not proc:
+        return {"running": False}
+    progress = _latest_ashare_progress(log_path)
+    current = _safe_int(progress.get("current"))
+    total = _safe_int(progress.get("total"))
+    pct = round(current / total * 100.0, 2) if current > 0 and total > 0 else None
+    return {
+        "running": True,
+        "pid": proc.get("pid"),
+        "command": proc.get("command"),
+        "progress_current": current,
+        "progress_total": total,
+        "progress_pct": pct,
+        "progress_code": progress.get("code") or "",
+        "progress_mode": progress.get("mode") or "",
+        "latest_progress_line": progress.get("line") or "",
+        "updated_at": _mtime_text(log_path),
+    }
+
+
+def _find_ashare_process() -> dict[str, str]:
+    patterns = ("backfill_ashare_data.py", "run_daily_ashare_archiver.sh")
+    try:
+        result = subprocess.run(
+            ["/usr/bin/pgrep", "-fl", "backfill_ashare_data.py|run_daily_ashare_archiver.sh"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return {}
+    for line in result.stdout.splitlines():
+        clean = line.strip()
+        if not clean or "pgrep" in clean:
+            continue
+        if not any(pattern in clean for pattern in patterns):
+            continue
+        parts = clean.split(maxsplit=1)
+        return {"pid": parts[0], "command": parts[1] if len(parts) > 1 else clean}
+    return {}
+
+
+def _latest_ashare_progress(log_path: Path) -> dict[str, Any]:
+    text = _read_log_tail(log_path, max_bytes=524288)
+    pattern = re.compile(r"\[backfill:(?P<mode>[^\]]+)\]\s+(?P<current>\d+)/(?P<total>\d+)\s+(?P<code>\d{6})")
+    for line in reversed(text.splitlines()):
+        match = pattern.search(line.strip())
+        if not match:
+            continue
+        return {
+            "mode": match.group("mode"),
+            "current": int(match.group("current")),
+            "total": int(match.group("total")),
+            "code": match.group("code"),
+            "line": line.strip(),
+        }
+    return {}
 
 
 def _latest_file(directory: Path, pattern: str) -> Optional[Path]:
@@ -1640,32 +2386,145 @@ def _cached_strategy_response(namespace: str, months: int, refresh: bool, factor
     return _filter_paused_strategy_payload(payload)
 
 
+def _stale_sentinel_5m_payload(
+    start_date: str,
+    end_date: str,
+    cache_path: Path,
+    reason: str,
+    status: str = "invalid",
+    validation: Optional[dict[str, Any]] = None,
+    cached_payload: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    current_signature = None
+    if isinstance(validation, dict) and isinstance(validation.get("current"), dict):
+        current_signature = validation.get("current")
+    if current_signature is None:
+        try:
+            current_signature = daily_picks_signature(start_date, end_date)
+        except Exception as exc:
+            current_signature = {
+                "start_date": start_date,
+                "end_date": end_date,
+                "contract_error": str(exc),
+            }
+    cached_rows = cached_payload.get("rows") if isinstance(cached_payload, dict) else None
+    cached_summary = cached_payload.get("summary") if isinstance(cached_payload, dict) else None
+    cached_row_count = len(cached_rows) if isinstance(cached_rows, list) else 0
+    cached_created_at = cached_payload.get("created_at") if isinstance(cached_payload, dict) else ""
+    return {
+        "created_at": cached_created_at or "",
+        "source": "sentinel_5m_backtest",
+        "start_date": start_date,
+        "end_date": end_date,
+        "summary": {
+            "status": "cache_stale",
+            "total_count": 0,
+            "trade_count": 0,
+            "evaluated_count": 0,
+            "covered_count": 0,
+            "win_count": 0,
+            "win_rate": None,
+            "mean_yield": None,
+            "cached_row_count": cached_row_count,
+            "cached_total_count": cached_summary.get("total_count") if isinstance(cached_summary, dict) else None,
+            "cache_invalid_reason": reason,
+        },
+        "rows": [],
+        "daily_picks_signature": current_signature,
+        "cache": {
+            "hit": False,
+            "namespace": "sentinel_5m_backtest",
+            "path": str(cache_path),
+            "created_at": cached_created_at or "",
+            "signature_status": status,
+            "signature_reason": reason,
+            "refresh_required": True,
+            "stale": True,
+            "cached_row_count": cached_row_count,
+        },
+        "active_strategy_types": list(PRODUCTION_OUTPUT_STRATEGIES),
+        "paused_strategy_types": list(PAUSED_STRATEGY_TYPES),
+        "paused_strategy_count": 0,
+    }
+
+
 def _load_sentinel_5m_backtest(start_date: str, end_date: str, refresh: bool = False) -> dict[str, Any]:
     start = _normalize_iso_date(start_date, "start_date")
     end = _normalize_iso_date(end_date, "end_date")
     cache_path = _sentinel_5m_cache_path(start, end)
     refreshed = False
-    if refresh or not cache_path.exists():
+    if refresh:
         _refresh_sentinel_5m_cache(start, end, cache_path)
+        _sync_latest_sentinel_5m_cache(start, cache_path)
         refreshed = True
     if not cache_path.exists():
-        raise RuntimeError(f"5m 回放缓存不存在：{cache_path}")
-    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        if refresh:
+            raise RuntimeError(f"5m 回放缓存不存在：{cache_path}")
+        return _stale_sentinel_5m_payload(
+            start,
+            end,
+            cache_path,
+            f"5m 回放缓存不存在：{cache_path}；请点击按最新策略重算。",
+            status="missing",
+        )
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        if refresh:
+            raise RuntimeError(f"5m 回放缓存读取失败：{cache_path}；{exc}") from exc
+        return _stale_sentinel_5m_payload(
+            start,
+            end,
+            cache_path,
+            f"5m 回放缓存读取失败：{exc}；请点击按最新策略重算。",
+            status="read_error",
+        )
     if not isinstance(payload, dict):
-        raise RuntimeError(f"5m 回放缓存格式非法：{cache_path}")
+        if refresh:
+            raise RuntimeError(f"5m 回放缓存格式非法：{cache_path}")
+        return _stale_sentinel_5m_payload(
+            start,
+            end,
+            cache_path,
+            f"5m 回放缓存格式非法：{cache_path}；请点击按最新策略重算。",
+            status="invalid",
+        )
+    valid_cache, validation = validate_sentinel_payload(payload)
+    if not valid_cache:
+        if refresh:
+            raise RuntimeError(f"5m 回放缓存与当前账本不一致：{validation.get('reason')}")
+        return _stale_sentinel_5m_payload(
+            start,
+            end,
+            cache_path,
+            str(validation.get("reason") or "Sentinel 缓存与当前账本不一致；请点击按最新策略重算。"),
+            status=str(validation.get("status") or "invalid"),
+            validation=validation,
+            cached_payload=payload,
+        )
     payload["cache"] = {
         "hit": not refreshed,
         "namespace": "sentinel_5m_backtest",
         "path": str(cache_path),
         "created_at": payload.get("created_at"),
+        "signature_status": validation.get("status"),
+        "signature_reason": validation.get("reason"),
+        "refresh_required": False,
+        "stale": False,
     }
     return _filter_paused_strategy_payload(payload)
 
 
+def _sync_latest_sentinel_5m_cache(start_date: str, cache_path: Path) -> None:
+    if start_date != SENTINEL_5M_DEFAULT_START_DATE or cache_path == SENTINEL_5M_LATEST_CACHE:
+        return
+    try:
+        SENTINEL_5M_LATEST_CACHE.write_text(cache_path.read_text(encoding="utf-8"), encoding="utf-8")
+    except Exception as exc:
+        print(f"[Sentinel5m][WARN] latest cache sync failed: {exc}")
+
+
 def _filter_paused_strategy_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    if not PAUSED_STRATEGY_TYPES:
-        return payload
-    paused = set(PAUSED_STRATEGY_TYPES)
     out = dict(payload)
     filtered_out = 0
     filtered_rows: Optional[List[dict[str, Any]]] = None
@@ -1673,7 +2532,11 @@ def _filter_paused_strategy_payload(payload: dict[str, Any]) -> dict[str, Any]:
         value = out.get(key)
         if not isinstance(value, list):
             continue
-        kept = [row for row in value if not isinstance(row, dict) or str(row.get("strategy_type") or "") not in paused]
+        kept = [
+            row
+            for row in value
+            if not isinstance(row, dict) or str(row.get("strategy_type") or "") in ACTIVE_BUY_STRATEGY_TYPES
+        ]
         filtered_out += len(value) - len(kept)
         out[key] = kept
         if key == "rows":
@@ -1684,19 +2547,21 @@ def _filter_paused_strategy_payload(payload: dict[str, Any]) -> dict[str, Any]:
         for key in ("strategy_counts", "candidate_strategy_counts"):
             counts = summary.get(key)
             if isinstance(counts, dict):
-                summary[key] = {str(k): v for k, v in counts.items() if str(k) not in paused}
+                summary[key] = {str(k): v for k, v in counts.items() if str(k) in ACTIVE_BUY_STRATEGY_TYPES}
         performance = summary.get("strategy_performance")
         if isinstance(performance, list):
             summary["strategy_performance"] = [
                 row for row in performance
-                if not isinstance(row, dict) or str(row.get("strategy_type") or "") not in paused
+                if not isinstance(row, dict) or str(row.get("strategy_type") or "") in ACTIVE_BUY_STRATEGY_TYPES
             ]
         if filtered_rows is not None:
             _refresh_summary_from_rows(summary, filtered_rows)
         summary["paused_strategy_types"] = list(PAUSED_STRATEGY_TYPES)
+        summary["active_strategy_types"] = list(PRODUCTION_OUTPUT_STRATEGIES)
         summary["paused_strategy_count"] = filtered_out
         out["summary"] = summary
     out["paused_strategy_types"] = list(PAUSED_STRATEGY_TYPES)
+    out["active_strategy_types"] = list(PRODUCTION_OUTPUT_STRATEGIES)
     out["paused_strategy_count"] = filtered_out
     return out
 
@@ -1732,6 +2597,17 @@ def _refresh_summary_from_rows(summary: dict[str, Any], rows: list[dict[str, Any
         summary["any_5m_count"] = sum(1 for row in rows if _safe_int(row.get("bars_replayed")) > 0)
         summary["covered_count"] = sum(1 for row in rows if row.get("coverage_status") == "covered")
         summary["daily_t3_fallback_count"] = sum(1 for row in rows if row.get("coverage_status") == "daily_t3_fallback")
+
+
+def _settled_5m_backtest_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    _refresh_summary_from_rows(summary, rows)
+    summary["covered_count"] = len(rows)
+    summary["closed_count"] = len(rows)
+    summary["coverage_status"] = "covered"
+    summary["data_view"] = "settled_5m_backtest"
+    summary["rule"] = "已结算 + 完整 5m 覆盖 + 当前买卖策略缓存签名有效。"
+    return summary
 
 
 def _row_yield_pct(row: dict[str, Any]) -> Optional[float]:

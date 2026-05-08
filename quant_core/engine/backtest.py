@@ -8,72 +8,71 @@ from typing import Any
 
 import pandas as pd
 
-from quant_core.config import BREAKOUT_MIN_SCORE, DIPBUY_MIN_SCORE, MAIN_WAVE_MIN_SCORE, REVERSAL_MIN_SCORE
+from quant_core.config import BREAKOUT_MIN_SCORE, GLOBAL_MIN_SCORE, PRODUCTION_TOTAL_PICK_LIMIT, ST_BREAKOUT_MIN_SCORE
 from quant_core.data_pipeline.market import fetch_sina_snapshot
 from quant_core.engine.predictor import (
+    BREAKOUT_STRATEGY_TYPE,
+    GLOBAL_MOMENTUM_STRATEGY_TYPE,
+    PRODUCTION_OUTPUT_STRATEGIES,
     PROFIT_TARGET_PCT,
     apply_production_filters,
-    build_features,
     filter_paused_strategies,
-    score_candidates,
-    select_strategy_top_picks,
+    prepare_historical_playback_candidates,
+    scan_market,
 )
 from quant_core.storage import connect, init_db
 
 
-SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪", "全局动量狙击"}
+SWING_STRATEGY_TYPES = {GLOBAL_MOMENTUM_STRATEGY_TYPE}
 
 
 def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, Any]:
     init_db()
-    from quant_core.strategies.labs.strategy_lab import prepare_evaluated_candidates
+    latest_date = _latest_trade_date()
+    if not latest_date:
+        return _empty_result("stock_daily 无可用交易日")
 
-    prepared = prepare_evaluated_candidates(months, refresh=refresh)
-    feature_df = prepared["evaluated"]
-    if feature_df.empty:
-        return _empty_result("过滤后没有候选股票")
-    feature_df = filter_paused_strategies(feature_df)
-    if feature_df.empty:
-        return _empty_result("暂停策略过滤后没有候选股票")
-    strategy_rows = _strategy_pick_rows(feature_df, months=min(2, months))
-    candidate_strategy_counts = feature_df["strategy_type"].fillna("尾盘突破").value_counts().to_dict() if "strategy_type" in feature_df.columns else {}
-    feature_df = apply_production_filters(feature_df)
-    if feature_df.empty:
-        result = _empty_result("生产过滤后没有候选股票")
-        result["strategy_rows"] = strategy_rows
-        result["summary"]["candidate_strategy_counts"] = {str(key): int(value) for key, value in candidate_strategy_counts.items()}
+    end_date = str(latest_date)
+    start_date = (pd.Timestamp(end_date) - pd.DateOffset(months=max(1, int(months)))).strftime("%Y-%m-%d")
+    prepared = prepare_historical_playback_candidates(start_date=start_date, end_date=end_date)
+    candidates = prepared.get("candidates", pd.DataFrame())
+    trading_dates = list(prepared.get("trading_dates") or [])
+    if candidates.empty or not trading_dates:
+        result = _empty_result(str(prepared.get("model_status") or "历史候选池为空"))
+        result["summary"]["months"] = months
+        result["summary"]["start_date"] = prepared.get("start_date")
+        result["summary"]["end_date"] = prepared.get("end_date")
         return result
 
-    pick_frames = []
-    for _, day_pool in feature_df.groupby("date", sort=True):
-        pick_frames.append(select_strategy_top_picks(day_pool, limit_per_strategy=1))
-    picks = pd.concat(pick_frames, ignore_index=True) if pick_frames else pd.DataFrame()
-    if not picks.empty:
-        picks = picks.sort_values(
-            ["date", "策略优先级", "排序评分", "预期溢价", "综合评分"],
-            ascending=[True, False, False, False, False],
-        ).copy()
-
+    active_strategies = set(PRODUCTION_OUTPUT_STRATEGIES)
+    candidate_strategy_counts = (
+        candidates["strategy_type"]
+        .fillna(BREAKOUT_STRATEGY_TYPE)
+        .loc[lambda series: series.isin(active_strategies)]
+        .value_counts()
+        .to_dict()
+        if "strategy_type" in candidates.columns
+        else {}
+    )
     results: list[dict[str, Any]] = []
-    for _, pick in picks.iterrows():
-        strategy_type = str(pick.get("strategy_type", "尾盘突破"))
-        if strategy_type in SWING_STRATEGY_TYPES and pd.isna(_swing_settlement_return(pick)):
-            continue
-        code = str(pick["纯代码"])
-        current_date = str(pick["date"])
-        current_close = float(pick["最新价"])
-        next_open = float(pick["next_open"]) if pd.notna(pick.get("next_open")) else None
-        premium = float(pick["open_premium"]) if pd.notna(pick.get("open_premium")) else None
-        results.append(_backtest_row(pick, current_close, next_open, premium))
+    for trade_date in trading_dates:
+        payload = scan_market(
+            limit=PRODUCTION_TOTAL_PICK_LIMIT,
+            persist_snapshot=False,
+            cache_prediction=False,
+            async_persist=False,
+            target_date=trade_date,
+            historical_candidates=candidates,
+        )
+        for row in payload.get("rows") or []:
+            if str(row.get("strategy_type") or "") not in active_strategies:
+                continue
+            results.append(_backtest_row_from_api(row))
 
     evaluated = [row for row in results if row["success"] is not None]
     wins = [row for row in evaluated if row["success"]]
     premiums = [float(row["open_premium"]) for row in evaluated if row["open_premium"] is not None]
-    reversal_rows = [row for row in results if row.get("strategy_type") == "中线超跌反转" and row.get("t3_settlement_return_pct") is not None]
-    reversal_returns = [float(row["t3_settlement_return_pct"]) for row in reversal_rows]
-    main_wave_rows = [row for row in results if row.get("strategy_type") == "右侧主升浪" and row.get("t3_settlement_return_pct") is not None]
-    main_wave_returns = [float(row["t3_settlement_return_pct"]) for row in main_wave_rows]
-    strategy_counts = pd.Series([row.get("strategy_type", "尾盘突破") for row in results]).value_counts().to_dict()
+    strategy_counts = pd.Series([row.get("strategy_type", BREAKOUT_STRATEGY_TYPE) for row in results]).value_counts().to_dict()
     strategy_performance = _strategy_performance_rows(results)
     summary = {
         "months": months,
@@ -90,23 +89,74 @@ def top_pick_open_backtest(months: int = 2, refresh: bool = False) -> dict[str, 
         "candidate_strategy_counts": {str(key): int(value) for key, value in candidate_strategy_counts.items()},
         "strategy_performance": strategy_performance,
         "avg_open_premium": round(float(pd.Series(premiums).mean()), 4) if premiums else 0.0,
-        "reversal_trade_count": len(reversal_rows),
-        "reversal_t3_win_rate": round(float((pd.Series(reversal_returns) > 0).mean() * 100), 4) if reversal_returns else 0.0,
-        "reversal_avg_t3_close_return_pct": round(float(pd.Series(reversal_returns).mean()), 4) if reversal_returns else 0.0,
-        "main_wave_trade_count": len(main_wave_rows),
-        "main_wave_t3_win_rate": round(float((pd.Series(main_wave_returns) > 0).mean() * 100), 4) if main_wave_returns else 0.0,
-        "main_wave_avg_t3_close_return_pct": round(float(pd.Series(main_wave_returns).mean()), 4) if main_wave_returns else 0.0,
+        "reversal_trade_count": 0,
+        "reversal_t3_win_rate": 0.0,
+        "reversal_avg_t3_close_return_pct": 0.0,
+        "main_wave_trade_count": 0,
+        "main_wave_t3_win_rate": 0.0,
+        "main_wave_avg_t3_close_return_pct": 0.0,
         "median_open_premium": round(float(pd.Series(premiums).median()), 4) if premiums else 0.0,
         "best_open_premium": round(max(premiums), 4) if premiums else 0.0,
         "worst_open_premium": round(min(premiums), 4) if premiums else 0.0,
         "model_status": prepared["model_status"],
         "repaired_pre_close_count": prepared["repaired_pre_close_count"],
         "repaired_volume_ratio_count": prepared["repaired_volume_ratio_count"],
-        "rule": f"生产策略复盘：排除周末、节假日、非完整交易日、创业板、北交所、科创板、ST/退市；大盘风控采用晴天/震荡/阴天/雷暴分级，尾盘突破综合评分>={BREAKOUT_MIN_SCORE:.1f}，首阴低吸综合评分>={DIPBUY_MIN_SCORE:.1f}，中线超跌反转预期T+3最大涨幅>={REVERSAL_MIN_SCORE:.1f}%，右侧主升浪预期T+3最大涨幅>={MAIN_WAVE_MIN_SCORE:.1f}%；雷暴或大盘下跌且缩量时空仓；过滤高位爆量、尾盘诱多，突破额外过滤涨幅>=7%、上影>=2%、近3日断头铡刀。每个交易日按策略分组独立选 Top1，短线策略按次日开盘卖出，波段策略统一按T+3当天15:00收盘价结算。",
+        "rule": f"生产策略复盘：历史回放逐日调用 scan_market(target_date)，与 14:50 实时推送共用评分、过滤、动态底线、Half-Kelly 仓位和分策略 Top1 选择链路；当前启用全局动量狙击、尾盘突破与尾盘突破-ST特情。普通突破综合评分>={BREAKOUT_MIN_SCORE:.1f}，ST特情综合评分>={ST_BREAKOUT_MIN_SCORE:.1f}，全局狙击概率>={GLOBAL_MIN_SCORE:.2f}；雷暴或大盘下跌且缩量时空仓；历史日线 15:00 收盘行作为 14:50 观察代理。",
         "trading_day_filter": "weekday<5 且全市场有效样本>=1000 且成交额>0。",
-        "rank_rule": "XGBRegressor 分策略预测收益；全局日线模型已收编为全局动量狙击，四大核心军团各自独立出票；同一策略内按排序评分、预期收益和综合评分择优。",
+        "rank_rule": "全局动量狙击按 T+3 波段收益口径结算；尾盘突破按 T+1 开盘溢价口径结算；同一策略内按当前生产 selection_score 和动态底线择优。",
+        "active_strategy_types": list(PRODUCTION_OUTPUT_STRATEGIES),
     }
+    strategy_rows = results[::-1][: max(0, min(len(results), 80))]
     return {"created_at": datetime.now().isoformat(timespec="seconds"), "summary": summary, "rows": results[::-1], "strategy_rows": strategy_rows}
+
+
+def _backtest_row_from_api(row: dict[str, Any]) -> dict[str, Any]:
+    strategy_type = str(row.get("strategy_type") or BREAKOUT_STRATEGY_TYPE)
+    premium = _optional_float(row.get("open_premium"))
+    t3_settlement_price = _optional_float(row.get("t3_settlement_price"))
+    t3_settlement_return = _optional_float(row.get("t3_settlement_return_pct"))
+    close_price = t3_settlement_price if strategy_type == GLOBAL_MOMENTUM_STRATEGY_TYPE else _optional_float(row.get("next_open"))
+    close_return = t3_settlement_return if strategy_type == GLOBAL_MOMENTUM_STRATEGY_TYPE else premium
+    if strategy_type == GLOBAL_MOMENTUM_STRATEGY_TYPE:
+        success = (t3_settlement_return > 0) if t3_settlement_return is not None else None
+    else:
+        success = (premium > PROFIT_TARGET_PCT) if premium is not None else None
+    return {
+        "date": str(row.get("date") or ""),
+        "code": str(row.get("code") or ""),
+        "name": str(row.get("name") or ""),
+        "name_source": str(row.get("name_source") or "scan_market"),
+        "strategy_type": strategy_type,
+        "win_rate": _rounded(row.get("win_rate")),
+        "close": _rounded(row.get("price")),
+        "change": _rounded(row.get("change")),
+        "turnover": _rounded(row.get("turnover")),
+        "expected_premium": _rounded(row.get("expected_premium")),
+        "risk_score": _rounded(row.get("risk_score")),
+        "liquidity_score": _rounded(row.get("liquidity_score")),
+        "composite_score": _rounded(row.get("composite_score")),
+        "sort_score": _rounded(row.get("sort_score")),
+        "score_threshold": _rounded(row.get("score_threshold")),
+        "selection_score": _rounded(row.get("selection_score"), digits=6),
+        "selection_tier": str(row.get("selection_tier") or ""),
+        "dynamic_floor": _rounded(row.get("dynamic_floor"), digits=6),
+        "risk_warning": str(row.get("risk_warning") or ""),
+        "suggested_position": _rounded(row.get("suggested_position")),
+        "sentiment_bonus": _rounded(row.get("sentiment_bonus")),
+        "market_gate_mode": str(row.get("market_gate_mode") or ""),
+        "next_date": str(row.get("next_date")) if row.get("next_date") else None,
+        "t3_exit_date": str(row.get("t3_exit_date")) if row.get("t3_exit_date") else None,
+        "next_open": _rounded(row.get("next_open")),
+        "open_premium": _rounded(premium),
+        "t3_max_gain_pct": _rounded(row.get("t3_max_gain_pct")),
+        "t3_close": _rounded(row.get("t3_close")),
+        "t3_close_return_pct": _rounded(row.get("t3_close_return_pct")),
+        "t3_settlement_price": _rounded(t3_settlement_price),
+        "t3_settlement_return_pct": _rounded(t3_settlement_return),
+        "close_price": _rounded(close_price),
+        "close_return_pct": _rounded(close_return),
+        "success": success,
+    }
 
 
 def _backtest_row(pick: pd.Series, current_close: float, next_open: float | None, premium: float | None) -> dict[str, Any]:
@@ -156,7 +206,7 @@ def _backtest_row(pick: pd.Series, current_close: float, next_open: float | None
 
 
 def _strategy_performance_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    order = ["全局动量狙击", "右侧主升浪", "中线超跌反转", "尾盘突破"]
+    order = list(PRODUCTION_OUTPUT_STRATEGIES)
     rows: list[dict[str, Any]] = []
     for strategy_type in order:
         items = [row for row in results if row.get("strategy_type", "尾盘突破") == strategy_type]
@@ -183,6 +233,11 @@ def _strategy_performance_rows(results: list[dict[str, Any]]) -> list[dict[str, 
             }
         )
     return rows
+
+
+def _rounded(value: Any, digits: int = 4) -> float | None:
+    parsed = _optional_float(value)
+    return round(parsed, digits) if parsed is not None else None
 
 
 def _optional_float(value: Any) -> float | None:

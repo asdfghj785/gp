@@ -3,7 +3,7 @@
     <div class="header-brand">
       <span class="logo">Q</span>
       <div>
-        <strong>V4.0 Theme Alpha</strong>
+        <strong>V6.0 Extreme Burst</strong>
         <small>{{ title }}</small>
       </div>
     </div>
@@ -13,8 +13,8 @@
         <span>今日锁定</span>
         <strong>{{ lockedCount }}</strong>
       </article>
-      <article>
-        <span>最近同步</span>
+      <article :title="latestSyncTitle">
+        <span>15:05日线同步</span>
         <strong>{{ latestSyncText }}</strong>
       </article>
       <article>
@@ -50,6 +50,14 @@ const latestSyncText = computed(() => {
   if (!props.latestSync) return '暂无'
   if (props.latestSync.status !== 'success') return '失败'
   return props.latestSync.sync_date || props.latestSync.finished_at || '成功'
+})
+
+const latestSyncTitle = computed(() => {
+  if (!props.latestSync) return '暂无同步记录'
+  const source = props.latestSync.source || '-'
+  const finishedAt = props.latestSync.finished_at || '-'
+  const error = props.latestSync.error ? ` / ${props.latestSync.error}` : ''
+  return `接口 /api/data/market-sync/latest，来源 ${source}，完成时间 ${finishedAt}${error}`
 })
 
 const syncOk = computed(() => props.latestSync?.status === 'success')

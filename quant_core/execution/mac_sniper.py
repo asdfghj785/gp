@@ -41,6 +41,9 @@ RESET_BUTTON_NAME = os.getenv("QUANT_MAC_SNIPER_RESET_BUTTON_NAME", "重填")
 SUBMIT_BUTTON_NAME = os.getenv("QUANT_MAC_SNIPER_SUBMIT_BUTTON_NAME", "确定买入")
 SELL_SUBMIT_BUTTON_NAME = os.getenv("QUANT_MAC_SNIPER_SELL_SUBMIT_BUTTON_NAME", "确定卖出")
 SELL_PANEL_KEY_CODE = _env_int("QUANT_MAC_SNIPER_SELL_PANEL_KEY_CODE", 1, minimum=0)
+V6_PRODUCTION_CONFIRMATION = (
+    f"[SYSTEM] V6.0 爆发大脑已挂载。AppleScript 卖出键位（{SELL_PANEL_KEY_CODE}）已就绪。非对称巡逻兵已上线。"
+)
 
 
 def aim_and_fire(
@@ -58,6 +61,7 @@ def aim_and_fire(
     clean_action_type = normalize_action_type(action_type)
     clean_shares = normalize_shares(shares, clean_action_type) if shares is not None else None
     clean_limit_price = normalize_limit_price(limit_price) if limit_price is not None else None
+    print(V6_PRODUCTION_CONFIRMATION)
 
     try:
         before_snapshot = None

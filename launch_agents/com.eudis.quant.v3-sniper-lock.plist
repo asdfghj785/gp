@@ -8,18 +8,13 @@
 	<array>
 		<string>/Users/eudis/ths/scripts/shell/run_v3_sniper_lock.sh</string>
 	</array>
+	<key>Disabled</key>
+	<true/>
 	<key>WorkingDirectory</key>
 	<string>/Users/eudis/ths</string>
 	<key>StandardOutPath</key>
 	<string>/Users/eudis/ths/v3_sniper_lock_agent.log</string>
 	<key>StandardErrorPath</key>
 	<string>/Users/eudis/ths/v3_sniper_lock_agent_err.log</string>
-	<key>StartCalendarInterval</key>
-	<dict>
-		<key>Hour</key>
-		<integer>14</integer>
-		<key>Minute</key>
-		<integer>50</integer>
-	</dict>
 </dict>
 </plist>

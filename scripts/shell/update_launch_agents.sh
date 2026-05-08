@@ -22,6 +22,7 @@ chmod +x \
   "$ROOT/scripts/shell/run_live_sentinel.sh" \
   "$ROOT/scripts/shell/run_jq_cold_5m.sh" \
   "$ROOT/scripts/shell/run_daily_ashare_archiver.sh" \
+  "$ROOT/scripts/shell/run_ollama_ensure.sh" \
   "$ROOT/scripts/shell/trading_day_guard.sh"
 
 /usr/bin/python3 - <<'PY'
@@ -70,6 +71,14 @@ plists = {
         keep_alive=True,
         env={"PATH": node_path},
     ),
+    "com.eudis.quant.ollama-ensure.plist": base(
+        "com.eudis.quant.ollama-ensure",
+        [str(root / "scripts/shell/run_ollama_ensure.sh")],
+        "logs/ollama_ensure_agent.log",
+        "logs/ollama_ensure_agent_err.log",
+        schedule=(8, 55),
+        run_at_load=True,
+    ),
     "com.eudis.quant.exit-sentinel-0916.plist": base(
         "com.eudis.quant.exit-sentinel-0916",
         [str(root / "scripts/shell/run_exit_sentinel.sh"), "--stage", "preopen"],
@@ -103,14 +112,7 @@ plists = {
         [str(root / "scripts/shell/run_swing_patrol.sh")],
         "swing_patrol_agent.log",
         "swing_patrol_agent_err.log",
-        schedule=(15, 10),
-    ),
-    "com.eudis.quant.v3-sniper-lock.plist": base(
-        "com.eudis.quant.v3-sniper-lock",
-        [str(root / "scripts/shell/run_v3_sniper_lock.sh")],
-        "v3_sniper_lock_agent.log",
-        "v3_sniper_lock_agent_err.log",
-        schedule=(14, 50),
+        schedule=(15, 35),
     ),
     "com.eudis.quant.push-top-pick.plist": base(
         "com.eudis.quant.push-top-pick",
@@ -118,6 +120,13 @@ plists = {
         "push_top_pick_agent.log",
         "push_top_pick_agent_err.log",
         schedule=(14, 50),
+    ),
+    "com.eudis.quant.push-top-pick-prewarm.plist": base(
+        "com.eudis.quant.push-top-pick-prewarm",
+        [str(root / "scripts/shell/run_push_top_pick.sh"), "prewarm-top-pick"],
+        "push_top_pick_prewarm_agent.log",
+        "push_top_pick_prewarm_agent_err.log",
+        schedule=(14, 45),
     ),
     "com.eudis.quant.live-sentinel.plist": base(
         "com.eudis.quant.live-sentinel",
@@ -147,26 +156,12 @@ plists = {
         "logs/daily_ashare_archiver_agent_err.log",
         schedule=(15, 15),
     ),
-    "com.eudis.quant.jq-cold-5m.plist": base(
-        "com.eudis.quant.jq-cold-5m",
-        [str(root / "scripts/shell/run_jq_cold_5m.sh")],
-        "logs/jq_cold_5m_agent.log",
-        "logs/jq_cold_5m_agent_err.log",
-        schedule=(1, 20),
-    ),
     "com.eudis.quant.push-heartbeat.plist": base(
         "com.eudis.quant.push-heartbeat",
         [str(root / "scripts/shell/run_push_heartbeat.sh")],
         "push_heartbeat_agent.log",
         "push_heartbeat_agent_err.log",
         schedule=(9, 0),
-    ),
-    "com.eudis.quant.daily-pick-save.plist": base(
-        "com.eudis.quant.daily-pick-save",
-        ["/usr/bin/python3", "-m", "quant_core.execution.daily_pick_cli", "save"],
-        "daily_pick_save.log",
-        "daily_pick_save_err.log",
-        schedule=(15, 30),
     ),
 }
 
@@ -183,20 +178,29 @@ done
 labels=(
   com.eudis.quant.backend-api
   com.eudis.quant.frontend-dev
+  com.eudis.quant.ollama-ensure
   com.eudis.quant.exit-sentinel-0916
   com.eudis.quant.exit-sentinel-0921
   com.eudis.quant.exit-sentinel-0925
   com.eudis.quant.snapshot-1430
   com.eudis.quant.swing-patrol
-  com.eudis.quant.v3-sniper-lock
   com.eudis.quant.push-top-pick
+  com.eudis.quant.push-top-pick-prewarm
   com.eudis.quant.live-sentinel
   com.eudis.quant.market-close-sync
   com.quant.datasync
   com.quant.daily_ashare_archiver
-  com.eudis.quant.jq-cold-5m
   com.eudis.quant.push-heartbeat
+)
+
+disabled_labels=(
   com.eudis.quant.daily-pick-save
+  com.eudis.quant.daily-pick-open
+  com.eudis.quant.exit-sentinel
+  com.eudis.quant.jq-cold-5m
+  com.eudis.quant.v3-sniper-lock
+  com.quant.heartbeat
+  com.quant.sniper
 )
 
 for label in "${labels[@]}"; do
@@ -206,10 +210,23 @@ for label in "${labels[@]}"; do
   launchctl enable "gui/$UID_VALUE/$label"
 done
 
+for label in "${disabled_labels[@]}"; do
+  plist="$DST_DIR/$label.plist"
+  launchctl bootout "gui/$UID_VALUE" "$plist" >/dev/null 2>&1 || true
+  launchctl disable "gui/$UID_VALUE/$label" >/dev/null 2>&1 || true
+  if [ ! -e "$SRC_DIR/$label.plist" ]; then
+    rm -f "$plist"
+  fi
+done
+
 echo "LaunchAgents updated and reloaded:"
 for label in "${labels[@]}"; do
   plist="$SRC_DIR/$label.plist"
   args="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$plist" | tr '\n' ' ' | sed 's/[[:space:]]\\+/ /g')"
   schedule="$(/usr/libexec/PlistBuddy -c 'Print :StartCalendarInterval' "$plist" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\\+/ /g' || true)"
   echo "- $label -> $args $schedule"
+done
+echo "Disabled LaunchAgents:"
+for label in "${disabled_labels[@]}"; do
+  echo "- $label"
 done

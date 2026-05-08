@@ -1,6 +1,6 @@
 # AGENTS.md - A 股量化工作站开发上下文
 
-更新时间：2026-05-04
+更新时间：2026-05-08
 
 本文件给后续接手本项目的 Codex/Agent 使用。进入项目后先读本文件，再读 `TECHNICAL_DOC.md`、`PROJECT_STRUCTURE_GUIDE.md` 和相关源码。项目根目录固定为 `/Users/eudis/ths`。
 
@@ -12,8 +12,8 @@
 
 当前系统同时包含五条主线：
 
-1. 生产影子测试主线：`quant_core/engine/predictor.py` 驱动多策略独立分档出票。当前生产启用 `全局动量狙击` 与 `尾盘突破`，每个启用策略只取 Top1，总输出上限 2；`右侧主升浪` 与 `中线超跌反转` 保留代码和模型但生产暂停。
-2. V5.6 5m Sentinel 离线回放主线：`scripts/backtest/simulate_sentinel_5m.py` 使用前复权冷数据与本地热数据合并回放，验证非对称日内风控、追踪止盈、尾盘结构止损与 T+3 兜底。
+1. 生产影子测试主线：`quant_core/engine/predictor.py` 驱动多策略独立分档出票。当前生产启用 `全局动量狙击`、`尾盘突破` 与 `尾盘突破-ST特情`，每个启用策略只取 Top1，总输出上限 3；`右侧主升浪` 与 `中线超跌反转` 保留代码和模型但生产暂停。
+2. V5.6 5m Sentinel 离线回放主线：`scripts/backtest/simulate_sentinel_5m.py` 以 `daily_picks` 出票事实为底座，优先读取统一 SQLite 5m 表 `stock_minute_5m`，验证非对称日内风控、追踪止盈、尾盘结构止损与 T+3 兜底。
 3. Theme Alpha 全局日线模型主线：`quant_dashboard/backend/routers/v3_sniper.py` 同时挂载 `/api/v4/sniper/*`，使用带 `theme_*` 因子的全市场 XGBoost 分类模型，实时拼接当日腾讯行情后输出高置信候选。
 4. 09:15 实时巡逻兵主线：`live_sentinel.py` 从上一交易日 14:50 标的重建 `shadow_ledger.json`，盘中执行止损、追踪止盈、分钟级爆量滞涨和五档盘口委比反转预警。
 5. V5.0 资金池与 Mac Sniper 主线：`data/shadow_account.json` 记录影子资金池、锁定持仓和券商确认流水；`data/sniper_status.json` 是前端保险匣、14:50 总线和巡逻兵共享的物理外挂开关。
@@ -21,9 +21,12 @@
 重要原则：
 
 - LLM/Ollama 只做舆情、公告、新闻风控，不直接预测价格，也不覆盖 XGBoost 排序。
+- 14:50 主推送不得等待 Ollama；AI 舆情与风险排查通过 `quant_core.execution.pushplus_tasks ai-supplement` 异步补发，成功推送后再写回 `daily_picks.raw_json`。
 - 实盘影子测试买入锚点是 14:50 的 `snapshot_price` 与 `snapshot_time`，这些字段必须不可篡改。
 - 生产出票必须保留 V5.6 风控契约：`selection_tier`、`risk_warning`、`dynamic_floor`/`score_floor`、`suggested_position`、`core_theme`、`theme_momentum_3d` 必须随 `raw_json.winner` 落库，并在 PushPlus、复盘 API 与前端展示。
-- 影子账本默认使用 `/api/daily-picks?view=strategy_top1`：按 `selection_date + strategy_type` 折叠，同一天允许 `全局动量狙击` 与 `尾盘突破` 各一只；`view=all` 只用于审计原始候选。
+- 14:50 真实出票只允许 `com.eudis.quant.push-top-pick` 在 14:50 到 15:05 写入；当天已有真实锁定票后禁止重新扫描，同策略不得用盘后更高分候选替换。
+- 真实账本数据默认使用 `/api/daily-picks?view=strategy_top1&coverage=complete_5m&exclude_st_limit_up=true`：先过滤 `is_shadow_test=1`，再按 `selection_date + strategy_type` 折叠，同一天允许 `全局动量狙击`、`尾盘突破` 与 `尾盘突破-ST特情` 各一只；`view=all` 只用于审计原始候选。
+- 5m回测数据单独使用 `/api/backtest/sentinel-5m-ledger?start_date=2025-01-01`：只展示已结算且完整 5m 覆盖的回测样本；买入策略、生产阈值或 5m 卖出策略实装变更后必须重算回测缓存再展示。
 - 历史复盘和历史账本重建使用 `stock_daily` 的 15:00 完整日线底座；5m Sentinel 回放只用于卖出引擎评估，不恢复历史 14:50 截面截断代理。
 - 禁止把 `.env`、PushPlus token、聚宽账号密码等密钥写入文档、日志或提交。
 - 禁止新增或恢复 AkShare/东方财富 行情与板块数据接入；实时快照优先使用腾讯，行业/板块日线只走 mpquant/Ashare `get_price` + 本地缓存。
@@ -38,7 +41,7 @@
 - XGBoost、scikit-learn
 - SQLite
 - Requests
-- jqdatasdk
+- jqdatasdk 仅保留旧兼容；默认禁用聚宽主动获取
 - Ollama 本地大模型
 - PushPlus 微信推送
 
@@ -99,7 +102,8 @@
 
 关键策略门槛默认值：
 
-- `QUANT_BREAKOUT_MIN_SCORE=72.00`
+- `QUANT_BREAKOUT_MIN_SCORE=62.00`
+- `QUANT_ST_BREAKOUT_MIN_SCORE=62.00`
 - `QUANT_DIPBUY_MIN_SCORE=99.00`，首阴低吸保留但生产冻结
 - `QUANT_REVERSAL_MIN_SCORE=6.00`
 - `QUANT_MAIN_WAVE_MIN_SCORE=6.60`
@@ -107,15 +111,17 @@
 
 推送配置：
 
-- `PUSHPLUS_TOKEN` 从 `.env` 读取。
-- 使用 `quant_core.config.check_push_config()` 检查配置。
-- 不要在任何输出中泄露 token。
+- PushPlus 主配置改为 SQLite 表 `pushplus_tokens`，前端 `PushPlus` 页面支持多 token 增删改查、启停和测试推送。
+- `.env` 的 `PUSHPLUS_TOKEN` 作为兼容 token 与数据库启用 token 一起参与循环推送；若与数据库 token 重复则自动去重。
+- 使用 `quant_core.config.check_push_config()` 检查配置；`send_pushplus()` 会按启用 token 循环推送。
+- API、前端、日志和文档不得展示 token 明文。
 
 Ollama：
 
 - 默认接口：`OLLAMA_API=http://127.0.0.1:11434/api/generate`
 - 当前常用模型：`qwen2.5:14b`
 - `quant_core/ai_agent/llm_engine.py` 支持 OpenAI compatible `/v1/chat/completions` 和 `/api/generate` 兜底。
+- 14:50 主报告不等待 LLM；`ai-supplement` 负责异步补发 AI 风险报告，`run_ollama_ensure.sh` 负责登录和盘前预热检查。
 
 ## 数据源与数据口径
 
@@ -127,11 +133,12 @@ Ollama：
 
 分钟线：
 
-- 路径：`data/min_kline/5m/{code}.parquet`。
-- V5.6 5m Sentinel 回放优先读取前复权冷数据目录 `/Users/eudis/5min/organized_5min_pre_adj`，再合并项目热数据 `data/min_kline/5m/{code}.parquet`；同一 `datetime` 冷数据优先，热数据补 2026-04-27 之后每日归档缺口。
-- 冷数据：聚宽，定时入口 `scripts/shell/run_jq_cold_5m.sh`，主脚本 `scripts/data_pipeline/batch_fetch_historical_min.py`；`scripts/data_pipeline/batch_fetch_jq_history.py` 为旧手工入口。
-- 聚宽账号历史权限窗口会随自然日滚动，冷数据脚本会用 `JQ_ROLLING_START_LOOKBACK_DAYS=465` 自动把请求起点夹到当前允许窗口内，避免固定早期日期越界。
-- 聚宽断点文件是 `data/min_kline/5m/jq_cold_5m_progress.json`，汇总文件是 `data/min_kline/5m/jq_summary_*.json`。
+- 生产读取表：`stock_minute_5m`，位于 `/Users/eudis/ths/data/core_db/quant_workstation.sqlite3`。
+- 路径 `data/min_kline/5m/{code}.parquet` 保留为腾讯/Ashare 兼容热数据归档和审计来源，不再作为前端和 Sentinel 的优先读取口径。
+- V5.6 5m Sentinel 回放优先读取统一 SQLite 表 `stock_minute_5m`；`/Users/eudis/5min/organized_5min_pre_adj` 与项目本地 Parquet 仅作为导入、审计或模拟补充来源。
+- 聚宽冷数据主动获取已停用：`QUANT_ENABLE_JQ_FETCH` 默认关闭，`scripts/shell/run_jq_cold_5m.sh` 仅记录停用日志并退出 0，`com.eudis.quant.jq-cold-5m` 不再安装启用。
+- 历史冷数据缓存仍可读取：`/Users/eudis/5min/organized_5min_pre_adj` 与项目本地 `data/min_kline/5m` 可作为导入、审计或模拟补充来源，不要删除已有 Parquet、断点或摘要文件。
+- 聚宽旧脚本 `scripts/data_pipeline/batch_fetch_historical_min.py`、`scripts/data_pipeline/batch_fetch_jq_history.py` 保留为兼容入口，但默认返回 `disabled`，不得在生产定时任务中重新启用。
 - 热数据：腾讯/Ashare 风格，脚本 `scripts/data_pipeline/daily_ashare_archiver.py`、`fast_fetch_today_m5.py`。
 - Theme Pipeline：`quant_core/data_pipeline/concept_engine.py` 负责细分概念指数日线缓存与 `data/concept_stock_map.json` 主概念映射，`quant_core/data_pipeline/sector_engine.py` 负责一级行业指数日线与 `stock_sector_map.parquet/csv` 兜底映射。
 - `daily_factor_factory.py` 的 `theme_*` 特征固定按“细分概念优先，一级行业兜底，无数据释放 NaN”级联计算；禁止把缺失主题数据填 0，XGBoost 原生学习 NaN 分裂。
@@ -190,7 +197,9 @@ SQLite 主库：`/Users/eudis/ths/data/core_db/quant_workstation.sqlite3`。
 
 - `snapshot_price` 和 `snapshot_time` 是影子测试原始证据，盘后修复、早盘哨兵、历史重建都不能覆盖真实实盘记录。
 - 存储层有不可变触发器。不要绕过 `storage.py` 直接写 SQL 去改快照字段。
+- 盘后误扫写入的候选不是证据，确认误入库后必须物理删除，不允许以隔离行形式继续保留在生产账本或参与 Top1 折叠。
 - 若需要清空模拟账本，先确认用户明确要求，并区分 `is_shadow_test` 真实数据。
+- `raw_json.source='historical_production_replay'` 的已结算行保持 `is_shadow_test=0`；未结算行必须提升为 `is_shadow_test=1`，作为真实影子持仓继续观察，并与前端、早盘哨兵、实时巡逻兵、15:35 卖出闭环保持同一集合。
 
 ## 生产策略
 
@@ -201,6 +210,13 @@ SQLite 主库：`/Users/eudis/ths/data/core_db/quant_workstation.sqlite3`。
 - 生命周期：T 日 14:50 锁定，T+1 开盘验证。
 - 结果字段：`open_premium`
 - 风控：非主板/ST过滤、尾盘诱多、断头铡刀、上影线、高位爆量、准涨停未封。
+
+### 尾盘突破-ST特情
+
+- 策略名：`尾盘突破-ST特情`
+- 生命周期：T 日 14:50 锁定，T+1 开盘验证。
+- 结果字段：`open_premium`
+- 风控：专门承接 ST/*ST 尾盘突破样本；必须过滤封死涨停、尾盘成交机会不足、成交量过小导致实盘无法买入的样本；Top1 不可买时允许在同策略候选池中按分数退到仍满足阈值的 Top2/Top3 并标记替补原因。
 
 ### 中线超跌反转
 
@@ -231,8 +247,8 @@ SQLite 主库：`/Users/eudis/ths/data/core_db/quant_workstation.sqlite3`。
 ### V5.6 分档与仓位
 
 - `ABSOLUTE_BOTTOM_PROBA=0.55` 是全策略通用绝对安全底线，禁止恢复人工 `_FLOOR_SCORE` 静态配置。
-- 当前生产启用策略来自 `PRODUCTION_STRATEGY_TYPES - PAUSED_STRATEGY_TYPES`，默认只输出 `全局动量狙击` 与 `尾盘突破`。
-- `select_strategy_top_picks()` 对每个启用策略先找 `score >= MIN_SCORE` 的 `base` 档，每个策略最多取 Top1；总输出上限由 `PRODUCTION_TOTAL_PICK_LIMIT=2` 控制。
+- 当前生产启用策略来自 `PRODUCTION_STRATEGY_TYPES - PAUSED_STRATEGY_TYPES`，默认输出 `全局动量狙击`、`尾盘突破` 与 `尾盘突破-ST特情`。
+- `select_strategy_top_picks()` 对每个启用策略先找 `score >= MIN_SCORE` 的 `base` 档，每个策略最多取 Top1；总输出上限由 `PRODUCTION_TOTAL_PICK_LIMIT=3` 控制。
 - 若 `base` 档为空，计算 `dynamic_floor=max(ABSOLUTE_BOTTOM_PROBA, legal_pool['score'].quantile(0.99))`，只有 Top 1 分数达到动态底线才以 `selection_tier=dynamic_floor` 出票。
 - `base` 档仓位使用 Half-Kelly，限制在 10% 到 30%；`dynamic_floor` 档固定 5% 试错轻仓。
 - 终端日志必须打印 `[AdaptiveFloor] ... dynamic_floor=...`，便于复盘当天动态及格线。
@@ -240,7 +256,7 @@ SQLite 主库：`/Users/eudis/ths/data/core_db/quant_workstation.sqlite3`。
 ### V5.6 5m Sentinel 卖出引擎
 
 - 脚本：`scripts/backtest/simulate_sentinel_5m.py`。
-- 数据：前复权冷数据 `/Users/eudis/5min/organized_5min_pre_adj` + 本地热数据 `data/min_kline/5m` 合并；历史未覆盖 T+3 时可用 `daily_picks` 已结算日线结果兜底。
+- 数据：优先读取统一 SQLite 5m 表 `stock_minute_5m`；前复权冷数据 `/Users/eudis/5min/organized_5min_pre_adj` 与本地热数据 `data/min_kline/5m` 只作为导入、审计或模拟补充来源。无完整 5m 覆盖时，全局狙击按 T+3 15:00 收盘兜底，尾盘突破/ST特情按 T+1 09:30 开盘兜底。
 - 口径：买入样本按 `selection_date + strategy_type` 折叠为每策略 Top1，并过滤 `PAUSED_STRATEGY_TYPES`。
 - 日内防爆止损：正规军 `-6%`，敢死队/狙击/突破 `-4%`。
 - 动态追踪止盈：最高浮盈达到 `+4%` 激活，随后从最高价回撤 `-2%` 触发。
@@ -312,18 +328,20 @@ FastAPI 实盘推理入口：
 
 常见任务：
 
-- `01:20` 聚宽历史 5m 冷数据额度任务，按月切片补齐，使用断点文件跳过已完成切片，额度耗尽后正常停止并等待次日继续。
+- 后端 API 与前端 Vite 由 `com.eudis.quant.backend-api`、`com.eudis.quant.frontend-dev` 以 `RunAtLoad + KeepAlive` 常驻。
+- `08:55` `com.eudis.quant.ollama-ensure` 检查 Ollama，必要时拉起 Ollama.app；该任务也会在登录时运行一次。
 - `09:00` PushPlus 心跳。
 - `09:15` 实时巡逻兵启动，监控上一交易日 14:50 推送标的。
 - `09:16` 早盘预观察。
 - `09:21` 撤单关闭后竞价审计。
 - `09:25` 终极开盘哨兵，只此阶段允许回填 `open_price`。
 - `14:30` 保存全市场快照。
-- `15:10` T+3 收盘结算器，按目标交易日 15:00 close 闭环波段策略。
+- `14:45` `com.eudis.quant.push-top-pick-prewarm` 预热扫描链路与 Ollama。
 - `14:50` 启用策略分策略 Top1 出票与 PushPlus 推送。
-- `14:50` 全局动量狙击雷达锁定。
+- `14:50` V4 全局动量狙击 Top5 雷达锁定/推送已停用；只保留接口和脚本用于手动审计，PushPlus 默认需显式开启 `QUANT_ENABLE_V3_SNIPER_PUSHPLUS=1`。
 - `15:05` 盘后日线同步。
 - `15:15` Ashare/腾讯 5m 热数据归档。
+- `15:35` 5m 卖出闭环与 T+3 收盘结算器，只处理真实未关闭影子持仓。
 
 重要脚本：
 
@@ -332,12 +350,15 @@ FastAPI 实盘推理入口：
 - `scripts/shell/run_exit_sentinel.sh`
 - `scripts/shell/run_swing_patrol.sh`
 - `scripts/shell/run_live_sentinel.sh`
-- `scripts/shell/run_v3_sniper_lock.sh`
+- `scripts/shell/run_v3_sniper_lock.sh`：V4 Top5 锁榜兼容入口，生产定时任务已停用
 - `scripts/shell/run_push_top_pick.sh`
+- `scripts/shell/run_ollama_ensure.sh`
 - `scripts/shell/run_market_close_sync.sh`
 - `scripts/shell/run_daily_ashare_archiver.sh`
-- `scripts/shell/run_jq_cold_5m.sh`
+- `scripts/shell/run_jq_cold_5m.sh`：聚宽停用哨兵脚本，只写停用日志并退出 0；LaunchAgent 默认禁用
 - `scripts/shell/update_launch_agents.sh`
+
+默认禁用或退役的旧 Label：`com.eudis.quant.daily-pick-save`、`com.eudis.quant.daily-pick-open`、`com.eudis.quant.exit-sentinel`、`com.eudis.quant.jq-cold-5m`、`com.eudis.quant.v3-sniper-lock`、`com.quant.heartbeat`、`com.quant.sniper`。
 
 ## 实时巡逻兵
 
@@ -389,11 +410,17 @@ LaunchAgent 启动脚本：
 - `GET /api/overview`
 - `GET /api/radar/cache`
 - `GET /api/radar/scan?limit=10`
-- `GET /api/daily-picks?view=strategy_top1`：默认真实影子账本，每个启用策略 Top1；`view=all` 仅审计原始记录。
+- `GET /api/daily-picks?view=strategy_top1`：默认真实账本数据，先过滤 `is_shadow_test=1` 再按每个启用策略 Top1 折叠；`view=all` 仅审计原始记录。
+- `GET /api/backtest/sentinel-5m-ledger?start_date=2025-01-01`：5m回测数据，只返回 `is_closed=true` 且 `coverage_status=covered` 的最新买卖策略样本。
 - `GET /api/data/market-sync/latest`
 - `GET /api/data/history/{code}`
 - `GET /api/data/history_min/{code}?period=5`
 - `GET /api/data/minute-fetch/status`
+- `GET /api/pushplus/tokens`
+- `POST /api/pushplus/tokens`
+- `PUT /api/pushplus/tokens/{token_id}`
+- `DELETE /api/pushplus/tokens/{token_id}`
+- `POST /api/pushplus/test`
 - `GET /api/v3/system/status`
 - `GET /api/v3/sniper/signals`
 - `GET /api/v3/sniper/scan_today`
@@ -426,20 +453,20 @@ npm run build
 
 核心文件：
 
-- `src/App.vue`：V5.6 5m Sentinel / Theme Alpha / Mac Sniper 主工作站入口，Dashboard 统一承载策略卡片、真实影子账本、资金池和物理外挂保险匣；暂停策略卡片灰显但不删除。
+- `src/App.vue`：V5.6 5m Sentinel / Theme Alpha / Mac Sniper 主工作站入口，Dashboard 统一承载策略卡片、真实账本数据、5m回测数据、资金池和物理外挂保险匣；暂停策略卡片灰显但不删除。
 - `src/components/Sidebar.vue`：左侧导航。
 - `src/components/StatsHeader.vue`：顶部状态条。
-- `src/components/SelectionTable.vue`：影子账本/策略表格。
+- `src/components/SelectionTable.vue`：真实账本/回测数据/策略表格。
 - `src/components/MinKlineViewer.vue`：5m 分时观测。
 - `src/router/index.js`：轻量路由解析，不是完整 vue-router。
 - `src/style.css`：暗夜金融终端样式。
 
-数据状态卡口径：
+PushPlus 页面口径：
 
-- Validation 页的 JQDATA COLD 5M 卡片读取 `GET /api/data/minute-fetch/status`。
-- 聚宽卡片的“本次新增”是最近一次 `jq_summary_*.json` 中的 `success / universe`，不包含本次因断点已完成而跳过的股票。
-- 聚宽卡片的“断点进度”来自 `jq_cold_5m_progress.json`，格式为 `progress_codes 股 / progress_segments 段`；一只股票完整冷数据大约对应 13 个自然月切片。
-- Ashare/Tencent 热数据卡片的“今日覆盖”仍表示当天热数据归档成功数。
+- 侧边栏 `PushPlus` 取代旧 `Validation` 同步/校验页；旧数据同步、校验报告、聚宽冷数据和数据资产卡片不再作为前端页面入口展示。
+- `GET /api/pushplus/tokens` 只返回 `token_mask`、启用状态、最近发送状态和统计计数，不返回 token 明文。
+- `POST /api/pushplus/test` 通过 `send_pushplus()` 向所有启用 token 循环发送测试消息。
+- Dashboard 保留 `Ashare 每日获取情况` 卡片，读取 `GET /api/data/minute-fetch/status` 的 `ashare` 段；不要恢复旧 JQ 冷数据卡。
 
 设计约束：
 
@@ -575,7 +602,7 @@ bash scripts/shell/update_launch_agents.sh
 - 新增模型路径要写入 `quant_core/config.py`，不要散落硬编码。
 - 新增生产字段必须在 `quant_core/storage.py` 做自动迁移。
 - 写入 `daily_picks` 时必须支持多标的并行，唯一性应考虑 `selection_date + strategy_type + code`。
-- 旧全局狙击页的历史锁定记录保存在 `v3_sniper_locks`，不会自动出现在影子账本；如需补录到 `daily_picks`，必须保留原始快照价/时间并写入历史导入风险提示。
+- 旧全局狙击页的历史锁定记录保存在 `v3_sniper_locks`，不会自动出现在真实账本数据；如需补录到 `daily_picks`，必须保留原始快照价/时间并写入历史导入风险提示。
 - 推送逻辑必须能处理空策略、列表结果、网络失败和重试。
 - V4 sniper 接口如果报 502，先看模型文件、meta 特征列、Theme Pipeline 缓存、腾讯实时行情、Python 3.9 类型注解。
 - 前端如果打不开，先检查 Vite 端口 5173、后端 8000、`npm run build`。
@@ -587,11 +614,11 @@ bash scripts/shell/update_launch_agents.sh
 ## 最近验证过的状态
 
 - `quant_dashboard/frontend` 的 `npm run build` 最近已通过。
-- `bash scripts/shell/run_jq_cold_5m.sh` 最近可正常登录聚宽并按断点继续，`2026-05-01` 实测结果为 `success=177`、`failed=0`、`stopped_by_quota=true`，额度自然耗尽后退出码为 0。
-- `GET /api/data/minute-fetch/status` 最近返回 JQ 状态 `quota_exhausted`，并能读取最新全量摘要 `jq_summary_20260501_185555.json`。
+- 聚宽主动获取已停用；`bash scripts/shell/run_jq_cold_5m.sh` 应只写停用日志并退出 0。
+- PushPlus 页面应能列出 SQLite token 与 `.env` 兼容 token；`.env` token 不可编辑，只展示掩码。
 - `GET /api/v3/system/status` 最近返回模型 ready、Ollama ready。
 - `GET /api/v4/sniper/scan_today?limit=3&threshold=0&cache_seconds=0` 最近返回 `prediction_date=2026-05-02`，每行包含 `theme_name` 与 `theme_pct_chg_3`。
-- 后端 LaunchAgent `com.eudis.quant.backend-api` 可通过 `launchctl kickstart` 重启。
+- 后端 LaunchAgent `com.eudis.quant.backend-api` 与前端 `com.eudis.quant.frontend-dev` 已按 `RunAtLoad + KeepAlive` 常驻；`com.eudis.quant.ollama-ensure` 和 `com.eudis.quant.push-top-pick-prewarm` 已安装用于盘前/尾盘预热。
 - `live_sentinel.py --once --dry-run --no-push` 最近通过；腾讯五档盘口字段可解析，合成委比 `-98%` 样本可触发盘口抢跑预警。
 
 ## 后续 Agent 接手建议

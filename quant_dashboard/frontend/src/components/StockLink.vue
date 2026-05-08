@@ -17,6 +17,9 @@ const props = defineProps({
   code: { type: [String, Number], required: true },
   name: { type: String, default: '' },
   label: { type: [String, Number], default: '' },
+  buyDate: { type: String, default: '' },
+  sellDate: { type: String, default: '' },
+  strategyType: { type: String, default: '' },
   mono: { type: Boolean, default: false },
   block: { type: Boolean, default: false },
 })
@@ -36,6 +39,11 @@ const openStock = () => {
   const payload = {
     code: cleanCode.value,
     name: props.name || displayText.value,
+    buy_date: props.buyDate,
+    selection_date: props.buyDate,
+    sell_date: props.sellDate,
+    close_date: props.sellDate,
+    strategy_type: props.strategyType,
   }
   if (typeof openStockMarket === 'function') {
     openStockMarket(payload)

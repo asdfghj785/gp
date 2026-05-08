@@ -19,6 +19,7 @@ from quant_core.data_pipeline.tencent_engine import get_tencent_realtime, tencen
 from quant_core.data_pipeline.trading_calendar import is_trading_day, nth_trading_day, trading_day_count_after
 from quant_core.execution.mac_sniper import aim_and_fire
 from quant_core.execution.pushplus_tasks import send_pushplus
+from quant_core.config import RISK_CONTROL_PROFILES
 from quant_core.sniper_status import get_sniper_status
 from quant_core.storage import connect, init_db, latest_daily_picks, mark_daily_pick_closed
 
@@ -38,16 +39,10 @@ ORDER_BOOK_IMBALANCE_THRESHOLD = -80.0
 VWAP_FAKE_DUMP_HOLD_RATIO = 0.995
 ANTI_NUCLEAR_CONFIRM_SECONDS = 180
 ANTI_NUCLEAR_MAX_LOSS_PCT = -1.0
-REGULAR_INTRADAY_DISASTER_STOP_PCT = -6.0
-SNIPER_INTRADAY_DISASTER_STOP_PCT = -4.0
-REGULAR_EOD_STRUCTURAL_STOP_PCT = -3.0
-SNIPER_EOD_STRUCTURAL_STOP_PCT = -1.5
-TRAILING_ARM_GAIN_PCT = 4.0
-TRAILING_DRAWDOWN_PCT = -2.0
 EOD_STRUCTURAL_STOP_START = clock_time(14, 50)
 INTRADAY_EXIT_MONITOR_ENABLED = True
 REGULAR_STRATEGY_TYPES = {"右侧主升浪"}
-SNIPER_STRATEGY_TYPES = {"尾盘突破", "全局动量狙击"}
+SNIPER_STRATEGY_TYPES = {"尾盘突破", "尾盘突破-ST特情", "全局动量狙击"}
 DEPRECATED_STRATEGY_TYPES = {"右侧主升浪", "中线超跌反转", "首阴低吸"}
 SHADOW_ACCOUNT_PATH = BASE_DIR / "data" / "shadow_account.json"
 
@@ -232,21 +227,12 @@ def seed_from_latest_1450_picks(path: Path = LEDGER_PATH, monitor_date: Optional
 
 def previous_1450_picks(current_day: str) -> list[dict[str, Any]]:
     rows = latest_daily_picks(limit=300, shadow_only=True)
-    previous_dates = sorted(
-        {
-            str(row.get("selection_date") or "")
-            for row in rows
-            if str(row.get("selection_date") or "") and str(row.get("selection_date") or "") < current_day
-        },
-        reverse=True,
-    )
-    if not previous_dates:
-        return []
-    selection_date = previous_dates[0]
     return [
         row
         for row in rows
-        if str(row.get("selection_date") or "") == selection_date and not bool(row.get("is_closed"))
+        if str(row.get("selection_date") or "")
+        and str(row.get("selection_date") or "") < current_day
+        and not bool(row.get("is_closed"))
     ]
 
 
@@ -427,8 +413,11 @@ def check_one_position(
     current_gain_pct = gain_pct(current_price, buy_price)
     highest_gain_pct = gain_pct(highest_price, buy_price)
     drawdown_pct = gain_pct(current_price, highest_price)
-    intraday_stop_pct = intraday_disaster_stop_pct(position)
-    structural_stop_pct = eod_structural_stop_pct(position)
+    profile_key, risk_profile = risk_control_profile(position)
+    intraday_stop_pct = risk_profile_pct(risk_profile, "hard_stop")
+    structural_stop_pct = risk_profile_pct(risk_profile, "eod_stop")
+    trailing_active_pct = risk_profile_pct(risk_profile, "trailing_active")
+    trailing_drawdown_pct = -abs(risk_profile_pct(risk_profile, "trailing_retrace"))
     anti_nuclear_event = check_anti_nuclear_pool(
         position=position,
         ledger=ledger,
@@ -503,17 +492,18 @@ def check_one_position(
             event["anti_nuclear"] = anti_nuclear_event
         return event
 
-    trailing_active = highest_gain_pct >= TRAILING_ARM_GAIN_PCT
-    trailing_hit = drawdown_pct <= TRAILING_DRAWDOWN_PCT
+    trailing_active = highest_gain_pct >= trailing_active_pct
+    trailing_hit = drawdown_pct <= trailing_drawdown_pct
     if trailing_active and trailing_hit:
         event = close_position(
             ledger=ledger,
             position=position,
             path=path,
             reason="trailing_take_profit",
-            title=f"【追踪止盈触发】{name} 最高浮盈达标后回撤 2%",
+            title=f"【追踪止盈触发】{name} 最高浮盈达标后回撤 {abs(trailing_drawdown_pct):.1f}%",
             message=(
-                f"【追踪止盈触发】{name}最高浮盈 {highest_gain_pct:.2f}%，"
+                f"【追踪止盈触发】{name}最高浮盈 {highest_gain_pct:.2f}% "
+                f"(激活阈值 {trailing_active_pct:.1f}%)，"
                 f"当前从最高点回撤 {abs(drawdown_pct):.2f}%，"
                 f"当前盈利约 {current_gain_pct:.2f}%，建议落袋为安！"
             ),
@@ -607,8 +597,12 @@ def check_one_position(
         "highest_gain_pct": round(highest_gain_pct, 4),
         "drawdown_pct": round(drawdown_pct, 4),
         "tier": position_tier(position),
+        "risk_profile_key": profile_key,
+        "risk_profile": risk_profile,
         "intraday_disaster_stop_pct": round(intraday_stop_pct, 4),
         "eod_structural_stop_pct": round(structural_stop_pct, 4),
+        "trailing_active_pct": round(trailing_active_pct, 4),
+        "trailing_drawdown_pct": round(trailing_drawdown_pct, 4),
         "trailing_active": trailing_active,
         "updated_highest": updated_highest,
         "checked_at": datetime.now().isoformat(timespec="seconds"),
@@ -1116,6 +1110,7 @@ def close_position(
 ) -> dict[str, Any]:
     code = normalize_code(position.get("code"))
     now = datetime.now().isoformat(timespec="seconds")
+    profile_key, profile = risk_control_profile(position)
     settlement = close_settlement_context(
         quote=quote,
         checked_at=now,
@@ -1185,6 +1180,8 @@ def close_position(
             "highest_price": round(highest_price, 4),
             "highest_gain_pct": round(highest_gain_pct, 4),
             "drawdown_pct": round(drawdown_pct, 4),
+            "risk_profile_key": profile_key,
+            "risk_profile": profile,
             "closed_at": now,
             "push_status": push_result,
             "daily_pick_sync": daily_pick_sync,
@@ -1214,6 +1211,8 @@ def close_position(
         "current_gain_pct": round(current_gain_pct, 4),
         "highest_gain_pct": round(highest_gain_pct, 4),
         "drawdown_pct": round(drawdown_pct, 4),
+        "risk_profile_key": profile_key,
+        "risk_profile": profile,
         "pushplus": push_result,
         "markdown": content,
         "daily_pick_sync": daily_pick_sync,
@@ -1319,21 +1318,30 @@ def sync_daily_pick_close(
     strategy_type = str(position.get("strategy_type") or "") or None
     if not selection_date:
         return {"status": "skipped", "reason": "missing_selection_date"}
+    profile_key, profile = risk_control_profile(position)
 
     close_signal = {
         "source": "live_sentinel",
         "action": reason,
         "title": title,
         "instruction": message,
+        "sell_strategy": reason,
+        "exit_policy": message or reason,
+        "close_time": checked_at,
+        "coverage_status": "covered",
         "current_price": round(current_price, 4),
         "settlement_price": round(settlement_price, 4),
+        "close_price": round(settlement_price, 4),
         "settlement_gain_pct": round(settlement_gain_pct, 4),
+        "close_return_pct": round(settlement_gain_pct, 4),
         "settlement_basis": settlement_basis,
         "buy_price": round(buy_price, 4),
         "highest_price": round(highest_price, 4),
         "current_gain_pct": round(current_gain_pct, 4),
         "highest_gain_pct": round(highest_gain_pct, 4),
         "drawdown_pct": round(drawdown_pct, 4),
+        "risk_profile_key": profile_key,
+        "risk_profile": profile,
         "quote_time": f"{quote.get('date') or ''} {quote.get('time') or ''}".strip(),
         "checked_at": checked_at,
     }
@@ -1665,12 +1673,47 @@ def is_sniper_position(position: dict[str, Any]) -> bool:
     return position_tier(position) == "dynamic_floor"
 
 
+def risk_control_profile_key(position: dict[str, Any]) -> str:
+    explicit = str(position.get("risk_control_profile") or position.get("risk_profile_key") or "").strip()
+    if explicit and explicit in RISK_CONTROL_PROFILES:
+        return explicit
+    strategy_type = str(position.get("strategy_type") or "").strip()
+    if strategy_type == "全局动量狙击":
+        return "全局狙击_V6"
+    if strategy_type == "尾盘突破-ST特情":
+        return "ST特情"
+    if strategy_type == "尾盘突破":
+        return "尾盘突破"
+    if strategy_type in RISK_CONTROL_PROFILES:
+        return strategy_type
+    return "default"
+
+
+def risk_control_profile(position: dict[str, Any]) -> tuple[str, dict[str, float]]:
+    default_profile = {
+        "hard_stop": -0.03,
+        "trailing_active": 0.03,
+        "trailing_retrace": 0.01,
+        "eod_stop": -0.02,
+    }
+    configured_default = RISK_CONTROL_PROFILES.get("default", {})
+    profile = {**default_profile, **configured_default}
+    key = risk_control_profile_key(position)
+    if key != "default":
+        profile.update(RISK_CONTROL_PROFILES.get(key, {}))
+    return key, {name: safe_float(value) for name, value in profile.items()}
+
+
+def risk_profile_pct(profile: dict[str, float], key: str) -> float:
+    return safe_float(profile.get(key)) * 100.0
+
+
 def intraday_disaster_stop_pct(position: dict[str, Any]) -> float:
-    return SNIPER_INTRADAY_DISASTER_STOP_PCT if is_sniper_position(position) else REGULAR_INTRADAY_DISASTER_STOP_PCT
+    return risk_profile_pct(risk_control_profile(position)[1], "hard_stop")
 
 
 def eod_structural_stop_pct(position: dict[str, Any]) -> float:
-    return SNIPER_EOD_STRUCTURAL_STOP_PCT if is_sniper_position(position) else REGULAR_EOD_STRUCTURAL_STOP_PCT
+    return risk_profile_pct(risk_control_profile(position)[1], "eod_stop")
 
 
 def is_eod_structural_stop_window(now: Optional[datetime] = None) -> bool:
@@ -1684,8 +1727,13 @@ def tier_stop_loss_pct(position: dict[str, Any]) -> float:
 
 
 def tier_display(position: dict[str, Any]) -> tuple[str, str]:
-    if is_sniper_position(position):
-        return "敢死队", "极严监控"
+    profile_key = risk_control_profile_key(position)
+    if profile_key == "全局狙击_V6":
+        return "V6极寒爆发", "宽波动隔离监控"
+    if profile_key == "ST特情":
+        return "ST特情", "极严监控"
+    if profile_key == "尾盘突破":
+        return "尾盘突破", "极严监控"
     return "正规军", "标准监控"
 
 

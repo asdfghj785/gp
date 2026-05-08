@@ -82,6 +82,8 @@
         <article><span>日 K 最新</span><strong>{{ latestDailyDate }}</strong></article>
         <article><span>5m 最新</span><strong>{{ latestMinuteTime }}</strong></article>
         <article><span>当前视图</span><strong>{{ activeRows.length }} 根</strong></article>
+        <article><span>买入日</span><strong :class="buyDateFound ? 'anchor-hit' : 'anchor-miss'">{{ buyDateText }}</strong></article>
+        <article><span>卖出日</span><strong :class="sellDateFound ? 'sell-anchor-hit' : 'anchor-miss'">{{ sellDateText }}</strong></article>
         <article><span>查看区间</span><strong>{{ activeRangeLabel }}</strong></article>
         <article class="wide-card"><span>本地文件</span><strong class="path-text">{{ activePathText }}</strong></article>
         <article><span>数据源</span><strong>{{ activeSourceText }}</strong></article>
@@ -153,6 +155,8 @@ const API = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
 const props = defineProps({
   stockCode: { type: [String, Number], default: '' },
   stockRequest: { type: Number, default: 0 },
+  stockAnchorDate: { type: String, default: '' },
+  stockSellDate: { type: String, default: '' },
 })
 
 const normalizeCode = (value) => String(value || '').replace(/\D/g, '').slice(-6)
@@ -213,6 +217,24 @@ const activeModeLabel = computed(() => {
 const activeChartTitle = computed(() => viewMode.value === 'daily' ? `日 K 与成交量 · ${activeRangeLabel.value}` : `5m K 线与成交量 · ${activeRangeLabel.value}`)
 const latestDailyDate = computed(() => dailyMeta.value.latest_date || lastValue(dailyRows.value, 'date') || '-')
 const latestMinuteTime = computed(() => minuteMeta.value.latest_datetime || lastValue(minuteRows.value, 'datetime') || '-')
+const buyAnchorDate = computed(() => normalizeDateKey(props.stockAnchorDate))
+const buyDateFound = computed(() => {
+  const anchor = buyAnchorDate.value
+  return Boolean(anchor && dailyRows.value.some((row) => normalizeDateKey(row.date || row.datetime) === anchor))
+})
+const buyDateText = computed(() => {
+  if (!buyAnchorDate.value) return '-'
+  return buyDateFound.value ? buyAnchorDate.value : `${buyAnchorDate.value} 未覆盖`
+})
+const sellAnchorDate = computed(() => normalizeDateKey(props.stockSellDate))
+const sellDateFound = computed(() => {
+  const anchor = sellAnchorDate.value
+  return Boolean(anchor && dailyRows.value.some((row) => normalizeDateKey(row.date || row.datetime) === anchor))
+})
+const sellDateText = computed(() => {
+  if (!sellAnchorDate.value) return '-'
+  return sellDateFound.value ? sellAnchorDate.value : `${sellAnchorDate.value} 未覆盖`
+})
 const activePathText = computed(() => {
   if (viewMode.value === 'daily') return 'SQLite stock_daily'
   const paths = minuteMeta.value.paths || []
@@ -382,15 +404,23 @@ const renderChart = () => {
   }
   chart.resize({ width: Math.round(box.width), height: Math.round(box.height) })
   const rows = activeRows.value
-  const times = rows.map((row) => rowTime(row))
-  const candles = rows.map((row) => [row.open, row.close, row.low, row.high])
-  const volumes = rows.map((row) => ({
-    value: row.volume,
-    itemStyle: { color: Number(row.close) >= Number(row.open) ? 'rgba(245,34,45,0.72)' : 'rgba(82,196,26,0.72)' },
-  }))
-  const ma5 = movingAverage(rows, 5)
-  const ma10 = movingAverage(rows, 10)
-  const ma20 = movingAverage(rows, 20)
+  const focus = buildPrimaryTradeFocus(rows)
+  const chartRows = buildChartRowsWithFocusPadding(rows, focus.index)
+  const focusIndex = focus.index >= 0 ? focus.index + chartRows.leadingPad : -1
+  const times = chartRows.rows.map((row) => chartRowTime(row))
+  const candles = chartRows.rows.map((row) => row.__pad ? ['-', '-', '-', '-'] : [row.open, row.close, row.low, row.high])
+  const volumes = chartRows.rows.map((row) => row.__pad
+    ? { value: '-', itemStyle: { color: 'rgba(148,163,184,0)' } }
+    : {
+        value: row.volume,
+        itemStyle: { color: Number(row.close) >= Number(row.open) ? 'rgba(245,34,45,0.72)' : 'rgba(82,196,26,0.72)' },
+      }
+  )
+  const ma5 = padSeries(movingAverage(rows, 5), chartRows.leadingPad, chartRows.trailingPad)
+  const ma10 = padSeries(movingAverage(rows, 10), chartRows.leadingPad, chartRows.trailingPad)
+  const ma20 = padSeries(movingAverage(rows, 20), chartRows.leadingPad, chartRows.trailingPad)
+  const zoomRange = dataZoomRange(times.length, focusIndex)
+  const tradeMarkers = buildTradeMarkers(rows, chartRows.leadingPad, times)
   const minZoomSpan = viewMode.value === 'daily' && times.length
     ? Math.min(100, (5 / times.length) * 100)
     : undefined
@@ -427,14 +457,14 @@ const renderChart = () => {
         boundaryGap: true,
         axisLine: { lineStyle: { color: '#334155' } },
         axisTick: { show: false },
-        axisLabel: { color: '#8a94a8', hideOverlap: true },
+        axisLabel: { color: '#8a94a8', hideOverlap: true, formatter: axisLabelFormatter },
       },
       {
         type: 'category',
         gridIndex: 1,
         data: times,
         boundaryGap: true,
-        axisLabel: { color: '#7f8aa1', hideOverlap: true },
+        axisLabel: { color: '#7f8aa1', hideOverlap: true, formatter: axisLabelFormatter },
         axisTick: { show: false },
         axisLine: { lineStyle: { color: '#334155' } },
       },
@@ -462,8 +492,8 @@ const renderChart = () => {
       {
         type: 'inside',
         xAxisIndex: [0, 1],
-        start: Math.max(0, 100 - (140 / Math.max(times.length, 140)) * 100),
-        end: 100,
+        start: zoomRange.start,
+        end: zoomRange.end,
         zoomOnMouseWheel: true,
         moveOnMouseWheel: false,
         moveOnMouseMove: true,
@@ -480,6 +510,8 @@ const renderChart = () => {
         fillerColor: 'rgba(24,144,255,0.22)',
         handleStyle: { color: '#69b1ff', borderColor: '#69b1ff' },
         textStyle: { color: '#7f8aa1' },
+        start: zoomRange.start,
+        end: zoomRange.end,
         ...zoomLimit,
       },
     ],
@@ -496,6 +528,10 @@ const renderChart = () => {
           borderColor0: '#52c41a',
           borderWidth: 1.2,
         },
+        ...(tradeMarkers ? {
+          markLine: tradeMarkers.markLine,
+          markPoint: tradeMarkers.markPoint,
+        } : {}),
       },
       lineSeries('MA5', ma5, '#f5c542'),
       lineSeries('MA10', ma10, '#69b1ff'),
@@ -618,6 +654,113 @@ const filterRowsByRange = (rows, range) => {
     return date && date >= start && date <= latest
   })
 }
+const chartRowTime = (row) => row.__pad ? row.__padLabel : rowTime(row)
+const axisLabelFormatter = (value) => String(value || '').startsWith('__pad_') ? '' : value
+const findTradeDateIndex = (rows, date) => {
+  if (!date) return -1
+  return rows.findIndex((row) => normalizeDateKey(row.date || row.datetime) === date)
+}
+const buildPrimaryTradeFocus = (rows) => {
+  if (viewMode.value !== 'daily') return { index: -1, date: '' }
+  const buyIndex = findTradeDateIndex(rows, buyAnchorDate.value)
+  if (buyIndex >= 0) return { index: buyIndex, date: buyAnchorDate.value }
+  const sellIndex = findTradeDateIndex(rows, sellAnchorDate.value)
+  return { index: sellIndex, date: sellIndex >= 0 ? sellAnchorDate.value : '' }
+}
+const buildChartRowsWithFocusPadding = (rows, focusIndex) => {
+  if (viewMode.value !== 'daily' || focusIndex < 0 || !rows.length) {
+    return { rows, leadingPad: 0, trailingPad: 0 }
+  }
+  const visible = Math.min(90, Math.max(30, rows.length))
+  const half = Math.floor(visible / 2)
+  const leadingPad = Math.max(0, half - focusIndex)
+  const trailingPad = Math.max(0, focusIndex + half - (rows.length - 1))
+  const lead = Array.from({ length: leadingPad }, (_, index) => ({ __pad: true, __padLabel: `__pad_left_${index + 1}` }))
+  const tail = Array.from({ length: trailingPad }, (_, index) => ({ __pad: true, __padLabel: `__pad_right_${index + 1}` }))
+  return { rows: [...lead, ...rows, ...tail], leadingPad, trailingPad }
+}
+const padSeries = (values, leadingPad, trailingPad) => [
+  ...Array.from({ length: leadingPad }, () => null),
+  ...values,
+  ...Array.from({ length: trailingPad }, () => null),
+]
+const dataZoomRange = (total, focusIndex) => {
+  if (!total) return { start: 0, end: 100 }
+  const visible = Math.min(viewMode.value === 'daily' ? 90 : 140, total)
+  if (focusIndex >= 0) {
+    const half = Math.floor(visible / 2)
+    let startIndex = Math.max(0, focusIndex - half)
+    let endIndex = Math.min(total - 1, startIndex + visible - 1)
+    startIndex = Math.max(0, endIndex - visible + 1)
+    return {
+      start: (startIndex / Math.max(total - 1, 1)) * 100,
+      end: (endIndex / Math.max(total - 1, 1)) * 100,
+    }
+  }
+  const startIndex = Math.max(0, total - visible)
+  return {
+    start: (startIndex / Math.max(total - 1, 1)) * 100,
+    end: 100,
+  }
+}
+const tradeMarkerPoint = (rows, rawIndex, times, chartIndex, type) => {
+  if (rawIndex < 0 || chartIndex < 0) return null
+  const row = rows[rawIndex]
+  const high = finiteNumber(row.high)
+  const low = finiteNumber(row.low)
+  const close = finiteNumber(row.close)
+  const isSell = type === 'sell'
+  const color = isSell ? '#69b1ff' : '#f5c542'
+  const label = isSell ? '卖出' : '买入'
+  const lineLabel = isSell ? '卖出日' : '买入日'
+  const price = isSell
+    ? (low !== null ? low * 0.965 : close)
+    : (high !== null ? high * 1.035 : close)
+  const xAxis = times[chartIndex]
+  return {
+    line: {
+      xAxis,
+      name: lineLabel,
+      lineStyle: { color, width: 1.6, type: 'dashed', opacity: 0.95 },
+      label: {
+        formatter: lineLabel,
+        color,
+        fontWeight: 900,
+        backgroundColor: 'rgba(15,17,23,0.82)',
+        padding: [3, 6],
+        borderRadius: 4,
+      },
+    },
+    point: {
+      name: lineLabel,
+      coord: [xAxis, price ?? 0],
+      value: label,
+      symbol: 'pin',
+      symbolSize: 58,
+      symbolRotate: isSell ? 180 : 0,
+      itemStyle: { color, borderColor: '#111827', borderWidth: 1.2 },
+      label: { formatter: label, color: '#111827', fontWeight: 950, fontSize: 11 },
+    },
+  }
+}
+const buildTradeMarkers = (rows, leadingPad, times) => {
+  if (viewMode.value !== 'daily') return null
+  const markers = [
+    tradeMarkerPoint(rows, findTradeDateIndex(rows, buyAnchorDate.value), times, findTradeDateIndex(rows, buyAnchorDate.value) + leadingPad, 'buy'),
+    tradeMarkerPoint(rows, findTradeDateIndex(rows, sellAnchorDate.value), times, findTradeDateIndex(rows, sellAnchorDate.value) + leadingPad, 'sell'),
+  ].filter(Boolean)
+  if (!markers.length) return null
+  return {
+    markLine: {
+      silent: true,
+      symbol: 'none',
+      data: markers.map((item) => item.line),
+    },
+    markPoint: {
+      data: markers.map((item) => item.point),
+    },
+  }
+}
 const formatAxisVolume = (value) => {
   const num = Number(value)
   if (!Number.isFinite(num)) return ''
@@ -657,7 +800,7 @@ watch(activeRange, async () => {
   scheduleRenderChart()
 })
 
-watch(() => [props.stockCode, props.stockRequest], async ([value]) => {
+watch(() => [props.stockCode, props.stockRequest, props.stockAnchorDate, props.stockSellDate], async ([value]) => {
   const clean = normalizeCode(value)
   if (clean.length !== 6) return
   const sameCode = clean === cleanCode.value
@@ -906,6 +1049,18 @@ h2 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.anchor-hit {
+  color: #f5c542 !important;
+}
+
+.sell-anchor-hit {
+  color: #69b1ff !important;
+}
+
+.anchor-miss {
+  color: #ff7875 !important;
 }
 
 .wide-card {

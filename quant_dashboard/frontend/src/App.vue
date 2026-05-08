@@ -43,9 +43,9 @@
         <section v-show="activeSection === 'dashboard'" class="page-stack">
           <section class="command-strip">
             <article>
-              <span>V4.0 Theme Alpha</span>
-              <strong>四大核心军团并行出票</strong>
-              <small>全局动量狙击 / 右侧主升浪 / 中线超跌反转 / 尾盘突破各自独立 Top1</small>
+              <span>V6.0 Extreme Burst</span>
+              <strong>{{ radarModelLabel }}</strong>
+              <small>{{ v6SniperContractText }}</small>
             </article>
             <article>
               <span>Snapshot Anchor</span>
@@ -59,8 +59,8 @@
             </article>
             <article>
               <span>Minute Factory</span>
-              <strong>JQ 冷数据 + 腾讯热数据</strong>
-              <small>15:15 跟随盘后日线同步后自动合并 5m Parquet</small>
+              <strong>SQLite 统一 5m 表</strong>
+              <small>{{ sentinelPolicyText }}</small>
             </article>
           </section>
 
@@ -69,8 +69,8 @@
               <template #header>
                 <div class="card-head">
                   <div>
-                    <p class="eyebrow">Strategy Legion</p>
-                    <h2>四大核心军团并行出票</h2>
+                    <p class="eyebrow">Strategy Matrix</p>
+                    <h2>多策略并行出票</h2>
                   </div>
                   <span class="terminal-chip">XGBRegressor</span>
                 </div>
@@ -109,6 +109,51 @@
                   <span>{{ node.phase }}</span>
                   <strong>{{ node.name }}</strong>
                   <small>{{ node.detail }}</small>
+                </article>
+              </div>
+            </el-card>
+
+            <el-card class="dark-card ashare-fetch-card" shadow="never">
+              <template #header>
+                <div class="card-head">
+                  <div>
+                    <p class="eyebrow">Ashare Hot 5m</p>
+                    <h2>Ashare 每日获取情况</h2>
+                  </div>
+                  <div class="card-actions">
+                    <span :class="['terminal-chip', fetchStatusClass(ashareFetch)]">{{ ashareFetch.status_label || '-' }}</span>
+                    <el-button size="small" :loading="busy.minuteFetch" @click="loadMinuteFetchStatus">刷新</el-button>
+                  </div>
+                </div>
+              </template>
+              <div class="pulse-grid fetch-summary">
+                <article>
+                  <span>{{ ashareFetch.status === 'running' ? '运行进度' : '最后获取' }}</span>
+                  <strong>{{ ashareFetchLastText }}</strong>
+                </article>
+                <article>
+                  <span>覆盖股票</span>
+                  <strong>{{ ashareFetchCoverageText }}</strong>
+                </article>
+                <article>
+                  <span>失败</span>
+                  <strong :class="Number(ashareFetch.failed || 0) > 0 ? 'risk' : ''">{{ ashareFetch.failed ?? 0 }}</strong>
+                </article>
+                <article>
+                  <span>入库行数</span>
+                  <strong>{{ ashareRowsText }}</strong>
+                </article>
+                <article>
+                  <span>数据源</span>
+                  <strong>{{ ashareFetch.source || '-' }}</strong>
+                </article>
+                <article>
+                  <span>运行日期</span>
+                  <strong>{{ ashareFetch.run_date || '-' }}</strong>
+                </article>
+                <article v-if="ashareFetch.latest_progress_line" class="wide">
+                  <span>最新进度</span>
+                  <strong>{{ ashareFetch.latest_progress_line }}</strong>
                 </article>
               </div>
             </el-card>
@@ -161,13 +206,13 @@
                     <p class="eyebrow">Signal Control</p>
                     <h2>今日核心出票与指令</h2>
                   </div>
-                  <el-tag effect="dark" type="primary">Forward Shadow</el-tag>
+                  <el-tag effect="dark" type="primary">Real Ledger</el-tag>
                 </div>
               </template>
 
               <div v-if="operationCards.length === 0" class="empty-panel">
                 <strong>暂无操作指令</strong>
-                <span>等待 14:50 真实快照锁定、09:25 T+1 开盘闭环、15:10 T+3 收盘结算自动写入。</span>
+                <span>等待 14:50 真实快照锁定、09:25 T+1 开盘闭环、15:35 5m 卖出闭环自动写入。</span>
               </div>
 
               <div v-else class="instruction-grid">
@@ -177,8 +222,25 @@
                     <strong :class="instructionClass(pick)">{{ instructionTitle(pick) }}</strong>
                   </header>
                   <p>
-                    <StockLink :code="pick.code" :name="pick.name" :label="pick.code" mono class="inline-stock-code" />
-                    <StockLink :code="pick.code" :name="pick.name" :label="pick.name" class="inline-stock-name" />
+                    <StockLink
+                      :code="pick.code"
+                      :name="pick.name"
+                      :label="pick.code"
+                      :buy-date="pick.selection_date || pick.date"
+                      :sell-date="pick.is_closed ? (pick.close_date || pick.exit_time || pick.close_time || pick.target_date) : ''"
+                      :strategy-type="pick.strategy_type"
+                      mono
+                      class="inline-stock-code"
+                    />
+                    <StockLink
+                      :code="pick.code"
+                      :name="pick.name"
+                      :label="pick.name"
+                      :buy-date="pick.selection_date || pick.date"
+                      :sell-date="pick.is_closed ? (pick.close_date || pick.exit_time || pick.close_time || pick.target_date) : ''"
+                      :strategy-type="pick.strategy_type"
+                      class="inline-stock-name"
+                    />
                   </p>
                   <small>{{ instructionBody(pick) }}</small>
                 </article>
@@ -215,6 +277,14 @@
                   <span>雷达缓存</span>
                   <strong>{{ radar.created_at || '无缓存' }}</strong>
                 </article>
+                <article>
+                  <span>生产模型</span>
+                  <strong :class="radarIsCleanForFrontend ? 'buy' : 'risk'">{{ radarCleanStateText }}</strong>
+                </article>
+                <article>
+                  <span>出票口径</span>
+                  <strong>{{ radarSelectionText }}</strong>
+                </article>
               </div>
             </el-card>
           </section>
@@ -222,7 +292,8 @@
           <section class="toolbar-panel">
             <div>
               <p class="eyebrow">Realtime Radar</p>
-              <h2>14:50 扫描结果</h2>
+              <h2>14:50 V6 扫描结果</h2>
+              <small class="toolbar-meta">{{ radarCleanText }}</small>
             </div>
             <div class="toolbar-actions">
               <el-button :loading="busy.refresh" @click="refreshAll">刷新状态</el-button>
@@ -230,7 +301,7 @@
             </div>
           </section>
 
-          <el-empty v-if="dashboardSignalRows.length === 0" class="radar-empty" description="空仓避险：当前没有达到动态底线的候选股" />
+          <el-empty v-if="dashboardSignalRows.length === 0" class="radar-empty" :description="radarEmptyText" />
 
           <section v-else class="dual-board">
             <SelectionTable
@@ -261,8 +332,25 @@
                 <div>
                   <p class="eyebrow">Ollama Risk Control</p>
                   <h2>
-                    <StockLink :code="selectedStock.code" :name="selectedStock.name" :label="selectedStock.code" mono class="heading-stock-code" />
-                    <StockLink :code="selectedStock.code" :name="selectedStock.name" :label="selectedStock.name" class="heading-stock-name" />
+                    <StockLink
+                      :code="selectedStock.code"
+                      :name="selectedStock.name"
+                      :label="selectedStock.code"
+                      :buy-date="selectedStock.selection_date || selectedStock.date"
+                      :sell-date="selectedStock.is_closed ? (selectedStock.close_date || selectedStock.exit_time || selectedStock.close_time || selectedStock.target_date) : ''"
+                      :strategy-type="selectedStock.strategy_type"
+                      mono
+                      class="heading-stock-code"
+                    />
+                    <StockLink
+                      :code="selectedStock.code"
+                      :name="selectedStock.name"
+                      :label="selectedStock.name"
+                      :buy-date="selectedStock.selection_date || selectedStock.date"
+                      :sell-date="selectedStock.is_closed ? (selectedStock.close_date || selectedStock.exit_time || selectedStock.close_time || selectedStock.target_date) : ''"
+                      :strategy-type="selectedStock.strategy_type"
+                      class="heading-stock-name"
+                    />
                   </h2>
                 </div>
                 <el-button type="primary" :loading="busy.analyze" @click="analyzeStock">运行风控</el-button>
@@ -289,6 +377,29 @@
         </section>
 
         <section v-show="activeSection === 'ledger'" class="page-stack">
+          <section class="sentinel-policy-strip">
+            <article>
+              <span>5m风控区间</span>
+              <strong>{{ sentinelPolicyRange }}</strong>
+              <small>{{ sentinelPolicyText }}</small>
+            </article>
+            <article>
+              <span>缓存覆盖</span>
+              <strong>{{ sentinelCoverageText }}</strong>
+              <small>{{ sentinelPolicyCacheText }}</small>
+            </article>
+            <article>
+              <span>已结算胜率</span>
+              <strong>{{ sentinelWinRateText }}</strong>
+              <small>{{ sentinelYieldText }}</small>
+            </article>
+            <article>
+              <span>账本模型口径</span>
+              <strong :class="ledgerModelClean ? 'buy' : 'risk'">{{ ledgerModelScopeText }}</strong>
+              <small>{{ ledgerModelFilterText }}</small>
+            </article>
+          </section>
+
           <section class="legion-grid">
             <el-card
               v-for="stat in strategyStats"
@@ -308,8 +419,8 @@
           </section>
 
           <SelectionTable
-            title="影子账本月度复盘"
-            eyebrow="Monthly Shadow Test"
+            title="真实账本数据"
+            eyebrow="Real Trading Ledger"
             :rows="dailyPicks.rows"
             mode="all"
             use-months
@@ -318,109 +429,204 @@
           />
         </section>
 
-        <section v-show="activeSection === 'validation'" class="validation-grid">
+        <section v-show="activeSection === 'backtest'" class="page-stack">
+          <section class="sentinel-policy-strip">
+            <article>
+              <span>回测区间</span>
+              <strong>{{ backtestPolicyRange }}</strong>
+              <small>{{ backtestPolicyText }}</small>
+            </article>
+            <article>
+              <span>完整5m覆盖</span>
+              <strong>{{ backtestCoverageText }}</strong>
+              <small>{{ backtestCacheText }}</small>
+            </article>
+            <article>
+              <span>已结算胜率</span>
+              <strong>{{ backtestWinRateText }}</strong>
+              <small>{{ backtestYieldText }}</small>
+            </article>
+            <article>
+              <span>策略契约</span>
+              <strong :class="backtestContractValid ? 'buy' : 'risk'">{{ backtestContractText }}</strong>
+              <small>{{ backtestContractHint }}</small>
+            </article>
+          </section>
+
+          <section class="legion-grid">
+            <el-card
+              v-for="stat in backtestStrategyStats"
+              :key="`backtest-${stat.strategy}`"
+              :class="['dark-card', 'legion-card', { 'strategy-disabled': stat.disabled }]"
+              shadow="never"
+            >
+              <span :class="strategyBadgeClass(stat.strategy)">{{ strategyLabel(stat.strategy) }}</span>
+              <strong>{{ stat.disabled ? '已暂停' : `回测 ${stat.count} 次` }}</strong>
+              <dl>
+                <div><dt>T+1胜率</dt><dd>{{ stat.t1WinRate }}</dd></div>
+                <div><dt>T+1均值</dt><dd :class="numberClass(stat.t1AvgRaw)">{{ stat.t1Avg }}</dd></div>
+                <div><dt>T+3胜率</dt><dd>{{ stat.t3WinRate }}</dd></div>
+                <div><dt>T+3均值</dt><dd :class="numberClass(stat.t3AvgRaw)">{{ stat.t3Avg }}</dd></div>
+              </dl>
+            </el-card>
+          </section>
+
+          <section class="toolbar-panel">
+            <div>
+              <p class="eyebrow">5m Simulation Ledger</p>
+              <h2>回测模拟数据</h2>
+              <small class="toolbar-meta">{{ backtestLedgerText }}</small>
+            </div>
+            <div class="toolbar-actions">
+              <el-button :loading="busy.backtest" @click="refreshBacktestLedger">按最新策略重算</el-button>
+            </div>
+          </section>
+
+          <SelectionTable
+            title="回测模拟数据"
+            eyebrow="Closed Covered 5m Simulation"
+            :rows="backtestLedger.rows"
+            mode="all"
+            use-months
+            :table-height="620"
+            @explain="openFactorExplain"
+          />
+        </section>
+
+        <section v-show="activeSection === 'pushplus'" class="page-stack pushplus-page">
+          <section class="sentinel-policy-strip">
+            <article>
+              <span>Token 总数</span>
+              <strong>{{ pushplusSummary.total_count || 0 }}</strong>
+              <small>数据库 {{ pushplusSummary.db_count || 0 }} / 环境兼容 {{ pushplusSummary.env_count || 0 }}</small>
+            </article>
+            <article>
+              <span>启用推送</span>
+              <strong :class="pushplusSummary.active_count > 0 ? 'buy' : 'risk'">{{ pushplusSummary.active_count || 0 }}</strong>
+              <small>发送任务会按启用 token 逐个推送</small>
+            </article>
+            <article>
+              <span>前端安全</span>
+              <strong>Masked</strong>
+              <small>页面不会返回或展示 token 明文</small>
+            </article>
+            <article>
+              <span>服务状态</span>
+              <strong :class="health?.pushplus?.ok ? 'buy' : 'risk'">{{ health?.pushplus?.ok ? 'Ready' : 'Critical' }}</strong>
+              <small>{{ health?.pushplus?.reason || '等待健康检查' }}</small>
+            </article>
+          </section>
+
+          <section class="pushplus-grid">
+            <el-card class="dark-card" shadow="never">
+              <template #header>
+                <div class="card-head">
+                  <div>
+                    <p class="eyebrow">Token Admin</p>
+                    <h2>{{ pushplusForm.id ? '编辑 PushPlus Token' : '新增 PushPlus Token' }}</h2>
+                  </div>
+                  <span class="terminal-chip">SQLite Managed</span>
+                </div>
+              </template>
+              <div class="pushplus-form">
+                <label>
+                  <span>名称</span>
+                  <el-input v-model="pushplusForm.name" placeholder="如 主账号 / 风控群 / 备用通知" />
+                </label>
+                <label>
+                  <span>{{ pushplusForm.id ? 'Token（留空则不修改）' : 'Token' }}</span>
+                  <el-input v-model="pushplusForm.token" show-password clearable placeholder="PushPlus token" />
+                </label>
+                <label>
+                  <span>备注</span>
+                  <el-input v-model="pushplusForm.note" type="textarea" :rows="3" placeholder="用途、接收人或维护说明" />
+                </label>
+                <div class="token-switch-row">
+                  <span>启用推送</span>
+                  <el-switch v-model="pushplusForm.enabled" />
+                </div>
+                <div class="toolbar-actions">
+                  <el-button type="primary" :loading="busy.pushplusSave" @click="savePushplusToken">
+                    {{ pushplusForm.id ? '保存修改' : '新增 Token' }}
+                  </el-button>
+                  <el-button @click="resetPushplusForm">清空</el-button>
+                </div>
+              </div>
+            </el-card>
+
+            <el-card class="dark-card" shadow="never">
+              <template #header>
+                <div class="card-head">
+                  <div>
+                    <p class="eyebrow">Broadcast Test</p>
+                    <h2>多 Token 测试推送</h2>
+                  </div>
+                  <el-button type="warning" plain :loading="busy.pushplusTest" @click="testPushplusBroadcast">发送测试</el-button>
+                </div>
+              </template>
+              <div class="pushplus-form">
+                <label>
+                  <span>标题</span>
+                  <el-input v-model="pushplusTestForm.title" />
+                </label>
+                <label>
+                  <span>内容</span>
+                  <el-input v-model="pushplusTestForm.content" type="textarea" :rows="5" />
+                </label>
+                <pre v-if="pushplusTestResult" class="account-preview">{{ pushplusTestResult }}</pre>
+              </div>
+            </el-card>
+          </section>
+
           <el-card class="dark-card" shadow="never">
             <template #header>
               <div class="card-head">
                 <div>
-                  <p class="eyebrow">15:05 Market Sync</p>
-                  <h2>数据同步</h2>
+                  <p class="eyebrow">Managed Tokens</p>
+                  <h2>PushPlus Token 列表</h2>
                 </div>
-                <el-button type="primary" :loading="busy.sync" @click="syncData">立即同步</el-button>
+                <el-button :loading="busy.pushplusLoad" @click="loadPushplusTokens">刷新</el-button>
               </div>
             </template>
-
-            <el-descriptions :column="2" border class="dark-desc">
-              <el-descriptions-item label="状态">{{ latestSync?.status || '-' }}</el-descriptions-item>
-              <el-descriptions-item label="完成时间">{{ latestSync?.finished_at || '-' }}</el-descriptions-item>
-              <el-descriptions-item label="同步日期">{{ latestSync?.sync_date || '-' }}</el-descriptions-item>
-              <el-descriptions-item label="新增/更新">{{ latestSync ? `${latestSync.inserted_rows} / ${latestSync.updated_rows}` : '-' }}</el-descriptions-item>
-            </el-descriptions>
-            <pre v-if="syncResult">{{ syncResult }}</pre>
-          </el-card>
-
-          <el-card class="dark-card" shadow="never">
-            <template #header>
-              <div class="card-head">
-                <div>
-                  <p class="eyebrow">Triple Validation</p>
-                  <h2>校验报告</h2>
-                </div>
-                <el-button :loading="busy.validate" @click="runValidation">运行校验</el-button>
-              </div>
-            </template>
-
-            <div class="validation-form">
-              <el-input-number v-model="validationSample" :min="1" :max="10000" />
-              <el-checkbox v-model="sourceCheck">实时源交叉核验</el-checkbox>
-            </div>
-
-            <div class="pulse-grid validation-summary">
-              <article><span>状态</span><strong>{{ validation.status || overview.latest_report?.status || '-' }}</strong></article>
-              <article><span>错误</span><strong>{{ validation.summary?.error_count ?? overview.latest_report?.summary?.error_count ?? 0 }}</strong></article>
-              <article><span>警告</span><strong>{{ validation.summary?.warning_count ?? overview.latest_report?.summary?.warning_count ?? 0 }}</strong></article>
-              <article><span>最新日期</span><strong>{{ overview.latest_report?.summary?.latest_date_seen || overview.max_date || '-' }}</strong></article>
-            </div>
-          </el-card>
-
-          <el-card class="dark-card fetch-card" shadow="never">
-            <template #header>
-              <div class="card-head">
-                <div>
-                  <p class="eyebrow">JQDATA COLD 5M</p>
-                  <h2>聚宽每日获取情况</h2>
-                </div>
-                <span :class="['terminal-chip', fetchStatusClass(jqFetch)]">{{ jqFetch.status_label || '-' }}</span>
-              </div>
-            </template>
-            <div class="pulse-grid fetch-summary">
-              <article><span>最后获取</span><strong>{{ jqFetch.last_fetch_at || '-' }}</strong></article>
-              <article><span>本次新增</span><strong>{{ fetchCoverage(jqFetch) }}</strong></article>
-              <article><span>失败</span><strong>{{ jqFetch.failed ?? 0 }}</strong></article>
-              <article><span>已处理股票</span><strong>{{ jqProcessedCodesText }}</strong></article>
-              <article><span>完成月切片</span><strong>{{ jqSegmentProgressText }}</strong></article>
-              <article><span>约等价完成</span><strong>{{ jqEquivalentProgressText }}</strong></article>
-              <article :title="jqFetch.eta_basis || ''"><span>预计捕捉完成</span><strong>{{ jqEtaText }}</strong></article>
-              <article><span>剩余额度</span><strong>{{ jqQuotaText }}</strong></article>
-              <article><span>数据区间</span><strong>{{ jqFetch.range || '-' }}</strong></article>
-            </div>
-          </el-card>
-
-          <el-card class="dark-card fetch-card" shadow="never">
-            <template #header>
-              <div class="card-head">
-                <div>
-                  <p class="eyebrow">ASHARE HOT 5M</p>
-                  <h2>Ashare 每日获取情况</h2>
-                </div>
-                <span :class="['terminal-chip', fetchStatusClass(ashareFetch)]">{{ ashareFetch.status_label || '-' }}</span>
-              </div>
-            </template>
-            <div class="pulse-grid fetch-summary">
-              <article><span>最后获取</span><strong>{{ ashareFetch.last_fetch_at || '-' }}</strong></article>
-              <article><span>今日覆盖</span><strong>{{ fetchCoverage(ashareFetch) }}</strong></article>
-              <article><span>失败</span><strong>{{ ashareFetch.failed ?? 0 }}</strong></article>
-              <article><span>每股拉取</span><strong>{{ ashareFetch.count ? `${ashareFetch.count} 根` : '-' }}</strong></article>
-              <article><span>数据源</span><strong>{{ ashareFetch.source || '-' }}</strong></article>
-              <article><span>运行日期</span><strong>{{ ashareFetch.run_date || '-' }}</strong></article>
-            </div>
-          </el-card>
-
-          <el-card class="dark-card full-span" shadow="never">
-            <template #header>
-              <div class="card-head">
-                <div>
-                  <p class="eyebrow">Data Assets</p>
-                  <h2>数据资产</h2>
-                </div>
-              </div>
-            </template>
-            <div class="asset-grid">
-              <article><span>股票数</span><strong>{{ overview.stock_count ?? 0 }}</strong></article>
-              <article><span>K 线行数</span><strong>{{ overview.rows_count ?? 0 }}</strong></article>
-              <article><span>Parquet 文件</span><strong>{{ overview.parquet_files ?? 0 }}</strong></article>
-              <article><span>日期范围</span><strong>{{ overview.min_date || '-' }} / {{ overview.max_date || '-' }}</strong></article>
-            </div>
+            <el-table :data="pushplusTokens.rows" class="dark-table" height="460" empty-text="暂无 PushPlus token">
+              <el-table-column prop="name" label="名称" min-width="160" fixed />
+              <el-table-column label="Token" min-width="150">
+                <template #default="{ row }">
+                  <strong class="token-mask">{{ row.token_mask }}</strong>
+                  <small>{{ row.source === 'env' ? '.env 兼容' : 'DB 管理' }}</small>
+                </template>
+              </el-table-column>
+              <el-table-column label="启用" width="100" align="center">
+                <template #default="{ row }">
+                  <el-switch
+                    v-model="row.enabled"
+                    :disabled="!row.editable"
+                    @change="togglePushplusToken(row)"
+                  />
+                </template>
+              </el-table-column>
+              <el-table-column prop="note" label="备注" min-width="180" show-overflow-tooltip />
+              <el-table-column label="最近状态" min-width="160">
+                <template #default="{ row }">
+                  <span :class="row.last_status === 'sent' ? 'buy' : row.last_status === 'failed' ? 'risk' : ''">
+                    {{ row.last_status || '-' }}
+                  </span>
+                  <small v-if="row.last_error" class="token-error">{{ row.last_error }}</small>
+                </template>
+              </el-table-column>
+              <el-table-column label="计数" width="120">
+                <template #default="{ row }">{{ row.send_count ?? '-' }} / {{ row.fail_count ?? '-' }}</template>
+              </el-table-column>
+              <el-table-column prop="updated_at" label="更新时间" width="168" />
+              <el-table-column label="操作" width="150" fixed="right">
+                <template #default="{ row }">
+                  <div class="row-actions">
+                    <el-button link type="primary" :disabled="!row.editable" @click="editPushplusToken(row)">编辑</el-button>
+                    <el-button link type="danger" :disabled="!row.editable" @click="deletePushplusTokenRow(row)">删除</el-button>
+                  </div>
+                </template>
+              </el-table-column>
+            </el-table>
           </el-card>
         </section>
 
@@ -571,6 +777,8 @@
             :key="stockMarketViewerKey"
             :stock-code="stockMarketCode"
             :stock-request="stockMarketRequest"
+            :stock-anchor-date="stockMarketAnchorDate"
+            :stock-sell-date="stockMarketSellDate"
           />
         </section>
       </main>
@@ -593,6 +801,9 @@
               :code="factorExplain.row.code"
               :name="factorExplain.row.name"
               :label="factorExplain.row.code"
+              :buy-date="factorExplain.row.selection_date || factorExplain.row.date"
+              :sell-date="factorExplain.row.is_closed ? (factorExplain.row.close_date || factorExplain.row.exit_time || factorExplain.row.close_time || factorExplain.row.target_date) : ''"
+              :strategy-type="factorExplain.row.strategy_type"
               mono
               class="heading-stock-code"
             />
@@ -726,7 +937,7 @@
 </template>
 
 <script setup>
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { computed, nextTick, onBeforeUnmount, onMounted, provide, reactive, ref, watch } from 'vue'
 import Sidebar from './components/Sidebar.vue'
 import StatsHeader from './components/StatsHeader.vue'
@@ -737,14 +948,46 @@ import { resolveInitialSection } from './router'
 
 const API = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
 const IGNORE_BROKER_CASH_FOR_TEST_ORDER = false
-const VALID_SECTIONS = new Set(['dashboard', 'ledger', 'validation', 'minute', 'account'])
+const VALID_SECTIONS = new Set(['dashboard', 'ledger', 'backtest', 'pushplus', 'minute', 'account'])
+const V6_SNIPER_MODEL_VERSION = 'v6_0_extreme_burst'
+const V6_SNIPER_SELECTION_MODE = 'v6_extreme_top1_p60'
 
 const activeSection = ref(resolveInitialSection())
 const overview = ref({})
 const health = ref({})
 const ollamaStatus = ref({})
-const radar = reactive({ rows: [], created_at: '', model_status: '', market_gate: null })
-const dailyPicks = reactive({ rows: [] })
+const radar = reactive({
+  rows: [],
+  created_at: '',
+  model_status: '',
+  market_gate: null,
+  productionModel: null,
+  selectionMode: '',
+  threshold: null,
+  topK: 1,
+  cache: null,
+  cleanDataContract: null,
+})
+const LEDGER_DISPLAY_START_DATE = '2025-01-01'
+const LEDGER_DISPLAY_COVERAGE = 'complete_5m'
+const dailyPicks = reactive({
+  rows: [],
+  activeStrategyTypes: [],
+  pausedStrategyTypes: [],
+  exitPolicy: {},
+  ledgerScope: {},
+  ledgerModelScope: {},
+  productionModel: null,
+})
+const backtestLedger = reactive({
+  rows: [],
+  summary: {},
+  scope: {},
+  cache: {},
+  strategyContract: {},
+  status: '',
+  error: '',
+})
 const sniperStatus = reactive({ enabled: false })
 const shadowAccount = reactive({
   available_cash: 0,
@@ -760,40 +1003,50 @@ const brokerSnapshot = reactive({
   positions: [],
   synced_at: '',
 })
-const validation = reactive({ status: '', summary: null, issues: [] })
 const minuteFetch = ref({})
 const message = reactive({ text: '', type: 'info', scope: 'global' })
+const pushplusTokens = reactive({ rows: [], summary: {}, security: {} })
+const pushplusForm = reactive({ id: null, name: '', token: '', enabled: true, note: '' })
+const pushplusTestForm = reactive({
+  title: 'PushPlus token 测试',
+  content: '量化工作站 PushPlus 多 token 推送测试。',
+})
+const pushplusTestResult = ref('')
 const selectedStock = ref(null)
 const factorExplain = reactive({ visible: false, loading: false, error: '', payload: null, row: null })
 const stockMarketCode = ref('')
+const stockMarketAnchorDate = ref('')
+const stockMarketSellDate = ref('')
 const stockMarketRequest = ref(0)
 const analysis = ref(null)
-const syncResult = ref('')
-const validationSample = ref(200)
-const sourceCheck = ref(false)
 const accountForm = reactive({ available_cash: 30000 })
 const testOrderForm = reactive({ code: '002747', name: '埃斯顿', current_price: 19.2, position_pct: 0.25 })
 const testOrderPreview = ref('')
 const busy = reactive({
   refresh: false,
   scan: false,
-  sync: false,
-  validate: false,
   analyze: false,
   sniper: false,
   accountCash: false,
   accountSync: false,
   accountPreview: false,
   accountTest: false,
+  backtest: false,
+  minuteFetch: false,
+  pushplusLoad: false,
+  pushplusSave: false,
+  pushplusDelete: false,
+  pushplusTest: false,
 })
 
 const currentTitle = computed(() => ({
-  dashboard: '四大军团统一总览',
-  ledger: 'Shadow Test 影子账本',
-  validation: 'Validation 数据校验',
+  dashboard: '多策略统一总览',
+  ledger: '真实账本数据',
+  backtest: '回测模拟数据',
+  pushplus: 'PushPlus Token 管理',
   minute: '单票行情库',
   account: 'V5.0 资金池',
-})[activeSection.value] || '四大军团统一总览')
+})[activeSection.value] || '多策略统一总览')
 
 watch(activeSection, (section) => {
   if (!VALID_SECTIONS.has(section)) activeSection.value = 'dashboard'
@@ -807,55 +1060,180 @@ const localDateText = (date = new Date()) => {
 }
 const todayText = computed(() => localDateText())
 const todayLockedCount = computed(() => dailyPicks.rows.filter((row) => row.selection_date === todayText.value).length)
-const operationCards = computed(() => dailyPicks.rows.filter((row) => row.selection_date === todayText.value).slice(0, 6))
-const jqFetch = computed(() => minuteFetch.value.jq || {})
+const sentinelPolicyRange = computed(() => {
+  const start = dailyPicks.ledgerScope?.start_date || LEDGER_DISPLAY_START_DATE
+  const end = dailyPicks.exitPolicy?.coverage_end_date || '-'
+  return `${start} / ${end}`
+})
+const sentinelPolicyText = computed(() => {
+  const start = dailyPicks.ledgerScope?.start_date || LEDGER_DISPLAY_START_DATE
+  return `${start} 起真实账本保留未结算，已结算按完整 5m 过滤`
+})
+const sentinelCoverageText = computed(() => {
+  const display = Number(dailyPicks.ledgerScope?.display_count)
+  const covered = Number(dailyPicks.exitPolicy?.sentinel_covered_count)
+  if (!Number.isFinite(display) && !Number.isFinite(covered)) return '-'
+  return `${Number.isFinite(display) ? display : 0} / ${Number.isFinite(covered) ? covered : 0}`
+})
+const sentinelPolicyCacheText = computed(() => {
+  const display = Number(dailyPicks.ledgerScope?.display_count)
+  const removedSt = Number(dailyPicks.ledgerScope?.removed_st_limit_up)
+  const incomplete = Number(dailyPicks.exitPolicy?.sentinel_incomplete_count)
+  const parts = []
+  if (Number.isFinite(display)) parts.push(`展示 ${display}`)
+  if (Number.isFinite(removedSt) && removedSt > 0) parts.push(`过滤ST涨停 ${removedSt}`)
+  if (Number.isFinite(incomplete)) parts.push(`未完整 ${incomplete}`)
+  return parts.join(' / ') || '等待 5m 回放缓存'
+})
+const sentinelWinRateText = computed(() => pct(dailyPicks.exitPolicy?.sentinel_win_rate))
+const sentinelYieldText = computed(() => {
+  const evaluated = Number(dailyPicks.exitPolicy?.sentinel_evaluated_count)
+  const meanYield = pct(dailyPicks.exitPolicy?.sentinel_mean_yield)
+  return `${Number.isFinite(evaluated) ? `${evaluated} 笔` : '-'} / 均值 ${meanYield}`
+})
+const ledgerModelClean = computed(() => String(dailyPicks.ledgerModelScope?.model_version || '') === V6_SNIPER_MODEL_VERSION)
+const ledgerModelScopeText = computed(() => {
+  const scope = dailyPicks.ledgerModelScope || {}
+  const threshold = Number(scope.threshold ?? 0.6)
+  return `${scope.model_label || 'V6.0 极寒爆发大脑'} P>=${Number.isFinite(threshold) ? threshold.toFixed(2) : '0.60'}`
+})
+const ledgerModelFilterText = computed(() => {
+  const removed = Number(dailyPicks.ledgerModelScope?.removed_legacy_global || 0)
+  return removed > 0 ? `旧全局狙击隔离 ${removed} 条` : '旧全局狙击未混入当前视图'
+})
+const backtestLedgerText = computed(() => {
+  const summary = backtestLedger.summary || {}
+  const scope = backtestLedger.scope || {}
+  const cache = backtestLedger.cache || {}
+  if (cache.refresh_required || cache.stale || backtestLedger.status === 'cache_stale') {
+    const cached = Number(summary.cached_row_count ?? cache.cached_row_count)
+    const cachedText = Number.isFinite(cached) && cached > 0 ? ` / 旧缓存 ${cached} 条未展示` : ''
+    return `${scope.start_date || LEDGER_DISPLAY_START_DATE} 起 / 5m回测缓存需按最新策略重算${cachedText}`
+  }
+  const trades = Number(summary.evaluated_count ?? summary.closed_count ?? backtestLedger.rows.length)
+  const cacheStatus = backtestLedger.cache?.hit === false ? '已重算' : '缓存有效'
+  return `${scope.start_date || LEDGER_DISPLAY_START_DATE} 起 / 完整5m已结算 ${Number.isFinite(trades) ? trades : 0} 笔 / 胜率 ${pct(summary.win_rate)} / 均值 ${pct(summary.mean_yield)} / ${cacheStatus}`
+})
+const backtestPolicyRange = computed(() => {
+  const scope = backtestLedger.scope || {}
+  return `${scope.start_date || LEDGER_DISPLAY_START_DATE} / ${scope.end_date || '-'}`
+})
+const backtestPolicyText = computed(() => {
+  const sourceStart = backtestLedger.scope?.source_start_date || '-'
+  return `源缓存 ${sourceStart} 起，页面只取完整 5m 已结算样本`
+})
+const backtestCoverageText = computed(() => {
+  const summary = backtestLedger.summary || {}
+  const covered = Number(summary.covered_count ?? backtestLedger.rows.length)
+  const total = Number(summary.total_count ?? backtestLedger.rows.length)
+  if (!Number.isFinite(covered) && !Number.isFinite(total)) return '-'
+  return `${Number.isFinite(covered) ? covered : 0} / ${Number.isFinite(total) ? total : 0}`
+})
+const backtestCacheText = computed(() => {
+  const cache = backtestLedger.cache || {}
+  if (cache.refresh_required || cache.stale || backtestLedger.status === 'cache_stale') {
+    return `缓存需重算 / ${cache.signature_status || 'stale'}`
+  }
+  const status = cache.hit === false ? '已重算' : cache.signature_status === 'valid' ? '签名有效' : '等待缓存校验'
+  const created = cache.created_at ? ` / ${cache.created_at}` : ''
+  return `${status}${created}`
+})
+const backtestWinRateText = computed(() => pct(backtestLedger.summary?.win_rate))
+const backtestYieldText = computed(() => {
+  const evaluated = Number(backtestLedger.summary?.evaluated_count ?? backtestLedger.rows.length)
+  return `${Number.isFinite(evaluated) ? `${evaluated} 笔` : '-'} / 均值 ${pct(backtestLedger.summary?.mean_yield)}`
+})
+const backtestContractValid = computed(() => backtestLedger.cache?.signature_status === 'valid')
+const backtestContractText = computed(() => {
+  if (backtestLedger.cache?.refresh_required || backtestLedger.cache?.stale) return '缓存需重算'
+  const contract = backtestLedger.strategyContract || {}
+  const sell = contract.sell_strategy_contract || {}
+  return sell.schema_version || contract.schema_version || '等待策略契约'
+})
+const backtestContractHint = computed(() => {
+  if (backtestLedger.error) return backtestLedger.error
+  const cache = backtestLedger.cache || {}
+  if ((cache.refresh_required || cache.stale || backtestLedger.status === 'cache_stale') && cache.signature_reason) {
+    return cache.signature_reason
+  }
+  const active = backtestLedger.strategyContract?.active_strategy_types
+  return Array.isArray(active) && active.length ? active.join(' / ') : '策略实装或阈值变化后自动重算'
+})
+const pushplusSummary = computed(() => pushplusTokens.summary || {})
 const ashareFetch = computed(() => minuteFetch.value.ashare || {})
-const jqProcessedCodesText = computed(() => {
-  const codes = Number(jqFetch.value.progress_codes)
-  const universe = Number(jqFetch.value.universe)
-  if (!Number.isFinite(codes)) return '-'
-  if (!Number.isFinite(universe) || universe <= 0) return `${codes} 股`
-  return `${codes} / ${universe} 股`
+const ashareRowsText = computed(() => {
+  const dailyRows = Number(ashareFetch.value.daily_rows)
+  const m5Rows = Number(ashareFetch.value.m5_rows)
+  const total = Number(ashareFetch.value.count)
+  if (Number.isFinite(dailyRows) || Number.isFinite(m5Rows)) {
+    return `日线 ${Number.isFinite(dailyRows) ? dailyRows : 0} / 5m ${Number.isFinite(m5Rows) ? m5Rows : 0}`
+  }
+  return Number.isFinite(total) && total > 0 ? `${total} 行` : '-'
 })
-const jqSegmentProgressText = computed(() => {
-  const done = Number(jqFetch.value.progress_segments)
-  const total = Number(jqFetch.value.progress_total_segments)
-  const perCode = Number(jqFetch.value.progress_segments_per_code)
-  if (!Number.isFinite(done)) return '-'
-  const base = Number.isFinite(total) && total > 0 ? `${done} / ${total} 段` : `${done} 段`
-  return Number.isFinite(perCode) && perCode > 0 ? `${base} (${perCode}段/股)` : base
+const ashareFetchCoverageText = computed(() => {
+  if (ashareFetch.value.status === 'running' || ashareFetch.value.status === 'starting') {
+    const current = Number(ashareFetch.value.progress_current)
+    const total = Number(ashareFetch.value.progress_total || ashareFetch.value.universe)
+    const pctValue = Number(ashareFetch.value.progress_pct)
+    if (Number.isFinite(current) && Number.isFinite(total) && total > 0) {
+      const pctText = Number.isFinite(pctValue) ? ` (${pctValue.toFixed(1)}%)` : ''
+      return `${current} / ${total}${pctText}`
+    }
+  }
+  return fetchCoverage(ashareFetch.value)
 })
-const jqEquivalentProgressText = computed(() => {
-  const equivalentCodes = Number(jqFetch.value.progress_equivalent_codes)
-  const universe = Number(jqFetch.value.universe)
-  const pct = Number(jqFetch.value.progress_pct)
-  if (!Number.isFinite(equivalentCodes)) return '-'
-  const base = Number.isFinite(universe) && universe > 0
-    ? `${equivalentCodes.toFixed(1)} / ${universe} 股`
-    : `${equivalentCodes.toFixed(1)} 股`
-  return Number.isFinite(pct) ? `${base} (${pct.toFixed(2)}%)` : base
+const ashareFetchLastText = computed(() => {
+  if (ashareFetch.value.status === 'running' || ashareFetch.value.status === 'starting') {
+    const code = ashareFetch.value.progress_code
+    return code ? `${ashareFetch.value.last_fetch_at || '-'} / ${code}` : (ashareFetch.value.last_fetch_at || '-')
+  }
+  return ashareFetch.value.last_fetch_at || '-'
 })
-const jqEtaText = computed(() => {
-  const date = jqFetch.value.eta_date
-  const days = Number(jqFetch.value.eta_days)
-  const rate = Number(jqFetch.value.eta_rate_codes_per_day)
-  if (!date) return '-'
-  const dayText = Number.isFinite(days) ? ` / ${days} 天` : ''
-  const rateText = Number.isFinite(rate) ? ` @${rate.toFixed(1)}股/天` : ''
-  return `${date}${dayText}${rateText}`
-})
-const jqQuotaText = computed(() => {
-  const spare = Number(jqFetch.value.quota_spare)
-  const total = Number(jqFetch.value.quota_total)
-  if (!Number.isFinite(spare) || !Number.isFinite(total) || total <= 0) return '-'
-  return `${spare} / ${total}`
-})
+const operationCards = computed(() => dailyPicks.rows.filter((row) => row.selection_date === todayText.value).slice(0, 6))
 const visibleMessage = computed(() => {
   if (!message.text) return false
   if (message.scope === 'minute') return activeSection.value === 'minute'
   return true
 })
 const sniperStatusText = computed(() => sniperStatus.enabled ? '🔥 实盘狙击 (物理外挂已解锁)' : '🤫 静默盯盘 (外挂已上锁)')
+const radarProductionModel = computed(() => radar.productionModel || {})
+const radarThresholdText = computed(() => {
+  const threshold = Number(radar.threshold ?? radarProductionModel.value.threshold)
+  return Number.isFinite(threshold) ? threshold.toFixed(2) : '0.60'
+})
+const radarTopKText = computed(() => Number(radar.topK || radarProductionModel.value.top_k || 1))
+const radarIsCleanForFrontend = computed(() => {
+  if (radar.cache?.stale) return false
+  const model = radarProductionModel.value
+  const version = String(model.version || '')
+  const selectionMode = String(radar.selectionMode || model.selection_mode || '')
+  return version === V6_SNIPER_MODEL_VERSION && selectionMode === V6_SNIPER_SELECTION_MODE
+})
+const radarModelLabel = computed(() => radarProductionModel.value.label || 'V6.0 极寒爆发大脑')
+const v6SniperContractText = computed(() => `全局狙击只读 V6 生产模型；每日 Top${radarTopKText.value} 且 P>=${radarThresholdText.value}`)
+const radarSelectionText = computed(() => `Top${radarTopKText.value} / P>=${radarThresholdText.value}`)
+const radarCleanStateText = computed(() => {
+  if (radar.cache?.stale) return '旧缓存已隔离'
+  return radarIsCleanForFrontend.value ? 'V6 Clean' : '等待V6扫描'
+})
+const radarModelPathText = computed(() => {
+  const path = String(radarProductionModel.value.path || '')
+  if (!path) return '-'
+  const parts = path.split('/')
+  return parts.slice(-3).join('/')
+})
+const radarCleanText = computed(() => {
+  if (radar.cache?.stale) return `已拦截旧缓存：${radar.cache.reason || '非 V6 生产扫描'}`
+  if (radarIsCleanForFrontend.value) {
+    return `${radarModelPathText.value}；${radarSelectionText.value}；旧 V4 锁榜/回放不进入本面板`
+  }
+  return '等待 V6 生产扫描；旧模型缓存不会展示'
+})
+const radarEmptyText = computed(() => {
+  if (radar.cache?.stale) return '旧模型缓存已被隔离，点击实时预测生成 V6 干净候选。'
+  if (!radarIsCleanForFrontend.value) return '等待 V6 生产扫描，当前不展示旧口径候选。'
+  return `空仓避险：当前没有达到 Top${radarTopKText.value} 且 P>=${radarThresholdText.value} 的 V6 候选股。`
+})
 const positionRows = computed(() => shadowAccount.positions || [])
 const tradeRecordRows = computed(() => (shadowAccount.trade_records || []).filter((row) => row.status === 'broker_confirmed'))
 const latestTradeText = computed(() => tradeRecordRows.value[0]?.fired_at || '-')
@@ -865,32 +1243,79 @@ const accountSummaryCards = computed(() => [
   { label: '影子总资产', value: money(shadowAccount.total_shadow_equity), hint: '可用资金 + 锁定成本', className: '' },
   { label: '最近成交', value: latestTradeText.value, hint: `${tradeRecordRows.value.length} 条 broker confirmed 流水`, className: 'risk' },
 ])
-const LEGION_STRATEGIES = ['全局动量狙击', '右侧主升浪', '中线超跌反转', '尾盘突破']
-const PAUSED_STRATEGIES = new Set(['右侧主升浪', '中线超跌反转'])
+const DEFAULT_STRATEGY_ORDER = ['全局动量狙击', '尾盘突破', '尾盘突破-ST特情']
+const DEFAULT_PAUSED_STRATEGIES = ['右侧主升浪', '中线超跌反转']
+const pausedStrategySet = computed(() =>
+  new Set(dailyPicks.pausedStrategyTypes?.length ? dailyPicks.pausedStrategyTypes : DEFAULT_PAUSED_STRATEGIES)
+)
+const strategyRank = (strategy) => ({
+  全局动量狙击: 40,
+  右侧主升浪: 30,
+  中线超跌反转: 20,
+  尾盘突破: 10,
+  '尾盘突破-ST特情': 8,
+  首阴低吸: 0,
+})[strategy] ?? -10
+const pushStrategy = (target, seen, strategy) => {
+  const value = String(strategy || '').trim()
+  if (!value || seen.has(value)) return
+  seen.add(value)
+  target.push(value)
+}
+const strategyListFromBackend = computed(() => {
+  const strategies = []
+  const seen = new Set()
+  const configured = dailyPicks.activeStrategyTypes?.length ? dailyPicks.activeStrategyTypes : DEFAULT_STRATEGY_ORDER
+  configured.forEach((strategy) => pushStrategy(strategies, seen, strategy))
+  dailyPicks.rows.forEach((row) => pushStrategy(strategies, seen, row?.strategy_type))
+  normalizedRadarRows.value.forEach((row) => pushStrategy(strategies, seen, row?.strategy_type || row?.raw?.winner?.strategy_type))
+  return strategies.sort((a, b) => strategyRank(b) - strategyRank(a) || a.localeCompare(b, 'zh-Hans-CN'))
+})
+const backtestPausedStrategySet = computed(() => {
+  const paused = backtestLedger.strategyContract?.paused_strategy_types
+  return new Set(Array.isArray(paused) && paused.length ? paused : DEFAULT_PAUSED_STRATEGIES)
+})
+const backtestStrategyList = computed(() => {
+  const strategies = []
+  const seen = new Set()
+  const contract = backtestLedger.strategyContract || {}
+  const configured =
+    contract.display_strategy_types ||
+    contract.active_strategy_types ||
+    DEFAULT_STRATEGY_ORDER
+  if (Array.isArray(configured)) configured.forEach((strategy) => pushStrategy(strategies, seen, strategy))
+  backtestLedger.rows.forEach((row) => pushStrategy(strategies, seen, row?.strategy_type))
+  return strategies.sort((a, b) => strategyRank(b) - strategyRank(a) || a.localeCompare(b, 'zh-Hans-CN'))
+})
 
-const normalizedRadarRows = computed(() => radar.rows.map((row) => {
-  const winner = row?.raw?.winner || {}
-  return {
-    ...row,
-    id: row?.id || `radar-${row?.strategy_type || '全局动量狙击'}-${row?.code || winner.code || ''}`,
-    selection_date: row?.selection_date || row?.date || todayText.value,
-    strategy_type: row?.strategy_type || winner.strategy_type || '全局动量狙击',
-    snapshot_price: row?.snapshot_price ?? row?.selection_price ?? row?.price ?? row?.close ?? winner.price,
-    selection_price: row?.selection_price ?? row?.price ?? row?.close ?? winner.price,
-    selection_change: row?.selection_change ?? row?.change ?? row?.pct_chg ?? winner.change,
-    composite_score: row?.composite_score ?? row?.global_probability_pct ?? row?.probability_pct ?? winner.composite_score,
-    sort_score: row?.sort_score ?? row?.global_probability_pct ?? row?.probability_pct ?? winner.sort_score,
-    expected_t3_max_gain_pct: row?.expected_t3_max_gain_pct ?? row?.expected_premium ?? winner.expected_t3_max_gain_pct ?? winner.expected_premium,
-    theme_name: row?.core_theme ?? row?.theme_name ?? winner.core_theme ?? winner.theme_name ?? '-',
-    theme_pct_chg_3: row?.theme_momentum ?? row?.theme_pct_chg_3 ?? winner.theme_momentum ?? winner.theme_pct_chg_3 ?? null,
-    core_theme: row?.core_theme ?? row?.theme_name ?? winner.core_theme ?? winner.theme_name ?? '',
-    theme_momentum: row?.theme_momentum ?? row?.theme_pct_chg_3 ?? winner.theme_momentum ?? winner.theme_pct_chg_3 ?? null,
-    suggested_position: row?.suggested_position ?? winner.suggested_position ?? null,
-    selection_tier: row?.selection_tier ?? winner.selection_tier ?? 'base',
-    risk_warning: row?.risk_warning ?? winner.risk_warning ?? '',
-    status: row?.status || 'radar_preview',
-  }
-}).filter((row) => !PAUSED_STRATEGIES.has(row.strategy_type)))
+const normalizedRadarRows = computed(() => {
+  if (!radarIsCleanForFrontend.value) return []
+  return radar.rows.map((row) => {
+    const winner = row?.raw?.winner || {}
+    return {
+      ...row,
+      id: row?.id || `radar-${row?.strategy_type || '全局动量狙击'}-${row?.code || winner.code || ''}`,
+      selection_date: row?.selection_date || row?.date || todayText.value,
+      strategy_type: row?.strategy_type || winner.strategy_type || '全局动量狙击',
+      snapshot_price: row?.snapshot_price ?? row?.selection_price ?? row?.price ?? row?.close ?? winner.price,
+      selection_price: row?.selection_price ?? row?.price ?? row?.close ?? winner.price,
+      selection_change: row?.selection_change ?? row?.change ?? row?.pct_chg ?? winner.change,
+      composite_score: row?.composite_score ?? row?.global_probability_pct ?? row?.probability_pct ?? winner.composite_score,
+      sort_score: row?.sort_score ?? row?.global_probability_pct ?? row?.probability_pct ?? winner.sort_score,
+      expected_t3_max_gain_pct: row?.expected_t3_max_gain_pct ?? row?.expected_premium ?? winner.expected_t3_max_gain_pct ?? winner.expected_premium,
+      theme_name: row?.core_theme ?? row?.theme_name ?? winner.core_theme ?? winner.theme_name ?? '-',
+      theme_pct_chg_3: row?.theme_momentum ?? row?.theme_pct_chg_3 ?? winner.theme_momentum ?? winner.theme_pct_chg_3 ?? null,
+      core_theme: row?.core_theme ?? row?.theme_name ?? winner.core_theme ?? winner.theme_name ?? '',
+      theme_momentum: row?.theme_momentum ?? row?.theme_pct_chg_3 ?? winner.theme_momentum ?? winner.theme_pct_chg_3 ?? null,
+      suggested_position: row?.suggested_position ?? winner.suggested_position ?? null,
+      selection_tier: row?.selection_tier ?? winner.selection_tier ?? 'base',
+      risk_warning: row?.risk_warning ?? winner.risk_warning ?? '',
+      model_version: row?.model_version || radarProductionModel.value.version || V6_SNIPER_MODEL_VERSION,
+      selection_mode: row?.selection_mode || radar.selectionMode || radarProductionModel.value.selection_mode || V6_SNIPER_SELECTION_MODE,
+      status: row?.status || 'radar_preview',
+    }
+  })
+})
 
 const dashboardSignalRows = computed(() => {
   const merged = []
@@ -906,15 +1331,14 @@ const dashboardSignalRows = computed(() => {
   return merged
 })
 
-const strategyStats = computed(() => LEGION_STRATEGIES.map((strategy) => {
-  const disabled = PAUSED_STRATEGIES.has(strategy)
-  const rows = disabled ? [] : dailyPicks.rows.filter((row) => row.strategy_type === strategy)
+const summarizeStrategyRows = (sourceRows, strategy, pausedSet) => {
+  const rows = sourceRows.filter((row) => row.strategy_type === strategy)
   const t1 = metricSummary(rows.map(t1ResultValue).filter((value) => value !== null))
   const t3 = metricSummary(rows.map(t3CloseResultValue).filter((value) => value !== null))
   return {
     strategy,
     isSwing: isSwingStrategy(strategy),
-    disabled,
+    disabled: pausedSet.has(strategy) && rows.length === 0,
     count: rows.length,
     openCount: rows.filter((row) => !row.is_closed).length,
     t1Count: t1.count,
@@ -927,12 +1351,18 @@ const strategyStats = computed(() => LEGION_STRATEGIES.map((strategy) => {
     t3Avg: t3.avg,
     t3WinRateWidth: t3.count ? t3.width : t1.width,
   }
-}))
+}
+const strategyStats = computed(() =>
+  strategyListFromBackend.value.map((strategy) => summarizeStrategyRows(dailyPicks.rows, strategy, pausedStrategySet.value))
+)
+const backtestStrategyStats = computed(() =>
+  backtestStrategyList.value.map((strategy) => summarizeStrategyRows(backtestLedger.rows, strategy, backtestPausedStrategySet.value))
+)
 const dataPipelineNodes = computed(() => [
   {
     phase: '15:15',
     name: '5m 热数据归档',
-    detail: '盘后随日线同步节奏，腾讯/Ashare 最近 100 根 5m K 线增量 upsert 到 Parquet',
+    detail: '盘后随日线同步节奏，腾讯/Ashare 5m K 线增量 upsert 到 SQLite 统一表',
   },
   {
     phase: '14:30',
@@ -941,8 +1371,8 @@ const dataPipelineNodes = computed(() => [
   },
   {
     phase: '14:50',
-    name: '四军团雷达',
-    detail: '四大核心军团同台竞技，统一 14:50 快照价',
+    name: 'V6 狙击雷达',
+    detail: '全局狙击只接 V6 极寒爆发模型；尾盘突破与 ST 特情仍按独立口径 Top1',
   },
   {
     phase: '15:05',
@@ -954,13 +1384,17 @@ const sentinelTimeline = [
   { time: '09:16', name: '竞价预热观察', desc: '读取腾讯虚拟匹配价，只推送不写库' },
   { time: '09:21', name: '撤单关闭审计', desc: '虚拟溢价大偏离时预警或超预期提示' },
   { time: '09:25', name: 'T+1 开盘闭环', desc: '尾盘突破从 14:50 买入，T+1 开盘价卖出结算' },
-  { time: '15:10', name: 'T+3 收盘结算', desc: '波段策略只按目标交易日 15:00 收盘价闭环' },
+  { time: '15:35', name: '5m 卖出闭环', desc: '真实账本闭环；回测卡片只展示已结算完整 5m 样本' },
   { time: '14:50', name: '多轨出票推送', desc: 'XGBoost 后接 AI 右脑，再推送 PushPlus' },
 ]
 const aiStatusText = computed(() => ollamaStatus.value?.ok ? 'Ollama Online' : 'Ollama Watch')
 const ollamaModelText = computed(() => ollamaStatus.value?.model || radar.model_status?.match(/qwen[^; ]+|deepseek[^; ]+/)?.[0] || 'qwen2.5:14b')
 const latePullTrapText = computed(() => '4.00%')
-const stockMarketViewerKey = computed(() => stockMarketCode.value ? `${stockMarketCode.value}-${stockMarketRequest.value}` : 'default')
+const stockMarketViewerKey = computed(() =>
+  stockMarketCode.value
+    ? `${stockMarketCode.value}-${stockMarketAnchorDate.value || 'latest'}-${stockMarketSellDate.value || 'open'}-${stockMarketRequest.value}`
+    : 'default'
+)
 const factorExplainTitle = computed(() => {
   const payload = factorExplain.payload
   const row = factorExplain.row || {}
@@ -1126,16 +1560,33 @@ const factorInfo = (label, description, group) => ({
 })
 
 const normalizeStockCode = (value) => String(value || '').replace(/\D/g, '').slice(-6)
+const normalizeAnchorDate = (value) => {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  const compact = raw.match(/^(\d{4})(\d{2})(\d{2})/)
+  if (compact) return `${compact[1]}-${compact[2]}-${compact[3]}`
+  const dashed = raw.match(/^(\d{4})[-/](\d{2})[-/](\d{2})/)
+  if (dashed) return `${dashed[1]}-${dashed[2]}-${dashed[3]}`
+  return raw.slice(0, 10)
+}
 const openStockMarket = async (stock) => {
   const clean = normalizeStockCode(stock?.code)
   if (clean.length !== 6) {
     setMessage(`无法跳转行情库：非法股票代码 ${stock?.code || '-'}`, 'error')
     return
   }
+  const anchorDate = normalizeAnchorDate(stock?.buy_date || stock?.selection_date || stock?.date || stock?.anchor_date)
+  const sellDate = normalizeAnchorDate(stock?.sell_date || stock?.close_date || stock?.exit_time || stock?.close_time)
   stockMarketCode.value = clean
+  stockMarketAnchorDate.value = anchorDate
+  stockMarketSellDate.value = sellDate
   stockMarketRequest.value += 1
   activeSection.value = 'minute'
-  setMessage(`已跳转到行情库：${stock?.name || clean}(${clean})。`, 'info', 'minute')
+  const dateParts = []
+  if (anchorDate) dateParts.push(`买入日 ${anchorDate}`)
+  if (sellDate) dateParts.push(`卖出日 ${sellDate}`)
+  const anchorText = dateParts.length ? `，已定位${dateParts.join(' / ')}` : ''
+  setMessage(`已跳转到行情库：${stock?.name || clean}(${clean})${anchorText}。`, 'info', 'minute')
   await nextTick()
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
@@ -1179,19 +1630,30 @@ const setMessage = (text, type = 'info', scope = 'global') => {
 const refreshAll = async () => {
   busy.refresh = true
   try {
-    await Promise.all([
-      loadHealth(),
-      loadOllamaStatus(),
-      loadOverview(),
-      loadRadarCache(),
-      loadDailyPicks(),
-      loadMinuteFetchStatus(),
-      loadSniperStatus(),
-      loadShadowAccount(),
-    ])
-    setMessage('工作站状态已刷新。')
+    const tasks = [
+      { label: '健康状态', run: loadHealth },
+      { label: 'Ollama', run: loadOllamaStatus },
+      { label: '总览', run: loadOverview },
+      { label: '策略缓存', run: loadRadarCache },
+      { label: '真实账本', run: loadDailyPicks },
+      { label: '回测模拟', run: () => loadBacktestLedger() },
+      { label: 'Ashare获取', run: loadMinuteFetchStatus },
+      { label: 'PushPlus', run: loadPushplusTokens },
+      { label: '保险匣', run: loadSniperStatus },
+      { label: '资金池', run: loadShadowAccount },
+    ]
+    const results = await Promise.allSettled(tasks.map((task) => task.run()))
+    const failed = results
+      .map((result, index) => ({ result, task: tasks[index] }))
+      .filter(({ result }) => result.status === 'rejected')
+      .map(({ result, task }) => `${task.label}: ${formatApiError(result.reason)}`)
+    if (failed.length) {
+      setMessage(`部分刷新失败：${failed.slice(0, 2).join('；')}${failed.length > 2 ? `；另 ${failed.length - 2} 项` : ''}`, 'warning')
+    } else {
+      setMessage('工作站状态已刷新。')
+    }
   } catch (error) {
-    setMessage(`刷新失败：${error.message}`, 'error')
+    setMessage(`刷新失败：${formatApiError(error)}`, 'error')
   } finally {
     busy.refresh = false
   }
@@ -1214,7 +1676,126 @@ const loadOverview = async () => {
   overview.value = await request('/api/overview')
 }
 const loadMinuteFetchStatus = async () => {
-  minuteFetch.value = await request('/api/data/minute-fetch/status')
+  busy.minuteFetch = true
+  try {
+    minuteFetch.value = await request('/api/data/minute-fetch/status')
+  } finally {
+    busy.minuteFetch = false
+  }
+}
+const loadPushplusTokens = async () => {
+  busy.pushplusLoad = true
+  try {
+    const data = await request('/api/pushplus/tokens')
+    pushplusTokens.rows = data.tokens || []
+    pushplusTokens.summary = data.summary || {}
+    pushplusTokens.security = data.security || {}
+  } finally {
+    busy.pushplusLoad = false
+  }
+}
+const resetPushplusForm = () => {
+  pushplusForm.id = null
+  pushplusForm.name = ''
+  pushplusForm.token = ''
+  pushplusForm.enabled = true
+  pushplusForm.note = ''
+}
+const editPushplusToken = (row) => {
+  pushplusForm.id = row.id
+  pushplusForm.name = row.name || ''
+  pushplusForm.token = ''
+  pushplusForm.enabled = Boolean(row.enabled)
+  pushplusForm.note = row.note || ''
+}
+const savePushplusToken = async () => {
+  busy.pushplusSave = true
+  try {
+    const payload = {
+      name: pushplusForm.name,
+      enabled: pushplusForm.enabled,
+      note: pushplusForm.note,
+    }
+    if (pushplusForm.token) payload.token = pushplusForm.token
+    const isEdit = Boolean(pushplusForm.id)
+    if (!isEdit) payload.token = pushplusForm.token
+    await request(isEdit ? `/api/pushplus/tokens/${pushplusForm.id}` : '/api/pushplus/tokens', {
+      method: isEdit ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    ElMessage.success(isEdit ? 'PushPlus token 已更新' : 'PushPlus token 已新增')
+    resetPushplusForm()
+    await loadPushplusTokens()
+    await loadHealth()
+  } catch (error) {
+    ElMessage.error(`PushPlus token 保存失败：${formatApiError(error)}`)
+  } finally {
+    busy.pushplusSave = false
+  }
+}
+const togglePushplusToken = async (row) => {
+  if (!row.editable) return
+  try {
+    await request(`/api/pushplus/tokens/${row.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: Boolean(row.enabled) }),
+    })
+    await loadPushplusTokens()
+    await loadHealth()
+  } catch (error) {
+    ElMessage.error(`PushPlus token 状态更新失败：${formatApiError(error)}`)
+    await loadPushplusTokens()
+  }
+}
+const deletePushplusTokenRow = async (row) => {
+  if (!row.editable) return
+  try {
+    await ElMessageBox.confirm(`删除 PushPlus token：${row.name}？`, '确认删除', {
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+  } catch {
+    return
+  }
+  busy.pushplusDelete = true
+  try {
+    await request(`/api/pushplus/tokens/${row.id}`, { method: 'DELETE' })
+    ElMessage.success('PushPlus token 已删除')
+    if (pushplusForm.id === row.id) resetPushplusForm()
+    await loadPushplusTokens()
+    await loadHealth()
+  } catch (error) {
+    ElMessage.error(`PushPlus token 删除失败：${formatApiError(error)}`)
+  } finally {
+    busy.pushplusDelete = false
+  }
+}
+const testPushplusBroadcast = async () => {
+  busy.pushplusTest = true
+  try {
+    const data = await request('/api/pushplus/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(pushplusTestForm),
+    })
+    pushplusTestResult.value = JSON.stringify(data.pushplus || data, null, 2)
+    await loadPushplusTokens()
+    await loadHealth()
+    if (data.status === 'sent') {
+      ElMessage.success(`PushPlus 测试发送成功：${data.pushplus?.sent_count || 0}/${data.pushplus?.token_count || 0}`)
+    } else if (data.status === 'partial') {
+      ElMessage.warning(`PushPlus 部分成功：${data.pushplus?.sent_count || 0}/${data.pushplus?.token_count || 0}`)
+    } else {
+      ElMessage.error(`PushPlus 测试未送达：${data.pushplus?.error || data.status}`)
+    }
+  } catch (error) {
+    ElMessage.error(`PushPlus 测试失败：${formatApiError(error)}`)
+  } finally {
+    busy.pushplusTest = false
+  }
 }
 const loadSniperStatus = async () => {
   try {
@@ -1356,6 +1937,12 @@ const applyRadarPayload = (data) => {
   radar.created_at = data.created_at || ''
   radar.model_status = data.model_status || data.strategy || ''
   radar.market_gate = data.market_gate || null
+  radar.productionModel = data.production_model || data.model || null
+  radar.selectionMode = data.selection_mode || data.production_model?.selection_mode || data.model?.selection_mode || ''
+  radar.threshold = data.threshold ?? data.production_model?.threshold ?? data.model?.threshold ?? null
+  radar.topK = data.top_k ?? data.production_model?.top_k ?? data.model?.top_k ?? 1
+  radar.cache = data.cache || null
+  radar.cleanDataContract = data.clean_data_contract || data.production_model?.data_contract || data.model?.data_contract || null
 }
 const loadRadarCache = async () => {
   const data = await request('/api/radar/cache')
@@ -1481,9 +2068,10 @@ const normalizeBacktestLedgerRows = (rows) => (rows || []).map((row, index) => {
 const normalizeSentinel5mLedgerRows = (rows) => (rows || []).map((row, index) => {
   const selectionDate = row.selection_date || row.date || ''
   const winner = row.raw?.winner || {}
-  const closeReturn = row.close_return_pct ?? row.yield_pct ?? row.t3_settlement_return_pct ?? winner.t3_settlement_return_pct ?? null
-  const closePrice = row.close_price ?? row.exit_price ?? row.t3_settlement_price ?? winner.t3_settlement_price ?? null
-  const closeDate = row.close_date || String(row.close_time || row.exit_time || '').slice(0, 10) || row.target_date || ''
+  const isClosed = Boolean(row.is_closed || row.coverage_status === 'covered')
+  const closeReturn = isClosed ? (row.close_return_pct ?? row.yield_pct ?? row.t3_settlement_return_pct ?? winner.t3_settlement_return_pct ?? null) : null
+  const closePrice = isClosed ? (row.close_price ?? row.exit_price ?? row.t3_settlement_price ?? winner.t3_settlement_price ?? null) : null
+  const closeDate = isClosed ? (row.close_date || String(row.close_time || row.exit_time || '').slice(0, 10) || '') : ''
   const position = row.suggested_position ?? winner.suggested_position ?? (row.selection_tier === 'dynamic_floor' ? 0.05 : 0.10)
   const coreTheme = row.core_theme || row.theme_name || winner.core_theme || winner.theme_name || ''
   const sellStrategy = row.sell_strategy || row.exit_policy || winner.sell_strategy || winner.exit_policy || row.close_reason || row.exit_reason || ''
@@ -1501,7 +2089,7 @@ const normalizeSentinel5mLedgerRows = (rows) => (rows || []).map((row, index) =>
     selection_price: row.selection_price ?? row.snapshot_price ?? row.price ?? row.cost_price,
     expected_t3_max_gain_pct: row.expected_t3_max_gain_pct ?? winner.expected_t3_max_gain_pct ?? row.expected_premium ?? null,
     close_date: closeDate,
-    close_reason: row.close_reason || row.exit_reason || '5m回放结算',
+    close_reason: row.close_reason || row.exit_reason || (isClosed ? '5m回放结算' : ''),
     sell_strategy: sellStrategy,
     exit_policy: sellStrategy,
     close_price: closePrice,
@@ -1509,8 +2097,8 @@ const normalizeSentinel5mLedgerRows = (rows) => (rows || []).map((row, index) =>
     t3_settlement_price: row.t3_settlement_price ?? closePrice,
     t3_settlement_return_pct: row.t3_settlement_return_pct ?? closeReturn,
     t3_max_gain_pct: row.t3_max_gain_pct ?? row.highest_gain_pct ?? winner.t3_max_gain_pct ?? null,
-    is_closed: closeReturn !== null && closeReturn !== undefined,
-    status: row.status || 'sentinel_5m_closed',
+    is_closed: isClosed && closeReturn !== null && closeReturn !== undefined,
+    status: row.status || (isClosed ? 'sentinel_5m_closed' : 'sentinel_5m_incomplete'),
     suggested_position: position,
     selection_tier: row.selection_tier || row.tier || winner.selection_tier || 'base',
     core_theme: coreTheme,
@@ -1543,30 +2131,43 @@ const normalizeSentinel5mLedgerRows = (rows) => (rows || []).map((row, index) =>
 const normalizeDailyPickLedgerRows = (rows) => (rows || []).map((row, index) => {
   const selectionDate = row.selection_date || row.date || ''
   const winner = row.raw?.winner || {}
+  const isClosed = Boolean(row.is_closed)
   const closeReturn =
-    row.close_return_pct ??
-    row.t3_settlement_return_pct ??
-    winner.t3_settlement_return_pct ??
-    row.t3_close_return_pct ??
-    winner.t3_close_return_pct ??
-    row.open_premium ??
-    null
+    isClosed
+      ? (
+          row.close_return_pct ??
+          row.t3_settlement_return_pct ??
+          winner.t3_settlement_return_pct ??
+          row.t3_close_return_pct ??
+          winner.t3_close_return_pct ??
+          row.open_premium ??
+          null
+        )
+      : null
   const closePrice =
-    row.close_price ??
-    row.t3_settlement_price ??
-    winner.t3_settlement_price ??
-    row.t3_close ??
-    winner.t3_close ??
-    row.open_price ??
-    row.next_open ??
-    null
+    isClosed
+      ? (
+          row.close_price ??
+          row.t3_settlement_price ??
+          winner.t3_settlement_price ??
+          row.t3_close ??
+          winner.t3_close ??
+          row.open_price ??
+          row.next_open ??
+          null
+        )
+      : null
   const closeDate =
-    row.close_date ||
-    String(row.close_time || row.close_checked_at || '').slice(0, 10) ||
-    row.target_date ||
-    winner.t3_exit_date ||
-    winner.next_date ||
-    ''
+    isClosed
+      ? (
+          row.close_date ||
+          String(row.close_time || row.close_checked_at || '').slice(0, 10) ||
+          row.target_date ||
+          winner.t3_exit_date ||
+          winner.next_date ||
+          ''
+        )
+      : ''
   const position = row.suggested_position ?? winner.suggested_position ?? (row.selection_tier === 'dynamic_floor' ? 0.05 : null)
   const selectionTier = row.selection_tier || row.tier || winner.selection_tier || 'base'
   const coreTheme = row.core_theme || row.theme_name || winner.core_theme || winner.theme_name || ''
@@ -1580,7 +2181,6 @@ const normalizeDailyPickLedgerRows = (rows) => (rows || []).map((row, index) => 
     winner.exit_policy ||
     row.close_reason ||
     (row.is_closed ? '真实账本闭环结算' : (isSwingStrategy(row) ? '真实账本T+3观察中' : '真实账本T+1待闭环'))
-  const isClosed = Boolean(row.is_closed || (closeReturn !== null && closeReturn !== undefined))
   return {
     ...row,
     id: row.id || `daily-pick-${selectionDate}-${row.strategy_type}-${row.code}-${index}`,
@@ -1604,6 +2204,9 @@ const normalizeDailyPickLedgerRows = (rows) => (rows || []).map((row, index) => 
     suggested_position: position,
     selection_tier: selectionTier,
     tier: row.tier || selectionTier,
+    model_version: row.model_version || winner.model_version || row.production_model?.version || winner.production_model?.version || '',
+    selection_mode: row.selection_mode || winner.selection_mode || row.production_model?.selection_mode || winner.production_model?.selection_mode || '',
+    production_model: row.production_model || winner.production_model || row.raw?.production_model || null,
     core_theme: coreTheme,
     theme_name: coreTheme,
     theme_momentum: themeMomentum,
@@ -1617,6 +2220,9 @@ const normalizeDailyPickLedgerRows = (rows) => (rows || []).map((row, index) => 
         ...row,
         suggested_position: position,
         selection_tier: selectionTier,
+        model_version: row.model_version || winner.model_version || row.production_model?.version || winner.production_model?.version || '',
+        selection_mode: row.selection_mode || winner.selection_mode || row.production_model?.selection_mode || winner.production_model?.selection_mode || '',
+        production_model: row.production_model || winner.production_model || row.raw?.production_model || null,
         core_theme: coreTheme,
         theme_name: coreTheme,
         theme_momentum: themeMomentum,
@@ -1631,51 +2237,76 @@ const normalizeDailyPickLedgerRows = (rows) => (rows || []).map((row, index) => 
   }
 })
 const loadDailyPicks = async () => {
-  const data = await request('/api/daily-picks?view=strategy_top1&limit=1000')
+  const query = new URLSearchParams({
+    view: 'strategy_top1',
+    limit: '10000',
+    start_date: LEDGER_DISPLAY_START_DATE,
+    coverage: LEDGER_DISPLAY_COVERAGE,
+    exclude_st_limit_up: 'true',
+    _: String(Date.now()),
+  })
+  const data = await request(`/api/daily-picks?${query.toString()}`)
+  const strategyTypes =
+    data.strategy_contract?.display_strategy_types ??
+    data.strategy_types ??
+    data.active_strategy_types
+  dailyPicks.activeStrategyTypes = Array.isArray(strategyTypes) ? strategyTypes : []
+  const pausedStrategyTypes =
+    data.strategy_contract?.paused_strategy_types ??
+    data.paused_strategy_types
+  dailyPicks.pausedStrategyTypes = Array.isArray(pausedStrategyTypes) ? pausedStrategyTypes : []
+  dailyPicks.exitPolicy = data.exit_policy || {}
+  dailyPicks.ledgerScope = data.ledger_scope || {}
+  dailyPicks.ledgerModelScope = data.ledger_model_scope || {}
+  dailyPicks.productionModel = data.production_model || null
   dailyPicks.rows = normalizeDailyPickLedgerRows(
-    (data.rows || []).filter((row) => !PAUSED_STRATEGIES.has(row.strategy_type))
+    data.rows || []
   )
+}
+const loadBacktestLedger = async (refresh = false) => {
+  const query = new URLSearchParams({
+    start_date: LEDGER_DISPLAY_START_DATE,
+    refresh: refresh ? 'true' : 'false',
+    _: String(Date.now()),
+  })
+  let data
+  try {
+    data = await request(`/api/backtest/sentinel-5m-ledger?${query.toString()}`)
+  } catch (error) {
+    backtestLedger.status = 'error'
+    backtestLedger.error = formatApiError(error)
+    throw error
+  }
+  backtestLedger.summary = data.summary || {}
+  backtestLedger.scope = data.scope || {}
+  backtestLedger.cache = data.cache || {}
+  backtestLedger.strategyContract = data.strategy_contract || {}
+  backtestLedger.status = data.status || ''
+  const stale = data.status === 'cache_stale' || data.cache?.refresh_required || data.cache?.stale
+  backtestLedger.error = stale ? (data.summary?.cache_invalid_reason || data.cache?.signature_reason || '') : ''
+  backtestLedger.rows = normalizeSentinel5mLedgerRows(data.rows || [])
+}
+const refreshBacktestLedger = async () => {
+  busy.backtest = true
+  try {
+    await loadBacktestLedger(true)
+    ElMessage.success('回测数据已按最新买卖策略重算')
+  } catch (error) {
+    ElMessage.error(`回测数据重算失败：${formatApiError(error)}`)
+  } finally {
+    busy.backtest = false
+  }
 }
 const scanRadar = async () => {
   busy.scan = true
   try {
     const data = await request('/api/radar/scan?limit=1')
     applyRadarPayload(data)
-    setMessage(radar.rows.length ? `扫描完成：${radar.rows.length} 条候选。` : '扫描完成：当前空仓避险。')
+    setMessage(normalizedRadarRows.value.length ? `V6 扫描完成：${normalizedRadarRows.value.length} 条干净候选。` : 'V6 扫描完成：当前空仓避险。')
   } catch (error) {
     setMessage(`实时预测失败：${error.message}`, 'error')
   } finally {
     busy.scan = false
-  }
-}
-const syncData = async () => {
-  busy.sync = true
-  try {
-    const data = await request('/api/data/market-sync/run', { method: 'POST' })
-    syncResult.value = JSON.stringify(data, null, 2)
-    setMessage(`同步完成：有效 ${data.valid_rows} 行，新增 ${data.inserted_rows}，更新 ${data.updated_rows}。`)
-    await loadOverview()
-    await loadMinuteFetchStatus()
-  } catch (error) {
-    setMessage(`同步失败：${error.message}`, 'error')
-  } finally {
-    busy.sync = false
-  }
-}
-const runValidation = async () => {
-  busy.validate = true
-  try {
-    const data = await request(`/api/data/validate?sample=${validationSample.value}&source_check=${sourceCheck.value}`, { method: 'POST' })
-    validation.status = data.status || ''
-    validation.summary = data.summary || null
-    validation.issues = data.issues || []
-    setMessage(`校验完成：${validation.status || '-'}。`, validation.status === 'pass' ? 'info' : 'error')
-    await loadOverview()
-    await loadMinuteFetchStatus()
-  } catch (error) {
-    setMessage(`校验失败：${error.message}`, 'error')
-  } finally {
-    busy.validate = false
   }
 }
 const analyzeStock = async () => {
@@ -1757,8 +2388,10 @@ const fetchCoverage = (item) => {
   return `${Number.isFinite(success) ? success : 0} / ${Number.isFinite(universe) ? universe : 0}`
 }
 const fetchStatusClass = (item) => {
-  if (item?.status === 'success' || item?.status === 'quota_exhausted') return 'chip-hot'
+  if (item?.status === 'running' || item?.status === 'starting') return 'chip-running'
+  if (item?.status === 'success' || item?.status === 'quota_exhausted') return 'chip-ok'
   if (item?.status === 'partial') return 'chip-warn'
+  if (item?.status === 'fail' || item?.status === 'failed') return 'chip-risk'
   return ''
 }
 const amountYi = (value) => {
@@ -1781,24 +2414,24 @@ const numberClass = (value) => {
   return num > 0 ? 'buy' : 'risk'
 }
 const strategyLabel = (strategy) => {
-  if (strategy === '全局动量狙击') return '全局狙击'
+  if (strategy === '全局动量狙击') return 'V6全局狙击'
+  if (strategy === '尾盘突破-ST特情') return 'ST特情'
   if (strategy === '右侧主升浪') return '顺势主升浪'
   if (strategy === '中线超跌反转') return '中线超跌反转'
   if (strategy === '首阴低吸') return '低吸影子'
-  return '尾盘突破'
+  return strategy || '未知策略'
 }
-const strategyBadgeClass = (strategy) => [
-  'strategy-badge',
-  strategy === '全局动量狙击'
-    ? 'strategy-global'
-    : strategy === '右侧主升浪'
-      ? 'strategy-main'
-      : strategy === '中线超跌反转'
-        ? 'strategy-reversal'
-        : strategy === '首阴低吸'
-          ? 'strategy-dip'
-          : 'strategy-breakout',
-]
+const strategyBadgeClass = (strategy) => {
+  const value = String(strategy || '')
+  let variant = 'strategy-generic'
+  if (value.includes('全局')) variant = 'strategy-global'
+  else if (value.toUpperCase().includes('ST')) variant = 'strategy-st'
+  else if (value.includes('主升')) variant = 'strategy-main'
+  else if (value.includes('超跌') || value.includes('反转')) variant = 'strategy-reversal'
+  else if (value.includes('低吸')) variant = 'strategy-dip'
+  else if (value.includes('尾盘') || value.includes('突破')) variant = 'strategy-breakout'
+  return ['strategy-badge', variant]
+}
 const instructionTitle = (pick) => {
   const actual = Number(pick.open_premium)
   if (isSwingStrategy(pick)) {
@@ -1923,7 +2556,7 @@ onBeforeUnmount(() => {
 
 .dashboard-grid,
 .dual-board,
-.validation-grid,
+.pushplus-grid,
 .account-control-grid,
 .account-table-grid {
   display: grid;
@@ -1960,6 +2593,37 @@ onBeforeUnmount(() => {
   margin: 6px 0 4px;
   color: var(--terminal-text);
   font-size: 1.12rem;
+  font-weight: 950;
+  overflow-wrap: anywhere;
+}
+
+.sentinel-policy-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.sentinel-policy-strip article {
+  min-width: 0;
+  border: 1px solid rgba(24, 144, 255, 0.22);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: rgba(15, 23, 42, 0.52);
+}
+
+.sentinel-policy-strip span,
+.sentinel-policy-strip small {
+  display: block;
+  color: #7f8da4;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.sentinel-policy-strip strong {
+  display: block;
+  margin: 4px 0;
+  color: var(--terminal-text);
+  font-size: 0.95rem;
   font-weight: 950;
   overflow-wrap: anywhere;
 }
@@ -2069,16 +2733,43 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
+.card-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .chip-hot {
   border-color: rgba(245, 34, 45, 0.36);
   background: rgba(245, 34, 45, 0.12);
   color: #ff7875;
 }
 
+.chip-ok {
+  border-color: rgba(82, 196, 26, 0.38);
+  background: rgba(82, 196, 26, 0.12);
+  color: #73d13d;
+}
+
 .chip-warn {
   border-color: rgba(245, 197, 66, 0.4);
   background: rgba(245, 197, 66, 0.12);
   color: #f5c542;
+}
+
+.chip-risk {
+  border-color: rgba(245, 34, 45, 0.4);
+  background: rgba(245, 34, 45, 0.12);
+  color: #ff7875;
+}
+
+.chip-running {
+  border-color: rgba(64, 169, 255, 0.52);
+  background: rgba(24, 144, 255, 0.16);
+  color: #91d5ff;
+  box-shadow: 0 0 0 1px rgba(64, 169, 255, 0.1), 0 0 18px rgba(24, 144, 255, 0.18);
 }
 
 .matrix-list,
@@ -2266,6 +2957,16 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
 }
 
+.toolbar-meta {
+  display: block;
+  max-width: 720px;
+  margin-top: 4px;
+  color: #7f8aa1;
+  font-size: 0.75rem;
+  font-weight: 800;
+  line-height: 1.45;
+}
+
 .eyebrow {
   margin: 0 0 4px;
   color: #6f7d95;
@@ -2424,12 +3125,50 @@ h2 {
   font-weight: 900;
 }
 
-.validation-form {
+.pushplus-form {
+  display: grid;
+  gap: 12px;
+}
+
+.pushplus-form label {
+  display: grid;
+  gap: 6px;
+  color: #a8b3c7;
+  font-size: 0.78rem;
+  font-weight: 900;
+}
+
+.token-switch-row {
   display: flex;
+  justify-content: space-between;
   align-items: center;
   gap: 12px;
-  margin-bottom: 14px;
-  flex-wrap: wrap;
+  border: 1px solid var(--terminal-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #11131a;
+  color: #a8b3c7;
+  font-weight: 900;
+}
+
+.token-mask,
+.token-error {
+  display: block;
+}
+
+.token-mask {
+  color: var(--terminal-text);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+}
+
+.token-error {
+  margin-top: 4px;
+  color: #ff7875;
+  font-size: 0.72rem;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .dark-desc {
@@ -2484,10 +3223,22 @@ pre {
   color: #ff7875;
 }
 
+.strategy-st {
+  border: 1px solid rgba(250, 219, 20, 0.5);
+  background: rgba(250, 219, 20, 0.14);
+  color: #ffec3d;
+}
+
 .strategy-dip {
   border: 1px solid rgba(250, 140, 22, 0.45);
   background: rgba(250, 140, 22, 0.16);
   color: #ffc069;
+}
+
+.strategy-generic {
+  border: 1px solid rgba(140, 150, 170, 0.42);
+  background: rgba(140, 150, 170, 0.14);
+  color: #c7d0df;
 }
 
 .mono {
@@ -2701,10 +3452,11 @@ pre {
   .main-grid,
   .dashboard-grid,
   .dual-board,
-  .validation-grid,
+  .pushplus-grid,
   .account-control-grid,
   .account-table-grid,
   .account-summary-grid,
+  .sentinel-policy-strip,
   .legion-grid,
   .cockpit-grid,
   .command-strip {

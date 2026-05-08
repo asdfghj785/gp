@@ -6,7 +6,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 import pandas as pd
 from tqdm import tqdm
@@ -17,23 +17,57 @@ if str(BASE_DIR) not in sys.path:
 
 from quant_core.config import MIN_KLINE_DIR
 from quant_core.data_pipeline.tencent_engine import get_tencent_m5, normalize_stock_code, tencent_symbol
-from quant_core.utils.stock_filter import get_core_universe
+from quant_core.storage import upsert_minute_5m_rows
+from quant_core.utils.stock_filter import get_core_universe, get_st_universe
 
 
-def daily_ashare_archive(limit: Optional[int] = None, sleep_seconds: float = 0.1, count: int = 100) -> dict[str, object]:
+def load_codes(codes: Optional[Sequence[str]] = None, code_file: Optional[Union[str, Path]] = None) -> list[str]:
+    items: list[str] = []
+    if codes:
+        items.extend(codes)
+    if code_file:
+        text = Path(code_file).read_text(encoding="utf-8")
+        items.extend(item for line in text.splitlines() for item in line.replace(",", " ").split())
+    return sorted({normalize_stock_code(item) for item in items if str(item).strip()})
+
+
+def daily_ashare_archive(
+    limit: Optional[int] = None,
+    sleep_seconds: float = 0.1,
+    count: int = 100,
+    include_st: bool = False,
+    st_only: bool = False,
+    codes: Optional[Sequence[str]] = None,
+    code_file: Optional[Union[str, Path]] = None,
+) -> dict[str, object]:
     """Archive daily hot 5m samples via Ashare-style Tencent API."""
     started_at = datetime.now().isoformat(timespec="seconds")
-    universe = get_core_universe()
+    explicit_codes = load_codes(codes=codes, code_file=code_file)
+    if explicit_codes:
+        universe = explicit_codes
+        universe_mode = "explicit"
+    elif st_only:
+        universe = get_st_universe()
+        universe_mode = "st_only"
+    elif include_st:
+        universe = sorted(set(get_core_universe()) | set(get_st_universe()))
+        universe_mode = "core_plus_st"
+    else:
+        universe = get_core_universe()
+        universe_mode = "core"
     if limit:
         universe = universe[: max(0, int(limit))]
     success = 0
+    db_upserted = 0
     errors: list[dict[str, str]] = []
     for code in tqdm(universe, desc="ashare/tencent hot 5m", unit="stock"):
         try:
             rows = _fetch_today_rows(code, count=count)
+            minute_db_rows = upsert_minute_5m_rows(rows, source="tencent.m5", code=code) if not rows.empty else 0
             written = _upsert_rows(code, rows)
+            db_upserted += int(minute_db_rows)
             success += 1
-            tqdm.write(f"[hot-archive] {code} rows={len(rows)} total={written}")
+            tqdm.write(f"[hot-archive] {code} rows={len(rows)} db={minute_db_rows} parquet_total={written}")
         except Exception as exc:
             errors.append({"code": code, "error": str(exc)})
             tqdm.write(f"[hot-archive][ERROR] {code}: {exc}")
@@ -48,6 +82,10 @@ def daily_ashare_archive(limit: Optional[int] = None, sleep_seconds: float = 0.1
         "success": success,
         "failed": len(errors),
         "count": count,
+        "minute_db_upserted_rows": db_upserted,
+        "include_st": include_st,
+        "st_only": st_only,
+        "universe_mode": universe_mode,
         "errors": errors[:50],
     }
     summary_path = MIN_KLINE_DIR / "5m" / f"ashare_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -145,8 +183,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--limit", type=int, help="只归档前 N 只，用于测试")
     parser.add_argument("--count", type=int, default=100, help="每只股票拉取最近 N 根 5 分钟线，默认 100")
     parser.add_argument("--sleep", type=float, default=0.1, help="每只股票之间休眠秒数")
+    parser.add_argument("--include-st", action="store_true", help="在核心股票池外追加 ST/*ST 股票")
+    parser.add_argument("--st-only", action="store_true", help="只归档 ST/*ST 股票")
+    parser.add_argument("--code", action="append", dest="codes", help="显式股票代码，可重复传入")
+    parser.add_argument("--code-file", help="股票代码文件，支持空格/逗号/换行分隔")
     args = parser.parse_args(argv)
-    print(daily_ashare_archive(limit=args.limit, sleep_seconds=args.sleep, count=args.count))
+    print(daily_ashare_archive(
+        limit=args.limit,
+        sleep_seconds=args.sleep,
+        count=args.count,
+        include_st=args.include_st,
+        st_only=args.st_only,
+        codes=args.codes,
+        code_file=args.code_file,
+    ))
 
 
 if __name__ == "__main__":

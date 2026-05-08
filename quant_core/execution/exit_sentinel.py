@@ -17,7 +17,10 @@ from quant_core.execution.pushplus_tasks import send_pushplus
 
 
 BREAKOUT_STRATEGY = "尾盘突破"
-SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪", "全局动量狙击"}
+ST_BREAKOUT_STRATEGY = "尾盘突破-ST特情"
+GLOBAL_MOMENTUM_STRATEGY = "全局动量狙击"
+SENTINEL_5M_STRATEGY_TYPES = {BREAKOUT_STRATEGY, ST_BREAKOUT_STRATEGY, GLOBAL_MOMENTUM_STRATEGY}
+SWING_STRATEGY_TYPES = {"中线超跌反转", "右侧主升浪", GLOBAL_MOMENTUM_STRATEGY}
 AUCTION_WARNING_LOW_PCT = -5.0
 AUCTION_WARNING_HIGH_PCT = 5.0
 STAGE_LABELS = {
@@ -154,11 +157,11 @@ def _judge_one_pick(
     open_premium = (open_price / base_price - 1) * 100
     strategy_type = str(pick.get("strategy_type") or BREAKOUT_STRATEGY)
 
-    if strategy_type == BREAKOUT_STRATEGY:
-        action = _breakout_action(open_premium)
+    if strategy_type in SENTINEL_5M_STRATEGY_TYPES:
+        action = _sentinel_5m_open_record_action(strategy_type)
         result = {
             "id": pick.get("id"),
-            "status": "action",
+            "status": "silent",
             "selection_date": pick.get("selection_date"),
             "target_date": target_day,
             "strategy_type": strategy_type,
@@ -172,7 +175,7 @@ def _judge_one_pick(
             **action,
         }
         if not dry_run:
-            _update_pick_open(pick, open_price, open_premium, checked_at, result, close_position=True)
+            _update_pick_open(pick, open_price, open_premium, checked_at, result, close_position=False)
         return result
 
     if strategy_type in SWING_STRATEGY_TYPES:
@@ -217,26 +220,15 @@ def _judge_one_pick(
     return result
 
 
-def _breakout_action(open_premium: float) -> dict[str, str]:
-    if open_premium < 0:
-        return {
-            "level": "danger",
-            "action": "T+1开盘卖出",
-            "title": "🔴【T+1开盘卖出】",
-            "instruction": "尾盘突破策略到期，按 T+1 开盘价卖出结算。",
-        }
-    if open_premium < 3.0:
-        return {
-            "level": "profit",
-            "action": "T+1开盘卖出",
-            "title": "🟢【T+1开盘卖出】",
-            "instruction": "尾盘突破策略到期，按 T+1 开盘价卖出结算。",
-        }
+def _sentinel_5m_open_record_action(strategy_type: str) -> dict[str, str]:
     return {
-        "level": "strong",
-        "action": "T+1高开兑现",
-        "title": "🚀【T+1高开兑现】",
-        "instruction": "尾盘突破策略到期，即使高开超预期也按 T+1 开盘价卖出结算。",
+        "level": "watch",
+        "action": "5m巡逻兵接管",
+        "title": "【5m巡逻兵接管】",
+        "instruction": (
+            f"{strategy_type} 已统一切入 V5.6 5m 卖出闭环；"
+            "09:25 只回填开盘价和开盘溢价，不做 T+1 开盘结算。"
+        ),
     }
 
 

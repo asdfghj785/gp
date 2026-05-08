@@ -1,5 +1,106 @@
 {
-  "positions": [],
+  "positions": [
+    {
+      "code": "600105",
+      "name": "永鼎股份",
+      "buy_price": 47.39,
+      "highest_price": 50.4,
+      "volume_alert_triggered": false,
+      "order_book_alert_triggered": true,
+      "buy_date": "2026-05-07",
+      "buy_time": "2026-05-07T14:51:34",
+      "target_date": "2026-05-12",
+      "strategy_type": "全局动量狙击",
+      "tier": "base",
+      "selection_tier": "base",
+      "source": "daily_picks_1450",
+      "source_selection_date": "2026-05-07",
+      "source_pick_id": 1043,
+      "monitor_date": "2026-05-08",
+      "highest_price_updated_at": "2026-05-08T13:27:32",
+      "anti_nuclear_status": "CONFIRMED_FAKE_DUMP",
+      "anti_nuclear_date": "2026-05-08",
+      "anti_nuclear_observation": {
+        "status": "FAKE_DUMP",
+        "started_at": "2026-05-08T09:35:14",
+        "deadline_at": "2026-05-08T09:38:14",
+        "initial_price": 46.84,
+        "initial_gain_pct": -1.1606,
+        "vwap": 46.509,
+        "vwap_threshold": 46.2765,
+        "vwap_deviation_pct": 0.7116,
+        "weibi": -88.1876,
+        "total_buy_vol": 131.0,
+        "total_sell_vol": 2087.0,
+        "quote_time": "20260508093510",
+        "push_sent": true,
+        "confirmed_at": "2026-05-08T09:38:20",
+        "confirmed_price": 46.92,
+        "confirmed_gain_pct": -0.9918,
+        "final_status": "CONFIRMED_FAKE_DUMP",
+        "push_status": {
+          "code": 200,
+          "msg": "执行成功",
+          "data": "0f1d313c72684ca391e3168410980c6e",
+          "status": "sent",
+          "attempt": 1
+        }
+      },
+      "order_book_alert_date": "2026-05-08",
+      "order_book_alert_at": "2026-05-08T09:35:14",
+      "order_book_alert_type": "FAKE_DUMP_INTERCEPTED",
+      "order_book_alert_snapshot": {
+        "total_buy_vol": 131.0,
+        "total_sell_vol": 2087.0,
+        "weibi": -88.1876,
+        "buy_volumes": [
+          22.0,
+          1.0,
+          22.0,
+          1.0,
+          85.0
+        ],
+        "sell_volumes": [
+          1.0,
+          97.0,
+          1527.0,
+          424.0,
+          38.0
+        ],
+        "quote_time": "20260508093510",
+        "vwap_verification": {
+          "fake_dump": true,
+          "status": "FAKE_DUMP",
+          "reason": "price_holds_vwap",
+          "current_price": 46.84,
+          "vwap": 46.509,
+          "vwap_threshold": 46.2765,
+          "vwap_deviation_pct": 0.7116,
+          "trigger": "order_book_imbalance",
+          "weibi": -88.1876
+        }
+      }
+    },
+    {
+      "code": "002030",
+      "name": "达安基因",
+      "buy_price": 6.1,
+      "highest_price": 6.64,
+      "volume_alert_triggered": false,
+      "order_book_alert_triggered": false,
+      "buy_date": "2026-05-06",
+      "buy_time": "2026-05-06T14:50:00",
+      "target_date": "2026-05-11",
+      "strategy_type": "全局动量狙击",
+      "tier": "base",
+      "selection_tier": "base",
+      "source": "daily_picks_1450",
+      "source_selection_date": "2026-05-06",
+      "source_pick_id": 1042,
+      "monitor_date": "2026-05-08",
+      "highest_price_updated_at": "2026-05-08T09:47:09"
+    }
+  ],
   "closed_positions": [
     {
       "code": "603305",
@@ -144,9 +245,229 @@
         "close_return_pct": 3.898902821316619,
         "close_reason": "trailing_take_profit"
       }
+    },
+    {
+      "code": "001309",
+      "name": "德明利",
+      "buy_price": 524.81,
+      "highest_price": 577.29,
+      "volume_alert_triggered": false,
+      "order_book_alert_triggered": false,
+      "buy_date": "2026-04-30",
+      "buy_time": "2026-04-30T14:50:00",
+      "target_date": "2026-05-08",
+      "strategy_type": "全局动量狙击",
+      "tier": "base",
+      "selection_tier": "base",
+      "source": "daily_picks_1450",
+      "source_selection_date": "2026-04-30",
+      "source_pick_id": 3036,
+      "monitor_date": "2026-05-06",
+      "highest_price_updated_at": "2026-05-06T09:15:32",
+      "exit_reason": "trailing_take_profit",
+      "exit_price": 561.0,
+      "exit_gain_pct": 6.8958,
+      "trigger_price": 561.0,
+      "trigger_gain_pct": 6.8958,
+      "settlement_basis": "realtime",
+      "highest_gain_pct": 9.9998,
+      "drawdown_pct": -2.8218,
+      "closed_at": "2026-05-06T09:30:46",
+      "push_status": {
+        "code": 200,
+        "msg": "执行成功",
+        "data": "e3a153e09fb6447199873f424ec0b3f0",
+        "status": "sent",
+        "attempt": 1
+      },
+      "daily_pick_sync": {
+        "status": "synced",
+        "selection_date": "2026-04-30",
+        "code": "001309",
+        "pick_id": 3036,
+        "close_price": 561.0,
+        "close_return_pct": 6.895828966673667,
+        "close_reason": "trailing_take_profit"
+      },
+      "mac_sniper": {
+        "status": "skipped",
+        "reason": "mac_sniper_locked"
+      }
+    },
+    {
+      "code": "600198",
+      "name": "大唐电信",
+      "buy_price": 8.47,
+      "highest_price": 8.7,
+      "volume_alert_triggered": false,
+      "order_book_alert_triggered": false,
+      "buy_date": "2026-04-29",
+      "buy_time": "2026-04-29T14:50:00",
+      "target_date": "2026-05-07",
+      "strategy_type": "全局动量狙击",
+      "tier": "base",
+      "selection_tier": "base",
+      "source": "daily_picks_1450",
+      "source_selection_date": "2026-04-29",
+      "source_pick_id": 1040,
+      "monitor_date": "2026-05-07",
+      "highest_price_updated_at": "2026-05-07T14:12:35",
+      "exit_reason": "t3_timeout",
+      "exit_price": 8.68,
+      "exit_gain_pct": 2.4793,
+      "trigger_price": 8.68,
+      "trigger_gain_pct": 2.4793,
+      "settlement_basis": "realtime",
+      "highest_gain_pct": 2.7155,
+      "drawdown_pct": -0.2299,
+      "risk_profile_key": "全局狙击_V6",
+      "risk_profile": {
+        "hard_stop": -0.05,
+        "trailing_active": 0.06,
+        "trailing_retrace": 0.025,
+        "eod_stop": -0.03
+      },
+      "closed_at": "2026-05-07T14:50:04",
+      "push_status": {
+        "code": 200,
+        "msg": "执行成功",
+        "data": "772193afbe9a4c3cbae9ed1563a7cd90",
+        "status": "sent",
+        "attempt": 1
+      },
+      "daily_pick_sync": {
+        "status": "synced",
+        "selection_date": "2026-04-29",
+        "code": "600198",
+        "pick_id": 1040,
+        "close_price": 8.68,
+        "close_return_pct": 2.4793388429751984,
+        "close_reason": "t3_timeout"
+      },
+      "mac_sniper": {
+        "status": "skipped",
+        "reason": "mac_sniper_locked"
+      }
+    },
+    {
+      "code": "600988",
+      "name": "赤峰黄金",
+      "buy_price": 42.41,
+      "highest_price": 44.86,
+      "volume_alert_triggered": false,
+      "order_book_alert_triggered": true,
+      "buy_date": "2026-05-07",
+      "buy_time": "2026-05-07T14:51:34",
+      "target_date": "2026-05-08",
+      "strategy_type": "尾盘突破",
+      "tier": "base",
+      "selection_tier": "base",
+      "source": "daily_picks_1450",
+      "source_selection_date": "2026-05-07",
+      "source_pick_id": 1044,
+      "monitor_date": "2026-05-08",
+      "highest_price_updated_at": "2026-05-08T14:49:51",
+      "anti_nuclear_status": "CONFIRMED_FAKE_DUMP",
+      "anti_nuclear_date": "2026-05-08",
+      "anti_nuclear_observation": {
+        "status": "FAKE_DUMP",
+        "started_at": "2026-05-08T09:32:08",
+        "deadline_at": "2026-05-08T09:35:08",
+        "initial_price": 42.88,
+        "initial_gain_pct": 1.1082,
+        "vwap": 42.5655,
+        "vwap_threshold": 42.3527,
+        "vwap_deviation_pct": 0.7388,
+        "weibi": -86.1594,
+        "total_buy_vol": 211.0,
+        "total_sell_vol": 2838.0,
+        "quote_time": "20260508093203",
+        "push_sent": true,
+        "confirmed_at": "2026-05-08T09:35:15",
+        "confirmed_price": 42.05,
+        "confirmed_gain_pct": -0.8489,
+        "final_status": "CONFIRMED_FAKE_DUMP",
+        "push_status": {
+          "code": 200,
+          "msg": "执行成功",
+          "data": "b10a9273b6fd4475b1f9c7702326d02f",
+          "status": "sent",
+          "attempt": 1
+        }
+      },
+      "order_book_alert_date": "2026-05-08",
+      "order_book_alert_at": "2026-05-08T09:32:08",
+      "order_book_alert_type": "FAKE_DUMP_INTERCEPTED",
+      "order_book_alert_snapshot": {
+        "total_buy_vol": 211.0,
+        "total_sell_vol": 2838.0,
+        "weibi": -86.1594,
+        "buy_volumes": [
+          15.0,
+          6.0,
+          138.0,
+          48.0,
+          4.0
+        ],
+        "sell_volumes": [
+          130.0,
+          432.0,
+          1627.0,
+          603.0,
+          46.0
+        ],
+        "quote_time": "20260508093203",
+        "vwap_verification": {
+          "fake_dump": true,
+          "status": "FAKE_DUMP",
+          "reason": "price_holds_vwap",
+          "current_price": 42.88,
+          "vwap": 42.5655,
+          "vwap_threshold": 42.3527,
+          "vwap_deviation_pct": 0.7388,
+          "trigger": "order_book_imbalance",
+          "weibi": -86.1594
+        }
+      },
+      "exit_reason": "t3_timeout",
+      "exit_price": 44.6,
+      "exit_gain_pct": 5.1639,
+      "trigger_price": 44.6,
+      "trigger_gain_pct": 5.1639,
+      "settlement_basis": "realtime",
+      "highest_gain_pct": 5.7769,
+      "drawdown_pct": -0.5796,
+      "risk_profile_key": "尾盘突破",
+      "risk_profile": {
+        "hard_stop": -0.04,
+        "trailing_active": 0.04,
+        "trailing_retrace": 0.02,
+        "eod_stop": -0.015
+      },
+      "closed_at": "2026-05-08T14:50:22",
+      "push_status": {
+        "code": 200,
+        "msg": "执行成功",
+        "data": "cdce26a9aee54bbca886d6b47b1f08f1",
+        "status": "sent",
+        "attempt": 1
+      },
+      "daily_pick_sync": {
+        "status": "synced",
+        "selection_date": "2026-05-07",
+        "code": "600988",
+        "pick_id": 1044,
+        "close_price": 44.6,
+        "close_return_pct": 5.163876444234861,
+        "close_reason": "t3_timeout"
+      },
+      "mac_sniper": {
+        "status": "skipped",
+        "reason": "mac_sniper_locked"
+      }
     }
   ],
-  "last_seeded_at": "2026-04-30T09:15:04",
-  "last_seeded_selection_date": "2026-04-29",
-  "monitor_date": "2026-04-30"
+  "last_seeded_at": "2026-05-08T09:15:01",
+  "last_seeded_selection_date": "2026-05-07",
+  "monitor_date": "2026-05-08"
 }

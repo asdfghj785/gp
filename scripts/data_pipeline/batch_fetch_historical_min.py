@@ -14,7 +14,7 @@ BASE_DIR = Path("/Users/eudis/ths")
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from quant_core.config import DATA_DIR, MIN_KLINE_DIR
+from quant_core.config import DATA_DIR, JQ_FETCH_ENABLED, MIN_KLINE_DIR
 from quant_core.data_pipeline.fetch_minute_data import (
     get_stock_min_data,
     init_jq,
@@ -83,6 +83,9 @@ def existing_good_codes(
 
 def query_jq_quota() -> dict[str, object]:
     """Return a normalized JoinQuant quota snapshot."""
+    if not JQ_FETCH_ENABLED:
+        return {"raw": "disabled", "total": None, "spare": None}
+
     from jqdatasdk import get_query_count
 
     raw = get_query_count()
@@ -194,6 +197,22 @@ def batch_fetch_historical_min(
     segment_mode: str = "month",
     quota_stop_buffer_rows: int = QUOTA_STOP_BUFFER_ROWS,
 ) -> dict[str, object]:
+    if not JQ_FETCH_ENABLED:
+        safe_period = normalize_period(period)
+        return {
+            "status": "disabled",
+            "reason": "聚宽冷数据获取已停用；保留本地历史缓存，新增分钟热数据走腾讯/Ashare 归档。",
+            "period": f"{safe_period}m",
+            "start_date": start_date or DEFAULT_COLD_START_DATE,
+            "end_date": end_date or DEFAULT_COLD_END_DATE,
+            "segment_mode": segment_mode,
+            "universe": 0,
+            "skipped": 0,
+            "success": 0,
+            "failed": 0,
+            "stopped_by_quota": False,
+        }
+
     init_jq()
     safe_period = normalize_period(period)
     output_path = Path(output_root)

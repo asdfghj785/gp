@@ -2,7 +2,7 @@
   <div class="radar-page">
     <div class="radar-shell">
       <header class="radar-header">
-        <h1 class="radar-title">🎯 实盘雷达：全市场情绪动量扫描</h1>
+        <h1 class="radar-title">V6.0 极寒爆发雷达：全局狙击 Top1</h1>
         <button class="scan-btn" :disabled="loading" type="button" @click="fetchData">
           {{ loading ? '扫描中...' : '重新扫描' }}
         </button>
@@ -176,7 +176,7 @@ const fetchData = async () => {
   loading.value = true
   error.value = ''
   try {
-    const response = await fetch(`${API_BASE}/api/radar/scan`)
+    const response = await fetch(`${API_BASE}/api/radar/scan?limit=1`)
     if (!response.ok) {
       const detail = await response.text()
       console.error('[Radar Scan] HTTP Error', {
@@ -187,8 +187,17 @@ const fetchData = async () => {
       throw new Error(`HTTP ${response.status}: ${detail || response.statusText}`)
     }
     const data = await response.json()
-    rows.value = Array.isArray(data) ? data : []
-    updatedAt.value = new Date().toLocaleString()
+    rows.value = (Array.isArray(data) ? data : (data.rows || [])).map((row) => ({
+      代码: row.代码 || row.code,
+      名称: row.名称 || row.name,
+      最新价: row.最新价 ?? row.selection_price ?? row.snapshot_price ?? row.price,
+      涨跌幅: row.涨跌幅 ?? row.selection_change ?? row.pct_chg,
+      量比: row.量比 ?? row.volume_ratio ?? row.snapshot_vol_ratio,
+      换手率: row.换手率 ?? row.turnover ?? row.turn,
+      AI胜率: row.AI胜率 ?? row.global_probability_pct ?? row.probability_pct ?? row.composite_score,
+      raw: row,
+    }))
+    updatedAt.value = data.created_at || new Date().toLocaleString()
   } catch (err) {
     console.error('[Radar Scan] Fetch Failed', err)
     rows.value = []

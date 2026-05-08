@@ -22,7 +22,7 @@ if str(BASE_DIR) not in sys.path:
 
 from quant_core.ai_agent.agent_gateway import run_1446_ai_interview
 from quant_core.cache_utils import CACHE_DIR, read_json_cache
-from quant_core.config import MODELS_DIR
+from quant_core.config import GLOBAL_DAILY_META_PATH, GLOBAL_DAILY_MODEL_PATH, V3_SNIPER_PUSHPLUS_ENABLED
 from quant_core.data_pipeline.concept_engine import CONCEPT_CATALOG_PATH, CONCEPT_INDEX_PATH, get_stock_concept_map
 from quant_core.data_pipeline.market import fetch_realtime_quote, fetch_sina_snapshot
 from quant_core.data_pipeline.sector_engine import get_stock_sector_map
@@ -42,10 +42,14 @@ from quant_core.storage import (
 router = APIRouter(prefix="/api/v3", tags=["v3-sniper"])
 v4_router = APIRouter(prefix="/api/v4", tags=["v4-sniper"])
 
-GLOBAL_MODEL_PATH = MODELS_DIR / "xgboost_daily_swing_global_v1.json"
-GLOBAL_META_PATH = MODELS_DIR / "xgboost_daily_swing_global_v1.meta.json"
+GLOBAL_MODEL_PATH = GLOBAL_DAILY_MODEL_PATH
+GLOBAL_META_PATH = GLOBAL_DAILY_META_PATH
 _SCAN_CACHE: dict[str, Any] = {"key": "", "created_at": 0.0, "payload": None}
-_TOP_K = 5
+_TOP_K = 1
+_SNIPER_MIN_PROBABILITY = 0.60
+_SNIPER_MODEL_VERSION = "v6_0_extreme_burst"
+_SNIPER_MODEL_LABEL = "V6.0 极寒爆发大脑"
+_SNIPER_SELECTION_MODE = "v6_extreme_top1_p60"
 _LOCK_HOUR = 14
 _LOCK_MINUTE = 50
 _LOCK_LABEL = f"{_LOCK_HOUR:02d}:{_LOCK_MINUTE:02d}"
@@ -65,7 +69,7 @@ class AnalyzeStockRequest(BaseModel):
 
 @router.get("/sniper/scan_today")
 async def scan_today(
-    threshold: float = Query(0.85, ge=0.0, le=1.0, description="Legacy param; Top-K mode ignores hard threshold."),
+    threshold: float = Query(0.60, ge=0.0, le=1.0, description="Legacy param; V6 production gate is fixed at P>=0.60."),
     limit: int = Query(default=0, ge=0, le=10000),
     max_workers: int = Query(default=8, ge=1, le=16),
     cache_seconds: int = Query(default=120, ge=0, le=900),
@@ -86,13 +90,13 @@ async def scan_today(
 
 @router.get("/sniper/history")
 async def sniper_history(limit: int = Query(default=20, ge=1, le=120)) -> dict[str, Any]:
-    """Return V4 Theme Alpha sniper locks plus synced 全局动量狙击 backtest settlement rows."""
+    """Return only clean V6.0 production sniper locks."""
     return await asyncio.to_thread(_sniper_history_sync, limit)
 
 
 @v4_router.get("/sniper/scan_today")
 async def scan_today_v4(
-    threshold: float = Query(0.85, ge=0.0, le=1.0, description="Legacy param; Top-K mode ignores hard threshold."),
+    threshold: float = Query(0.60, ge=0.0, le=1.0, description="Legacy param; V6 production gate is fixed at P>=0.60."),
     limit: int = Query(default=0, ge=0, le=10000),
     max_workers: int = Query(default=8, ge=1, le=16),
     cache_seconds: int = Query(default=120, ge=0, le=900),
@@ -131,11 +135,14 @@ def _scan_today_sync(threshold: float, limit: int, max_workers: int, cache_secon
     start_ts = time.time()
     prediction_date = datetime.now().date().isoformat()
     locked = get_v3_sniper_lock(prediction_date)
-    if locked:
+    stale_lock = None
+    if locked and _is_clean_v6_payload(locked.get("payload") or {}):
         return _payload_from_lock(locked, start_ts)
+    if locked:
+        stale_lock = locked
 
     can_attempt_lock = _can_attempt_daily_lock(limit)
-    cache_key = f"{prediction_date}:{limit}:{max_workers}:top{_TOP_K}:live-v4-theme"
+    cache_key = f"{prediction_date}:{limit}:{max_workers}:top{_TOP_K}:p{_SNIPER_MIN_PROBABILITY:.2f}:live-v6-extreme"
     now_ts = datetime.now().timestamp()
     if (
         not can_attempt_lock
@@ -167,12 +174,18 @@ def _scan_today_sync(threshold: float, limit: int, max_workers: int, cache_secon
     tasks, filter_stats = _build_candidate_tasks(files, quote_pool)
     scored_rows, errors = _score_candidate_tasks(tasks, feature_cols, max_workers=max_workers)
     evaluated_count = len(scored_rows)
+    eligible_rows = [
+        row for row in scored_rows if float(row.get("probability") or 0.0) >= _SNIPER_MIN_PROBABILITY
+    ]
     rows = [
         _ensure_theme_contract(row)
-        for row in sorted(scored_rows, key=lambda item: float(item.get("probability") or 0.0), reverse=True)[:_TOP_K]
+        for row in sorted(eligible_rows, key=lambda item: float(item.get("probability") or 0.0), reverse=True)[:_TOP_K]
     ]
     if not rows:
-        raise RuntimeError(f"没有生成任何有效最新因子。errors={errors[:5]} filter_stats={filter_stats}")
+        raise RuntimeError(
+            f"没有生成任何 P>={_SNIPER_MIN_PROBABILITY:.2f} 的 V6.0 全局狙击候选。"
+            f" evaluated={evaluated_count} errors={errors[:5]} filter_stats={filter_stats}"
+        )
 
     elapsed_seconds = round(time.time() - start_ts, 3)
     payload = {
@@ -184,9 +197,9 @@ def _scan_today_sync(threshold: float, limit: int, max_workers: int, cache_secon
             "fetch_mode": quote_meta.get("mode") or "batch",
             "mode": "local_daily_tail_plus_live_quote",
         },
-        "threshold": None,
+        "threshold": _SNIPER_MIN_PROBABILITY,
         "legacy_threshold_param": threshold,
-        "selection_mode": "top_k",
+        "selection_mode": _SNIPER_SELECTION_MODE,
         "top_k": _TOP_K,
         "locked": False,
         "lock_cutoff": _LOCK_LABEL,
@@ -201,18 +214,31 @@ def _scan_today_sync(threshold: float, limit: int, max_workers: int, cache_secon
         "errors": errors[:12],
         "filter_stats": filter_stats,
         "model": {
+            "version": _SNIPER_MODEL_VERSION,
+            "label": _SNIPER_MODEL_LABEL,
             "path": str(GLOBAL_MODEL_PATH),
+            "meta_path": str(GLOBAL_META_PATH),
             "split_date": meta.get("split_date"),
             "metrics": meta.get("metrics", {}),
-            "high_confidence_precision": "85.78%",
+            "threshold": _SNIPER_MIN_PROBABILITY,
+            "top_k": _TOP_K,
+            "selection_mode": _SNIPER_SELECTION_MODE,
+            "data_contract": {
+                "snapshot_anchor": "14:50 lock",
+                "feature_timing": "T日 high/low/close/volume + 历史滚动窗口；不读取 T+1/T+3",
+                "blocked_legacy_sources": ["v4_theme_alpha_locks", "top_pick_backtest_m12"],
+            },
         },
         "cache": {"hit": False, "ttl_seconds": cache_seconds},
     }
     should_lock, lock_reason = _should_lock_payload(limit, quote_pool, quote_meta, prediction_date)
+    if stale_lock:
+        should_lock = False
+        lock_reason = f"stale_legacy_lock_ignored:id={stale_lock.get('id')}; serving_clean_v6_runtime_only"
     payload["lock_status"] = lock_reason
     if should_lock:
         payload["locked_at"] = datetime.now().isoformat(timespec="seconds")
-        locked = save_v3_sniper_lock(payload, created_by="v4_theme_alpha_1450")
+        locked = save_v3_sniper_lock(payload, created_by="v6_extreme_burst_1450")
         payload = _payload_from_lock(locked, start_ts)
         payload["cache"] = {"hit": False, "type": "persistent_lock", "inserted": bool(locked.get("inserted"))}
         if locked.get("inserted"):
@@ -225,18 +251,20 @@ def _scan_today_sync(threshold: float, limit: int, max_workers: int, cache_secon
 
 def lock_today_sniper_snapshot(limit: int = 0, max_workers: int = 8) -> dict[str, Any]:
     """CLI-friendly entry point for the 14:50 LaunchAgent."""
-    return _scan_today_sync(threshold=0.85, limit=limit, max_workers=max_workers, cache_seconds=0)
+    return _scan_today_sync(threshold=0.60, limit=limit, max_workers=max_workers, cache_seconds=0)
 
 
 def _sniper_history_sync(limit: int) -> dict[str, Any]:
     locks = list_v3_sniper_locks(limit=limit)
     rows: list[dict[str, Any]] = []
-    backtest_by_date = _global_momentum_backtest_history(limit=limit)
+    skipped_legacy = 0
     for lock in locks:
         payload = dict(lock.get("payload") or {})
+        if not _is_clean_v6_payload(payload):
+            skipped_legacy += 1
+            continue
         signals = _filter_display_rows(list(payload.get("rows") or []))[: int(payload.get("top_k") or _TOP_K)]
         stocks = [_history_stock_row(signal, str(lock["selection_date"])) for signal in signals]
-        _merge_backtest_stocks(stocks, backtest_by_date.pop(str(lock["selection_date"]), []))
         rows.append(
             {
                 "id": lock.get("id"),
@@ -246,39 +274,39 @@ def _sniper_history_sync(limit: int) -> dict[str, Any]:
                 "signal_count": len(signals),
                 "elapsed_seconds": payload.get("elapsed_seconds"),
                 "live_source": (payload.get("live_data") or {}).get("source"),
+                "selection_mode": payload.get("selection_mode") or _SNIPER_SELECTION_MODE,
+                "model_version": ((payload.get("model") or {}).get("version") or _SNIPER_MODEL_VERSION),
                 "stocks": stocks,
             }
         )
-    for selection_date in sorted(backtest_by_date.keys(), reverse=True):
-        stocks = backtest_by_date[selection_date]
-        if not stocks:
-            continue
-        rows.append(
-            {
-                "id": f"backtest-global-{selection_date}",
-                "selection_date": selection_date,
-                "locked_at": f"{selection_date}T15:00:00",
-                "top_k": len(stocks),
-                "signal_count": len(stocks),
-                "elapsed_seconds": None,
-                "live_source": "top_pick_backtest_m12",
-                "history_source": "top_pick_backtest_m12",
-                "stocks": stocks,
-            }
-        )
-        if len(rows) >= limit:
-            break
     rows = sorted(rows, key=lambda item: str(item.get("selection_date") or ""), reverse=True)[:limit]
     return {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "count": len(rows),
         "backtest_sync": {
-            "enabled": True,
-            "source": "data/strategy_cache/top_pick_backtest_m12.json",
+            "enabled": False,
+            "source": "",
             "strategy_type": "全局动量狙击",
+            "reason": "V6.0 production history excludes legacy backtest rows to keep the frontend data contract clean.",
         },
+        "skipped_legacy_locks": skipped_legacy,
+        "model_version": _SNIPER_MODEL_VERSION,
+        "selection_mode": _SNIPER_SELECTION_MODE,
         "rows": rows,
     }
+
+
+def _is_clean_v6_payload(payload: dict[str, Any]) -> bool:
+    model = payload.get("model") or {}
+    try:
+        threshold = float(payload.get("threshold") or 0)
+    except (TypeError, ValueError):
+        threshold = 0.0
+    return (
+        str(payload.get("selection_mode") or "") == _SNIPER_SELECTION_MODE
+        and str(model.get("version") or "") == _SNIPER_MODEL_VERSION
+        and threshold >= _SNIPER_MIN_PROBABILITY
+    )
 
 
 def _merge_backtest_stocks(stocks: list[dict[str, Any]], backtest_stocks: list[dict[str, Any]]) -> None:
@@ -871,6 +899,16 @@ def _format_signal_row(row: pd.Series) -> dict[str, Any]:
 
 def _align_features(frame: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
     out = frame.copy()
+    if "entry_price" not in out.columns and "close" in out.columns:
+        out["entry_price"] = out["close"]
+    if "buy5m_entry_price" not in out.columns and "close" in out.columns:
+        out["buy5m_entry_price"] = out["close"]
+    if "buy5m_bar_count" not in out.columns:
+        out["buy5m_bar_count"] = 0.0
+    if "tail_accel" not in out.columns:
+        out["tail_accel"] = 1.0
+    if "intra_volatility" not in out.columns:
+        out["intra_volatility"] = 0.0
     for col in feature_cols:
         if col not in out.columns:
             out[col] = np.nan if col in THEME_FACTOR_COLUMNS else 0.0
@@ -1046,26 +1084,32 @@ def _is_excluded_board(code: str) -> bool:
 
 
 def _send_v3_sniper_pushplus(payload: dict[str, Any]) -> dict[str, Any]:
+    if not V3_SNIPER_PUSHPLUS_ENABLED:
+        result = {"status": "skipped_disabled", "reason": "QUANT_ENABLE_V3_SNIPER_PUSHPLUS 未开启"}
+        print(json.dumps({"task": "v3_sniper_pushplus", **result}, ensure_ascii=False))
+        return result
+
     rows = _filter_display_rows(list(payload.get("rows") or []))[: int(payload.get("top_k") or _TOP_K)]
     if not rows:
-        return {"status": "skipped_empty", "reason": "V4 锁榜后主板过滤无可推送标的"}
+        return {"status": "skipped_empty", "reason": "V6 锁榜后主板过滤无可推送标的"}
     try:
         from quant_core.execution.pushplus_tasks import send_pushplus
 
-        title = f"{_LOCK_LABEL} V4全局动量狙击 Top {len(rows)}"
+        title = f"{_LOCK_LABEL} V6极寒爆发 Top {len(rows)}"
         lines = "\n".join(_v3_push_line(index, row) for index, row in enumerate(rows, start=1))
         live = payload.get("live_data") or {}
         stats = payload.get("filter_stats") or {}
-        content = f"""## {_LOCK_LABEL} V4 Theme Alpha 全局动量狙击
+        content = f"""## {_LOCK_LABEL} V6.0 极寒爆发全局狙击
 
 预测日期: {payload.get('prediction_date') or '-'}
 锁定时间: {payload.get('locked_at') or '-'}
 行情源: {live.get('source') or '-'}
 扫描耗时: {_fmt_number(payload.get('elapsed_seconds'))} 秒
+门槛: Top1 且 P >= {_SNIPER_MIN_PROBABILITY:.2f}
 
 {lines}
 
-过滤规则: 已排除创业板、科创板、北交所、ST/退市；仅保留沪深主板候选。
+过滤规则: 已排除创业板、科创板、北交所、ST/退市；仅保留沪深主板候选；旧 V4 锁榜和旧回放结果不参与本次推送。
 候选统计: 全量 {payload.get('universe_count', '-')} / 板块过滤 {stats.get('excluded_board', 0)} / ST过滤 {stats.get('st', 0)} / 入模 {payload.get('evaluated_count', '-')}
 """
         result = send_pushplus(title, content)

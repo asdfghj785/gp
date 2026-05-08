@@ -29,6 +29,20 @@ DAILY_COLUMNS = [
     "ingested_at",
 ]
 LIVE_DAILY_SOURCES = {"sina_close_sync", "sina_snapshot", "sina_open_check"}
+MINUTE_5M_COLUMNS = [
+    "code",
+    "datetime",
+    "trade_date",
+    "trade_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
+    "source",
+    "ingested_at",
+]
 
 
 def connect() -> sqlite3.Connection:
@@ -63,6 +77,26 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_stock_daily_date ON stock_daily(date);
             CREATE INDEX IF NOT EXISTS idx_stock_daily_code ON stock_daily(code);
+
+            CREATE TABLE IF NOT EXISTS stock_minute_5m (
+                code TEXT NOT NULL,
+                datetime TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                trade_time TEXT NOT NULL,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume REAL,
+                amount REAL,
+                source TEXT NOT NULL DEFAULT 'unknown',
+                ingested_at TEXT NOT NULL,
+                PRIMARY KEY (code, datetime)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_stock_minute_5m_code_dt ON stock_minute_5m(code, datetime);
+            CREATE INDEX IF NOT EXISTS idx_stock_minute_5m_trade_date ON stock_minute_5m(trade_date);
+            CREATE INDEX IF NOT EXISTS idx_stock_minute_5m_source ON stock_minute_5m(source);
 
             CREATE TABLE IF NOT EXISTS validation_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,7 +227,10 @@ def init_db() -> None:
         conn.execute(
             """
             UPDATE daily_picks
-            SET is_shadow_test = 0
+            SET is_shadow_test = CASE
+                WHEN COALESCE(is_closed, 0) = 0 THEN 1
+                ELSE 0
+            END
             WHERE json_extract(raw_json, '$.source') = 'historical_production_replay'
             """
         )
@@ -353,6 +390,126 @@ def upsert_daily_rows(df: pd.DataFrame, source: str = "unknown") -> int:
     with connect() as conn:
         conn.executemany(sql, rows)
     return len(rows)
+
+
+def normalize_minute_5m_frame(df: pd.DataFrame, code: str | None = None, source: str | None = None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=MINUTE_5M_COLUMNS)
+
+    out = df.copy()
+    out = out.rename(
+        columns={
+            "time": "datetime",
+            "date": "datetime",
+            "index": "datetime",
+            "money": "amount",
+            "成交额": "amount",
+            "成交量": "volume",
+            "开盘": "open",
+            "最高": "high",
+            "最低": "low",
+            "收盘": "close",
+        }
+    )
+    out = _coalesce_duplicate_columns(out)
+    if "datetime" not in out.columns:
+        return pd.DataFrame(columns=MINUTE_5M_COLUMNS)
+    if "code" not in out.columns:
+        out["code"] = code
+    out["code"] = out["code"].astype(str).str.extract(r"(\d{6})")[0]
+    if code:
+        out["code"] = out["code"].fillna(str(code).zfill(6)[-6:])
+
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    for col in ["open", "high", "low", "close", "volume", "amount"]:
+        if col not in out.columns:
+            out[col] = None
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    if source is not None:
+        out["source"] = source
+    elif "source" not in out.columns:
+        out["source"] = "unknown"
+    else:
+        out["source"] = out["source"].fillna("unknown").astype(str)
+    if "ingested_at" not in out.columns:
+        out["ingested_at"] = datetime.now().isoformat(timespec="seconds")
+    out["ingested_at"] = out["ingested_at"].fillna(datetime.now().isoformat(timespec="seconds")).astype(str)
+
+    out = out.dropna(subset=["code", "datetime", "open", "high", "low", "close"])
+    if out.empty:
+        return pd.DataFrame(columns=MINUTE_5M_COLUMNS)
+    out["datetime"] = out["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    parsed_dt = pd.to_datetime(out["datetime"], errors="coerce")
+    out["trade_date"] = parsed_dt.dt.strftime("%Y-%m-%d")
+    out["trade_time"] = parsed_dt.dt.strftime("%H:%M:%S")
+    out = out.dropna(subset=["trade_date", "trade_time"])
+    out = out.sort_values(["code", "datetime"]).drop_duplicates(subset=["code", "datetime"], keep="last")
+    return out[MINUTE_5M_COLUMNS].copy()
+
+
+def upsert_minute_5m_rows(df: pd.DataFrame, source: str | None = None, code: str | None = None) -> int:
+    init_db()
+    rows_df = normalize_minute_5m_frame(df, code=code, source=source)
+    if rows_df.empty:
+        return 0
+    rows = [
+        tuple(None if pd.isna(value) else value for value in record)
+        for record in rows_df[MINUTE_5M_COLUMNS].itertuples(index=False, name=None)
+    ]
+    placeholders = ",".join(["?"] * len(MINUTE_5M_COLUMNS))
+    assignments = ",".join([f"{col}=excluded.{col}" for col in MINUTE_5M_COLUMNS if col not in {"code", "datetime"}])
+    sql = f"""
+        INSERT INTO stock_minute_5m ({",".join(MINUTE_5M_COLUMNS)})
+        VALUES ({placeholders})
+        ON CONFLICT(code, datetime) DO UPDATE SET {assignments}
+    """
+    with connect() as conn:
+        conn.executemany(sql, rows)
+    return len(rows)
+
+
+def recent_minute_5m_rows(code: str, limit: int = 5000) -> list[dict[str, Any]]:
+    init_db()
+    clean = str(code).zfill(6)[-6:]
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT code, datetime, trade_date, trade_time, open, high, low, close,
+                   volume, amount, source
+            FROM stock_minute_5m
+            WHERE code = ?
+            ORDER BY datetime DESC
+            LIMIT ?
+            """,
+            (clean, int(limit)),
+        ).fetchall()
+    return [dict(row) for row in rows][::-1]
+
+
+def minute_5m_window(code: str, start_datetime: str, end_datetime: str | None = None) -> pd.DataFrame:
+    init_db()
+    clean = str(code).zfill(6)[-6:]
+    params: list[Any] = [clean, start_datetime]
+    clause = "code = ? AND datetime > ?"
+    if end_datetime:
+        clause += " AND datetime <= ?"
+        params.append(end_datetime)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT code, datetime, trade_date, trade_time, open, high, low, close,
+                   volume, amount, source
+            FROM stock_minute_5m
+            WHERE {clause}
+            ORDER BY datetime ASC
+            """,
+            params,
+        ).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=MINUTE_5M_COLUMNS)
+    out = pd.DataFrame([dict(row) for row in rows])
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    return out.dropna(subset=["datetime"]).copy()
 
 
 def _filter_live_trading_dates(rows_df: pd.DataFrame, source: str) -> pd.DataFrame:
@@ -729,6 +886,20 @@ def latest_prediction_snapshot() -> dict[str, Any] | None:
 
 def save_daily_pick(pick: dict[str, Any]) -> int:
     init_db()
+    pick = dict(pick)
+    raw_source = pick.get("raw") if isinstance(pick.get("raw"), dict) else {}
+    winner_source = raw_source.get("winner") if isinstance(raw_source.get("winner"), dict) else {}
+    code = str(pick.get("code") or winner_source.get("code") or "").zfill(6)
+    name = _resolve_stock_name(code, pick.get("name"), winner_source.get("name"))
+    pick["code"] = code
+    pick["name"] = name
+    if raw_source:
+        raw = dict(raw_source)
+        winner = dict(winner_source)
+        winner["code"] = code
+        winner["name"] = name
+        raw["winner"] = winner
+        pick["raw"] = raw
     strategy_type = pick.get("strategy_type") or (pick.get("raw") or {}).get("winner", {}).get("strategy_type") or "尾盘突破"
     t3_max_gain_pct = pick.get("t3_max_gain_pct")
     raw_payload = _daily_pick_raw_payload_with_theme_contract(pick)
@@ -754,12 +925,12 @@ def save_daily_pick(pick: dict[str, Any]) -> int:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(selection_date, strategy_type, code) DO NOTHING
             """,
-            (
-                pick["selection_date"],
-                pick["target_date"],
-                selected_at,
-                pick["code"],
-                pick["name"],
+	            (
+	                pick["selection_date"],
+	                pick["target_date"],
+	                selected_at,
+	                code,
+	                name,
                 strategy_type,
                 pick["win_rate"],
                 pick["selection_price"],
@@ -784,6 +955,14 @@ def _daily_pick_raw_payload_with_theme_contract(pick: dict[str, Any]) -> dict[st
     winner = raw.get("winner") if isinstance(raw.get("winner"), dict) else {}
     winner = dict(winner)
     raw["winner"] = winner
+    code = str(pick.get("code") or winner.get("code") or raw.get("code") or "").zfill(6)
+    resolved_name = _resolve_stock_name(code, pick.get("name"), winner.get("name"), raw.get("name"))
+    if code:
+        raw["code"] = code
+        winner["code"] = code
+    if resolved_name:
+        raw["name"] = resolved_name
+        winner["name"] = resolved_name
 
     core_theme = _theme_text(
         pick.get("core_theme"),
@@ -815,6 +994,42 @@ def _daily_pick_raw_payload_with_theme_contract(pick: dict[str, Any]) -> dict[st
     winner["theme_momentum"] = _optional_float(winner.get("theme_momentum")) if winner.get("theme_momentum") is not None else momentum
     winner["theme_pct_chg_3"] = _optional_float(winner.get("theme_pct_chg_3")) if winner.get("theme_pct_chg_3") is not None else momentum
     return raw
+
+
+def _resolve_stock_name(code: str, *candidates: Any) -> str:
+    clean_code = str(code or "").zfill(6)
+    for value in candidates:
+        text = str(value or "").strip()
+        if _is_valid_stock_name(clean_code, text):
+            return text
+    return _latest_stock_name(clean_code) or ""
+
+
+def _is_valid_stock_name(code: str, name: str) -> bool:
+    text = str(name or "").strip()
+    if not text or text.lower() in {"none", "nan", "-"}:
+        return False
+    return text != str(code or "").zfill(6)
+
+
+def _latest_stock_name(code: str) -> str:
+    clean_code = str(code or "").zfill(6)
+    if not clean_code:
+        return ""
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT name
+            FROM stock_daily
+            WHERE code = ?
+              AND COALESCE(TRIM(name), '') <> ''
+              AND TRIM(name) <> ?
+            ORDER BY date DESC
+            LIMIT 1
+            """,
+            (clean_code, clean_code),
+        ).fetchone()
+    return str(row["name"] or "").strip() if row else ""
 
 
 def _theme_text(*values: Any) -> str:
@@ -1026,10 +1241,11 @@ def open_position_picks(today: str | None = None) -> list[dict[str, Any]]:
             SELECT *
             FROM daily_picks
             WHERE COALESCE(is_closed, 0) = 0
+              AND COALESCE(is_shadow_test, 0) = 1
               AND selection_date < ?
               AND (
                     (
-                        strategy_type = '尾盘突破'
+                        strategy_type IN ('尾盘突破', '尾盘突破-ST特情')
                         AND status = 'pending_open'
                         AND target_date <= ?
                     )
@@ -1041,6 +1257,26 @@ def open_position_picks(today: str | None = None) -> list[dict[str, Any]]:
             ORDER BY selection_date ASC
             """,
             (current, current, current),
+        ).fetchall()
+    return [_decode_daily_pick(row) for row in rows if row]
+
+
+def sentinel_5m_exit_picks(start_date: str, today: str | None = None) -> list[dict[str, Any]]:
+    init_db()
+    current = today or datetime.now().date().isoformat()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM daily_picks
+            WHERE selection_date >= ?
+              AND selection_date <= ?
+              AND COALESCE(is_shadow_test, 0) = 1
+              AND COALESCE(is_closed, 0) = 0
+              AND strategy_type IN ('全局动量狙击', '尾盘突破', '尾盘突破-ST特情')
+            ORDER BY selection_date ASC, strategy_type ASC, id ASC
+            """,
+            (start_date, current),
         ).fetchall()
     return [_decode_daily_pick(row) for row in rows if row]
 
@@ -1173,6 +1409,12 @@ def _attach_pick_display_fields(item: dict[str, Any]) -> None:
     item["close_action"] = close_signal.get("action") or item.get("close_reason")
     item["close_instruction"] = close_signal.get("instruction") or ""
     item["close_push_status"] = close_signal.get("push_status")
+    item["close_time"] = close_signal.get("close_time") or item.get("close_checked_at")
+    item["sell_strategy"] = close_signal.get("sell_strategy") or winner.get("sell_strategy") or item.get("close_reason")
+    item["exit_policy"] = close_signal.get("exit_policy") or winner.get("exit_policy") or item.get("sell_strategy")
+    item["coverage_status"] = close_signal.get("coverage_status") or winner.get("coverage_status")
+    item["exit_category"] = close_signal.get("exit_category") or winner.get("exit_category")
+    item["bars_replayed"] = close_signal.get("bars_replayed") or winner.get("bars_replayed")
 
 
 def _optional_float(value: Any) -> float | None:
