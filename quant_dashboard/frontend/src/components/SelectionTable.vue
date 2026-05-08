@@ -13,6 +13,29 @@
     <el-tabs v-if="useMonths && months.length" v-model="selectedMonth" class="month-tabs">
       <el-tab-pane v-for="month in months" :key="month" :name="month" :label="`${month} (${monthGroups[month]?.length || 0})`" />
     </el-tabs>
+    <div v-if="useMonths && months.length" class="month-return-strip">
+      <div class="month-return-main">
+        <span>{{ selectedMonth }} 仓位加权月收益</span>
+        <strong :class="numberClass(selectedMonthStats.returnPct)">
+          {{ signedPct(selectedMonthStats.returnPct) }}
+        </strong>
+      </div>
+      <div class="month-strategy-stats">
+        <button
+          v-for="item in selectedMonthStrategyStats"
+          :key="item.strategy"
+          type="button"
+          :class="['month-strategy-chip', { 'month-strategy-chip-active': isMonthStrategyActive(item.strategy) }]"
+          :aria-pressed="isMonthStrategyActive(item.strategy)"
+          @click="toggleMonthStrategyFilter(item.strategy)"
+        >
+          <span>{{ item.label }}</span>
+          <strong>{{ ratioText(item.winRate) }}</strong>
+          <em :class="numberClass(item.revenuePct)">营收 {{ signedPct(item.revenuePct) }}</em>
+        </button>
+      </div>
+      <span class="month-return-meta">已结清 {{ selectedMonthStats.closedCount }}/{{ selectedMonthStats.totalCount }}</span>
+    </div>
 
     <el-table
       :data="displayRows"
@@ -26,8 +49,25 @@
         <template #default="{ row }">
           <div class="stock-stack">
             <div class="stock-cell">
-              <StockLink :code="row.code" :name="row.name" :label="row.code" mono class="stock-code-link" />
-              <StockLink :code="row.code" :name="row.name" :label="row.name" class="stock-name-link" />
+              <StockLink
+                :code="row.code"
+                :name="row.name"
+                :label="row.code"
+                :buy-date="row.selection_date || row.date"
+                :sell-date="row.is_closed ? (row.close_date || row.exit_time || row.close_time || row.target_date) : ''"
+                :strategy-type="row.strategy_type"
+                mono
+                class="stock-code-link"
+              />
+              <StockLink
+                :code="row.code"
+                :name="row.name"
+                :label="row.name"
+                :buy-date="row.selection_date || row.date"
+                :sell-date="row.is_closed ? (row.close_date || row.exit_time || row.close_time || row.target_date) : ''"
+                :strategy-type="row.strategy_type"
+                class="stock-name-link"
+              />
               <Sparkline :row="row" />
             </div>
             <div v-if="rowRiskWarning(row)" class="risk-warning-line">
@@ -87,7 +127,7 @@
       <el-table-column label="卖出策略" min-width="220">
         <template #default="{ row }">
           <el-popover
-            v-if="isT3Strategy(row)"
+            v-if="hasPriceTrail(row)"
             placement="left"
             width="280"
             trigger="hover"
@@ -105,9 +145,9 @@
               <p v-if="returnTrail(row).loading" class="trail-muted">读取收益路径...</p>
               <p v-else-if="returnTrail(row).error" class="trail-error">{{ returnTrail(row).error }}</p>
               <ol v-else-if="returnTrail(row).rows.length">
-                <li v-for="item in returnTrail(row).rows" :key="`${row.code}-${item.date}`">
-                  <span>{{ item.date }}</span>
-                  <strong>{{ money(item.close) }}</strong>
+                <li v-for="item in returnTrail(row).rows" :key="`${row.code}-${item.date}-${item.label || ''}`">
+                  <span>{{ item.label || item.date }}</span>
+                  <strong>{{ money(item.price ?? item.close) }}</strong>
                   <em :class="numberClass(item.returnPct)">{{ pct(item.returnPct) }}</em>
                 </li>
               </ol>
@@ -131,7 +171,15 @@
       </el-table-column>
       <el-table-column label="状态" width="118">
         <template #default="{ row }">
-          <span :class="stateClass(row)">{{ stateText(row) }}</span>
+          <el-tooltip
+            v-if="hasFiveMinuteExitTooltip(row)"
+            :content="fiveMinuteExitTooltip(row)"
+            placement="top"
+            effect="dark"
+          >
+            <span :class="stateClass(row)">{{ stateText(row) }}</span>
+          </el-tooltip>
+          <span v-else :class="stateClass(row)">{{ stateText(row) }}</span>
         </template>
       </el-table-column>
       <el-table-column label="操作" width="146" fixed="right">
@@ -165,6 +213,7 @@ const props = defineProps({
 defineEmits(['inspect', 'explain'])
 
 const selectedMonth = ref('')
+const selectedMonthStrategyFilter = ref('')
 const returnTrailCache = reactive({})
 
 const isSwingStrategy = (rowOrStrategy) => {
@@ -199,9 +248,14 @@ watch(months, (value) => {
   }
 }, { immediate: true })
 
-const displayRows = computed(() => {
+const selectedMonthRows = computed(() => {
   if (!props.useMonths) return filteredRows.value
   return monthGroups.value[selectedMonth.value] || []
+})
+const displayRows = computed(() => {
+  const rows = selectedMonthRows.value
+  if (!props.useMonths || !selectedMonthStrategyFilter.value) return rows
+  return rows.filter((row) => row.strategy_type === selectedMonthStrategyFilter.value)
 })
 
 const hasOnlySwing = computed(() => displayRows.value.length > 0 && displayRows.value.every((row) => isSwingStrategy(row)))
@@ -218,6 +272,14 @@ const pct = (value) => {
   const num = toNum(value)
   return num === null ? '-' : `${num.toFixed(2)}%`
 }
+const signedPct = (value) => {
+  const num = toNum(value)
+  return num === null ? '-' : `${num > 0 ? '+' : ''}${num.toFixed(2)}%`
+}
+const ratioText = (value) => {
+  const num = toNum(value)
+  return num === null ? '胜率 -' : `胜率 ${num.toFixed(2)}%`
+}
 const money = (value) => {
   const num = toNum(value)
   return num === null ? '-' : num.toFixed(2)
@@ -229,18 +291,22 @@ const normalizeDate = (value) => {
   return raw.slice(0, 10).replaceAll('/', '-')
 }
 const buyPrice = (row) => toNum(row?.snapshot_price ?? row?.selection_price ?? row?.price ?? row?.raw?.winner?.price)
+const hasPriceTrail = (row) => buyPrice(row) !== null
 const returnTrailKey = (row) => `${row?.code || ''}-${normalizeDate(row?.selection_date || row?.date)}-${normalizeDate(row?.target_date || row?.close_date)}`
 const returnTrail = (row) => returnTrailCache[returnTrailKey(row)] || { loading: false, error: '', rows: [] }
 const loadReturnTrail = async (row) => {
-  if (!isT3Strategy(row)) return
   const key = returnTrailKey(row)
   if (!key || returnTrailCache[key]?.loaded || returnTrailCache[key]?.loading) return
+  if (!isT3Strategy(row)) {
+    returnTrailCache[key] = { loading: false, loaded: true, error: '', rows: buildStaticReturnTrail(row) }
+    return
+  }
   const code = String(row?.code || '').replace(/\D/g, '').slice(-6)
   const anchor = buyPrice(row)
   const start = normalizeDate(row?.selection_date || row?.date)
   const end = normalizeDate(row?.target_date || row?.close_date)
   if (!code || anchor === null || anchor <= 0 || !start) {
-    returnTrailCache[key] = { loading: false, loaded: true, error: '缺少买入锚点或代码', rows: [] }
+    returnTrailCache[key] = { loading: false, loaded: true, error: '缺少买入锚点或代码', rows: buildStaticReturnTrail(row) }
     return
   }
   returnTrailCache[key] = { loading: true, loaded: false, error: '', rows: [] }
@@ -251,6 +317,8 @@ const loadReturnTrail = async (row) => {
     const rows = (payload.rows || [])
       .map((item) => ({
         date: normalizeDate(item.date),
+        label: normalizeDate(item.date),
+        price: toNum(item.close),
         close: toNum(item.close),
       }))
       .filter((item) => item.date && item.close !== null && item.date >= start && (!end || item.date <= end))
@@ -260,8 +328,46 @@ const loadReturnTrail = async (row) => {
       }))
     returnTrailCache[key] = { loading: false, loaded: true, error: '', rows }
   } catch (error) {
-    returnTrailCache[key] = { loading: false, loaded: true, error: error.message || '历史日线读取失败', rows: [] }
+    const fallbackRows = buildStaticReturnTrail(row)
+    returnTrailCache[key] = {
+      loading: false,
+      loaded: true,
+      error: fallbackRows.length ? '' : (error.message || '历史日线读取失败'),
+      rows: fallbackRows,
+    }
   }
+}
+const buildStaticReturnTrail = (row) => {
+  const anchor = buyPrice(row)
+  const rows = []
+  const seen = new Set()
+  const push = (date, label, priceValue, returnValue) => {
+    const cleanDate = normalizeDate(date)
+    const priceValueNum = toNum(priceValue)
+    const returnValueNum = toNum(returnValue)
+    if (!cleanDate && priceValueNum === null) return
+    const key = `${cleanDate}-${label}-${priceValueNum ?? ''}`
+    if (seen.has(key)) return
+    seen.add(key)
+    rows.push({
+      date: cleanDate || label,
+      label: cleanDate ? `${cleanDate} ${label}` : label,
+      price: priceValueNum,
+      close: priceValueNum,
+      returnPct: returnValueNum,
+    })
+  }
+  push(row?.selection_date || row?.date, row?.snapshot_time || '14:50 锚点', anchor, 0)
+  const winner = rawWinner(row)
+  const openDate = row?.next_date || winner.next_date || row?.target_date || row?.open_checked_at
+  const openPrice = row?.open_price ?? winner.open_price ?? winner.next_open
+  const openReturn = row?.open_premium ?? winner.open_premium
+  push(openDate, 'T+1 开盘', openPrice, openReturn)
+  if (row?.is_closed) {
+    const exitDate = row?.close_time || winner.close_time || row?.close_date || row?.target_date
+    push(exitDate, '卖出结算', closePrice(row), resultValue(row))
+  }
+  return rows
 }
 const themeMomentumPct = (value) => {
   const num = toNum(value)
@@ -298,20 +404,26 @@ const positionClass = (row) => {
   return 'position-badge position-normal'
 }
 const expected = (row) => toNum(row.expected_t3_max_gain_pct ?? row.expected_premium ?? row.predicted_open_premium ?? row.composite_score)
-const settlementReturn = (row) => toNum(
-  row.close_return_pct ??
-  row.t3_settlement_return_pct ??
-  rawWinner(row)?.t3_settlement_return_pct ??
-  row.t3_close_return_pct ??
-  rawWinner(row)?.t3_close_return_pct
-)
-const closePrice = (row) => toNum(
-  row.close_price ??
-  row.t3_settlement_price ??
-  rawWinner(row)?.t3_settlement_price ??
-  row.t3_close ??
-  rawWinner(row)?.t3_close
-)
+const settlementReturn = (row) => {
+  if (!row?.is_closed) return null
+  return toNum(
+    row.close_return_pct ??
+    row.t3_settlement_return_pct ??
+    rawWinner(row)?.t3_settlement_return_pct ??
+    row.t3_close_return_pct ??
+    rawWinner(row)?.t3_close_return_pct
+  )
+}
+const closePrice = (row) => {
+  if (!row?.is_closed) return null
+  return toNum(
+    row.close_price ??
+    row.t3_settlement_price ??
+    rawWinner(row)?.t3_settlement_price ??
+    row.t3_close ??
+    rawWinner(row)?.t3_close
+  )
+}
 const maxFloatingGain = (row) => isSwingStrategy(row)
   ? toNum(row.t3_max_gain_pct ?? rawWinner(row)?.t3_max_gain_pct)
   : null
@@ -320,6 +432,76 @@ const resultValue = (row) => {
   if (row.is_closed && closedReturn !== null) return closedReturn
   return isSwingStrategy(row) ? settlementReturn(row) : toNum(row.open_premium)
 }
+const positionWeight = (row) => {
+  const value = suggestedPosition(row)
+  if (value === null) return 1
+  return value > 1 ? value / 100 : value
+}
+const selectedMonthStats = computed(() => {
+  let closedCount = 0
+  let totalReturnPct = 0
+  let hasReturn = false
+  for (const row of selectedMonthRows.value) {
+    if (!row?.is_closed) continue
+    closedCount += 1
+    const value = resultValue(row)
+    if (value === null) continue
+    totalReturnPct += positionWeight(row) * value
+    hasReturn = true
+  }
+  return {
+    totalCount: selectedMonthRows.value.length,
+    closedCount,
+    returnPct: hasReturn ? totalReturnPct : null,
+  }
+})
+const summarizeStrategyMonth = (strategy, label) => {
+  let closedCount = 0
+  let winCount = 0
+  let revenuePct = 0
+  let hasReturn = false
+  for (const row of selectedMonthRows.value) {
+    if (row?.strategy_type !== strategy || !row?.is_closed) continue
+    const value = resultValue(row)
+    if (value === null) continue
+    closedCount += 1
+    if (value > 0) winCount += 1
+    revenuePct += positionWeight(row) * value
+    hasReturn = true
+  }
+  return {
+    strategy,
+    label,
+    winRate: closedCount > 0 ? (winCount / closedCount) * 100 : null,
+    revenuePct: hasReturn ? revenuePct : null,
+  }
+}
+const strategyRank = (strategy) => ({
+  全局动量狙击: 40,
+  右侧主升浪: 30,
+  中线超跌反转: 20,
+  尾盘突破: 10,
+  '尾盘突破-ST特情': 8,
+  首阴低吸: 0,
+})[strategy] ?? -10
+const selectedMonthStrategies = computed(() => {
+  const seen = new Set()
+  const strategies = []
+  for (const row of selectedMonthRows.value) {
+    const strategy = String(row?.strategy_type || '').trim()
+    if (!strategy || seen.has(strategy)) continue
+    seen.add(strategy)
+    strategies.push(strategy)
+  }
+  return strategies.sort((a, b) => strategyRank(b) - strategyRank(a) || a.localeCompare(b, 'zh-Hans-CN'))
+})
+const selectedMonthStrategyStats = computed(() =>
+  selectedMonthStrategies.value.map((strategy) => summarizeStrategyMonth(strategy, strategyLabel(strategy)))
+)
+const toggleMonthStrategyFilter = (strategy) => {
+  selectedMonthStrategyFilter.value = selectedMonthStrategyFilter.value === strategy ? '' : strategy
+}
+const isMonthStrategyActive = (strategy) => selectedMonthStrategyFilter.value === strategy
 const primaryValue = (row) => isSwingStrategy(row) ? expected(row) : toNum(row.composite_score ?? row.win_rate)
 const primaryText = (row) => isSwingStrategy(row) ? pct(expected(row)) : `${(primaryValue(row) ?? 0).toFixed(2)} 分`
 const secondaryValue = (row) => {
@@ -337,11 +519,45 @@ const numberClass = (value) => {
 }
 const exitText = (row) => {
   const policy = row?.sell_strategy || row?.exit_policy || rawWinner(row)?.sell_strategy || rawWinner(row)?.exit_policy
-  if (policy) return policy
+  const mappedPolicy = humanExitPolicy(policy, row)
+  if (mappedPolicy) return mappedPolicy
   if (row.is_closed) return row.close_reason || row.close_date || '已结清'
   if (isSwingStrategy(row)) return row.close_date || row.target_date || 'T+3 观察期'
   return row.close_date || row.target_date || row.next_date || 'T+1 开盘'
 }
+const humanExitPolicy = (policy, row) => {
+  const text = String(policy || '').trim()
+  const closeSignal = row?.raw?.close_signal || {}
+  const source = String(closeSignal.source || row?.exit_policy_source || '')
+  const action = String(closeSignal.action || text || row?.close_reason || '').trim()
+  if (source === 'live_sentinel') {
+    const labels = {
+      intraday_disaster_stop: '5m实时巡逻兵：日内防爆止损',
+      trailing_take_profit: '5m实时巡逻兵：追踪止盈触发',
+      eod_structural_stop: '5m实时巡逻兵：尾盘结构止损',
+      t3_timeout: '5m实时巡逻兵：T+3超时清仓',
+    }
+    return labels[action] || (action ? `5m实时巡逻兵：${action}` : '5m实时巡逻兵：真实卖出闭环')
+  }
+  return text
+}
+const rawSentinel5m = (row) => row?.raw?.sentinel_5m || {}
+const closeTime = (row) => row?.close_time || rawWinner(row)?.close_time || rawSentinel5m(row)?.close_time || ''
+const hasFiveMinuteExitTooltip = (row) => {
+  if (!row?.is_closed || !closeTime(row)) return false
+  const closeSignal = row?.raw?.close_signal || {}
+  if (['live_sentinel', 'sentinel_5m_backtest'].includes(closeSignal.source)) return true
+  const text = [
+    row?.sell_strategy,
+    row?.exit_policy,
+    rawWinner(row)?.sell_strategy,
+    rawWinner(row)?.exit_policy,
+    rawSentinel5m(row)?.sell_strategy,
+    rawSentinel5m(row)?.exit_policy,
+  ].filter(Boolean).join(' ')
+  return text.includes('5m风控')
+}
+const fiveMinuteExitTooltip = (row) => `触发卖出时间：${closeTime(row)}`
 const stateText = (row) => {
   if (row.is_closed) return '已结清'
   if (row.status === 'pending_open') return '待开盘'
@@ -355,24 +571,24 @@ const stateClass = (row) => [
 const rowRiskWarning = (row) => row?.risk_warning || row?.raw?.winner?.risk_warning || ''
 const isDynamicFloor = (row) => (row?.selection_tier || row?.raw?.winner?.selection_tier || '') === 'dynamic_floor'
 const strategyLabel = (strategy) => {
-  if (strategy === '全局动量狙击') return '全局狙击'
+  if (strategy === '全局动量狙击') return 'V6全局狙击'
+  if (strategy === '尾盘突破-ST特情') return 'ST特情'
   if (strategy === '右侧主升浪') return '顺势主升浪'
   if (strategy === '中线超跌反转') return '中线超跌反转'
   if (strategy === '首阴低吸') return '低吸影子'
-  return '尾盘突破'
+  return strategy || '未知策略'
 }
-const strategyClass = (strategy) => [
-  'strategy-badge',
-  strategy === '全局动量狙击'
-    ? 'strategy-global'
-    : strategy === '右侧主升浪'
-      ? 'strategy-main'
-      : strategy === '中线超跌反转'
-        ? 'strategy-reversal'
-        : strategy === '首阴低吸'
-          ? 'strategy-dip'
-          : 'strategy-breakout',
-]
+const strategyClass = (strategy) => {
+  const value = String(strategy || '')
+  let variant = 'strategy-generic'
+  if (value.includes('全局')) variant = 'strategy-global'
+  else if (value.toUpperCase().includes('ST')) variant = 'strategy-st'
+  else if (value.includes('主升')) variant = 'strategy-main'
+  else if (value.includes('超跌') || value.includes('反转')) variant = 'strategy-reversal'
+  else if (value.includes('低吸')) variant = 'strategy-dip'
+  else if (value.includes('尾盘') || value.includes('突破')) variant = 'strategy-breakout'
+  return ['strategy-badge', variant]
+}
 
 const sparkValues = (row) => {
   const raw = row.raw?.winner?.trend_features || row.trend_features || {}
@@ -444,6 +660,95 @@ h2 {
 
 .month-tabs {
   margin-top: -8px;
+}
+
+.month-return-strip {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  padding: 9px 0 10px;
+  margin: -2px 0 10px;
+}
+
+.month-return-main {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.month-return-main span,
+.month-return-meta {
+  color: #7f8aa1;
+  font-size: 0.75rem;
+  font-weight: 900;
+}
+
+.month-return-main strong {
+  font-size: 0.98rem;
+  font-weight: 950;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.month-strategy-stats {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex: 1;
+  min-width: 260px;
+}
+
+.month-strategy-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid rgba(127, 138, 161, 0.22);
+  border-radius: 7px;
+  padding: 4px 8px;
+  background: rgba(15, 23, 42, 0.32);
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 0.16s ease, background 0.16s ease;
+}
+
+.month-strategy-chip:hover {
+  border-color: rgba(105, 177, 255, 0.5);
+  background: rgba(24, 144, 255, 0.12);
+}
+
+.month-strategy-chip-active {
+  border-color: rgba(24, 144, 255, 0.68);
+  background: rgba(24, 144, 255, 0.18);
+}
+
+.month-strategy-chip span {
+  color: #d7deeb;
+  font-size: 0.72rem;
+  font-weight: 950;
+}
+
+.month-strategy-chip strong,
+.month-strategy-chip em {
+  font-size: 0.7rem;
+  font-style: normal;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+.month-strategy-chip strong {
+  color: #9aa7bb;
+}
+
+.month-return-meta {
+  white-space: nowrap;
 }
 
 .selection-table {
@@ -612,10 +917,22 @@ h2 {
   color: #ff7875;
 }
 
+.strategy-st {
+  border: 1px solid rgba(250, 219, 20, 0.5);
+  background: rgba(250, 219, 20, 0.14);
+  color: #ffec3d;
+}
+
 .strategy-dip {
   border: 1px solid rgba(250, 140, 22, 0.45);
   background: rgba(250, 140, 22, 0.16);
   color: #ffc069;
+}
+
+.strategy-generic {
+  border: 1px solid rgba(140, 150, 170, 0.42);
+  background: rgba(140, 150, 170, 0.14);
+  color: #c7d0df;
 }
 
 .state-pending {

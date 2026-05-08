@@ -1,0 +1,143 @@
+{
+  "status": "success",
+  "success_kind": "broker_alert_recorded",
+  "message": "券商弹窗已记录并自动确认：-150906130[-150906130]资金可用数不足,尚需20869.50",
+  "started_at": "2026-05-04 01:15:11",
+  "finished_at": "2026-05-04 01:15:30",
+  "code": "002747",
+  "name": "埃斯顿",
+  "attempts": [
+    {
+      "attempt": 1,
+      "started_at": "2026-05-04 01:15:11",
+      "code": "002747",
+      "name": "埃斯顿",
+      "cash": 117563.93,
+      "position_pct": 0.25,
+      "broker_snapshot": {
+        "status": "synced",
+        "target_window": 1,
+        "available_cash": 7563.93,
+        "order_form": {
+          "code": "",
+          "name": "",
+          "limit_price": null,
+          "quantity": null,
+          "current_price": null
+        },
+        "target_positions": [
+          {
+            "code": "002747",
+            "name": "埃斯顿",
+            "market_price": 21.87,
+            "pnl": -1.0,
+            "today_pnl": 107.0,
+            "pnl_pct": -0.046,
+            "actual_quantity": 100.0,
+            "stock_balance": 100.0,
+            "available_quantity": 100.0,
+            "frozen_quantity": 0.0,
+            "cost_price": 21.88,
+            "market_value": 2187.0,
+            "position_pct": 8.606
+          }
+        ],
+        "position_count": 3
+      },
+      "price": 21.87,
+      "price_source": "positions.002747.market_price",
+      "order": {
+        "code": "002747",
+        "current_price": 21.87,
+        "position_pct": 0.25,
+        "available_cash": 117563.93,
+        "reserve_rate": 0.995,
+        "target_amount": 29244.03,
+        "shares": 1300,
+        "estimated_cost": 28431.0
+      },
+      "mac_sniper": {
+        "status": "broker_alert",
+        "code": "002747",
+        "shares": 1300,
+        "limit_price": "21.87",
+        "returncode": null,
+        "stdout": "",
+        "stderr": "",
+        "hint": null,
+        "before_snapshot_error": "",
+        "after_snapshot_error": "",
+        "preexisting_broker_alert": {
+          "status": "absent",
+          "present": false,
+          "dismissed": false,
+          "message": ""
+        },
+        "broker_alert": {
+          "status": "present",
+          "present": true,
+          "title": "警告",
+          "message": "-150906130[-150906130]资金可用数不足,尚需20869.50",
+          "texts": [
+            "警告",
+            "-150906130[-150906130]资金可用数不足,尚需20869.50"
+          ],
+          "buttons": [
+            "确认"
+          ],
+          "dismissed": true,
+          "window": 1,
+          "sheet": 1,
+          "raw": "alert\t1\t1\ntext\t警告\t警告\ntext\t-150906130[-150906130]资金可用数不足,尚需20869.50\t-150906130[-150906130]资金可用数不足,尚需20869.50\nbutton\t确认\tmissing value\ndismissed\ttrue\n"
+        },
+        "broker_verification": {
+          "confirmed": false,
+          "code": "002747",
+          "requested_shares": 1300,
+          "before_quantity": 100,
+          "after_quantity": 100,
+          "filled_delta": 0,
+          "reason": "broker_alert",
+          "broker_alert_message": "-150906130[-150906130]资金可用数不足,尚需20869.50"
+        },
+        "after_snapshot": {
+          "status": "synced",
+          "target_window": 1,
+          "available_cash": 7563.93,
+          "order_form": {
+            "code": "",
+            "name": "",
+            "limit_price": null,
+            "quantity": null,
+            "current_price": null
+          },
+          "target_positions": [
+            {
+              "code": "002747",
+              "name": "埃斯顿",
+              "market_price": 21.87,
+              "pnl": -1.0,
+              "today_pnl": 107.0,
+              "pnl_pct": -0.046,
+              "actual_quantity": 100.0,
+              "stock_balance": 100.0,
+              "available_quantity": 100.0,
+              "frozen_quantity": 0.0,
+              "cost_price": 21.88,
+              "market_value": 2187.0,
+              "position_pct": 8.606
+            }
+          ],
+          "position_count": 3
+        }
+      },
+      "decision": {
+        "success": true,
+        "status": "success",
+        "kind": "broker_alert_recorded",
+        "message": "券商弹窗已记录并自动确认：-150906130[-150906130]资金可用数不足,尚需20869.50"
+      },
+      "status": "success"
+    }
+  ]
+}

@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import subprocess
+import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, time as dt_time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import requests
 
-from quant_core.config import PRODUCTION_TOTAL_PICK_LIMIT, PUSHPLUS_TOKEN, check_push_config
+from quant_core.config import PRODUCTION_TOTAL_PICK_LIMIT, check_push_config
+from quant_core.pushplus_tokens import list_active_pushplus_tokens, record_pushplus_send_result
 from quant_core.ai_agent.agent_gateway import attach_ai_interview, run_1446_ai_interview
+from quant_core.ai_agent.llm_engine import chat_completion
 from quant_core.data_pipeline.trading_calendar import is_trading_day
 from quant_core.daily_pick import save_pushed_top_picks
-from quant_core.engine.predictor import scan_market
+from quant_core.engine.predictor import PRODUCTION_OUTPUT_STRATEGIES, scan_market
 from quant_core.execution.mac_sniper import aim_and_fire, read_trade_panel_snapshot
 from quant_core.execution.position_sizer import (
     InsufficientFundsError,
@@ -23,6 +28,7 @@ from quant_core.execution.position_sizer import (
 )
 from quant_core.sniper_status import get_sniper_status
 from quant_core.storage import (
+    connect,
     database_overview,
     get_daily_picks,
     latest_prediction_snapshot,
@@ -33,18 +39,24 @@ from quant_core.storage import (
 
 
 PUSHPLUS_URL = "http://www.pushplus.plus/send"
+TOP_PICK_LOCK_TIME = dt_time(14, 50)
 BASE_DIR = Path(__file__).resolve().parent
 PUSHPLUS_RETRY_COUNT = 3
 PUSHPLUS_RETRY_DELAY_SECONDS = 2
 PUSHPLUS_MAX_CONTENT_LENGTH = 3500
 MAC_SNIPER_APP_NAME = os.getenv("QUANT_MAC_SNIPER_APP", "同花顺").strip() or "同花顺"
+TOP_PICK_AI_SUPPLEMENT_ENABLED = os.getenv("QUANT_TOP_PICK_AI_SUPPLEMENT", "1").strip().lower() not in {"0", "false", "no"}
+AI_SUPPLEMENT_LOG = Path("/Users/eudis/ths/logs/top_pick_ai_supplement.log")
+PREWARM_SCAN_ENABLED = os.getenv("QUANT_TOP_PICK_PREWARM_SCAN", "1").strip().lower() not in {"0", "false", "no"}
 PUSH_STRATEGY_PRIORITY = {
     "全局动量狙击": 4,
     "右侧主升浪": 3,
     "中线超跌反转": 2,
     "尾盘突破": 1,
+    "尾盘突破-ST特情": 0.8,
     "首阴低吸": 0,
 }
+ACTIVE_PUSH_STRATEGY_TYPES = set(PRODUCTION_OUTPUT_STRATEGIES)
 
 
 def send_pushplus(title: str, content: str) -> dict[str, Any]:
@@ -52,27 +64,58 @@ def send_pushplus(title: str, content: str) -> dict[str, Any]:
     if not config["ok"]:
         return {"status": "skipped_missing_token", "error": config["reason"]}
 
-    token = _pushplus_token()
-    if not token:
-        return {"status": "skipped_missing_token", "error": "缺少 PUSHPLUS_TOKEN，无法发送 PushPlus"}
+    tokens = list_active_pushplus_tokens()
+    if not tokens:
+        return {"status": "skipped_missing_token", "error": "缺少 PushPlus token，无法发送 PushPlus"}
 
     chunks = _split_markdown(content, PUSHPLUS_MAX_CONTENT_LENGTH)
-    results = []
-    for index, chunk in enumerate(chunks, start=1):
-        chunk_title = title if len(chunks) == 1 else f"{title} ({index}/{len(chunks)})"
-        results.append(_send_pushplus_once(token, chunk_title, chunk))
+    token_results = []
+    for token_info in tokens:
+        parts = []
+        for index, chunk in enumerate(chunks, start=1):
+            chunk_title = title if len(chunks) == 1 else f"{title} ({index}/{len(chunks)})"
+            parts.append(_send_pushplus_once(token_info["token"], chunk_title, chunk))
+        failed_parts = [item for item in parts if item.get("status") != "sent"]
+        status = "failed" if failed_parts else "sent"
+        error = failed_parts[-1].get("error") if failed_parts else ""
+        record_pushplus_send_result(token_info.get("id"), status, error or "")
+        token_results.append(
+            {
+                "token_id": token_info.get("id"),
+                "token_name": token_info.get("name"),
+                "token_mask": token_info.get("token_mask"),
+                "source": token_info.get("source"),
+                "status": status,
+                "parts": _public_push_parts(parts),
+                "error": error or "",
+            }
+        )
 
-    failed = [item for item in results if item.get("status") != "sent"]
-    if failed:
-        return {"status": "failed", "parts": results, "error": failed[-1].get("error") or "PushPlus 分段发送失败"}
-    if len(results) == 1:
-        return results[0]
+    failed = [item for item in token_results if item.get("status") != "sent"]
+    sent = [item for item in token_results if item.get("status") == "sent"]
+    if failed and not sent:
+        return {
+            "status": "failed",
+            "token_count": len(tokens),
+            "sent_count": 0,
+            "failed_count": len(failed),
+            "tokens": token_results,
+            "error": failed[-1].get("error") or "PushPlus 多 token 发送失败",
+        }
     return {
-        "status": "sent",
-        "multipart": True,
-        "parts": results,
-        "data": ",".join(str(item.get("data", "")) for item in results if item.get("data")),
-        "attempt": max(int(item.get("attempt", 1)) for item in results),
+        "status": "partial" if failed else "sent",
+        "multipart": len(chunks) > 1,
+        "token_count": len(tokens),
+        "sent_count": len(sent),
+        "failed_count": len(failed),
+        "tokens": token_results,
+        "parts": token_results[0].get("parts", []) if len(token_results) == 1 else [],
+        "data": ",".join(
+            str(part.get("data", ""))
+            for token_result in token_results
+            for part in token_result.get("parts", [])
+            if part.get("data")
+        ),
     }
 
 
@@ -105,6 +148,21 @@ def _send_pushplus_once(token: str, title: str, content: str) -> dict[str, Any]:
     return {"status": "failed", "attempts": PUSHPLUS_RETRY_COUNT, "error": last_error}
 
 
+def _public_push_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    clean = []
+    for item in parts:
+        clean.append(
+            {
+                "status": item.get("status"),
+                "code": item.get("code"),
+                "data": item.get("data"),
+                "attempt": item.get("attempt") or item.get("attempts"),
+                "error": item.get("error", ""),
+            }
+        )
+    return clean
+
+
 def heartbeat() -> dict[str, Any]:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     overview = database_overview()
@@ -121,7 +179,7 @@ def heartbeat() -> dict[str, Any]:
 数据日期范围: {overview.get('min_date')} 至 {overview.get('max_date')}
 预测缓存条数: {cached_rows}
 最新数据验证: {latest_report.get('status', '无')} / 错误 {latest_report_summary.get('error_count', '-')} / 警告 {latest_report_summary.get('warning_count', '-')}
-今日14:50将推送实时最高预期溢价股票。
+今日14:50将按当前启用策略各取 Top1 推送。
 """
     result = send_pushplus("量化项目心跳：运行正常", content)
     print({"status": "sent", "task": "heartbeat", "time": now, "pushplus": result})
@@ -133,6 +191,10 @@ def top_pick() -> dict[str, Any]:
     today = date.today()
     if not is_trading_day(today):
         result = {"status": "skipped", "reason": "非交易日不执行 14:50 推送", "selection_date": today.isoformat()}
+        print(result)
+        return result
+    if datetime.now().time() < TOP_PICK_LOCK_TIME:
+        result = {"status": "skipped", "reason": "未到 14:50，不执行 14:50 推送", "selection_date": today.isoformat(), "time": now}
         print(result)
         return result
 
@@ -176,17 +238,13 @@ def top_pick() -> dict[str, Any]:
 状态: 空仓
 模式: {gate.get('mode')}
 14:30快照: {intraday.get('status')} | 拦截: {intraday.get('trapped_count', 0)}
-原因: 没有达到四大军团动态底线且通过物理风控的候选股。
+原因: 没有达到当前启用策略动态底线且通过物理风控的候选股。
 模型状态: {scan.get('model_status')}
 """
         result = send_pushplus("14:50尾盘策略：无强信号空仓", content)
         print({"status": "sent", "task": "top_pick", "time": now, "pushplus": result})
         return result
-    ai_interview = run_1446_ai_interview(
-        [str(row.get("code") or "") for row in rows],
-        [str(row.get("name") or "") for row in rows],
-        rows,
-    )
+    ai_interview = _deferred_ai_interview(rows)
     rows = attach_ai_interview(rows, ai_interview)
     saved = save_pushed_top_picks(rows, scan, force=False)
     pick_lines = "\n".join(_pick_line(winner) for winner in rows) or "- 本次扫描无可展示标的。"
@@ -209,8 +267,20 @@ def top_pick() -> dict[str, Any]:
     day_rows = _limit_top_push_rows(get_daily_picks(date.today().isoformat()))
     _mark_push(date.today().isoformat(), day_rows, result)
     sniper_result = _trigger_mac_sniper(rows)
-    print(_compact_task_result("sent", "top_pick", now, day_rows, result, daily_pick=saved, mac_sniper=sniper_result))
-    return {"pushplus": result, "mac_sniper": sniper_result, "daily_pick": saved}
+    supplement_result = _spawn_ai_supplement(date.today().isoformat(), enabled=TOP_PICK_AI_SUPPLEMENT_ENABLED)
+    print(
+        _compact_task_result(
+            "sent",
+            "top_pick",
+            now,
+            day_rows,
+            result,
+            daily_pick=saved,
+            mac_sniper=sniper_result,
+            ai_supplement=supplement_result,
+        )
+    )
+    return {"pushplus": result, "mac_sniper": sniper_result, "daily_pick": saved, "ai_supplement": supplement_result}
 
 
 def resend_today(send_push: bool = True) -> dict[str, Any]:
@@ -237,6 +307,131 @@ def resend_today(send_push: bool = True) -> dict[str, Any]:
     return {"pushplus": result, "daily_pick": {"status": "resent", "picks": rows}}
 
 
+def ai_supplement(selection_date: str = "today", send_push: bool = True, force: bool = False, update_db: bool = True) -> dict[str, Any]:
+    target_date = date.today().isoformat() if str(selection_date or "").lower() == "today" else str(selection_date)[:10]
+    rows = _limit_top_push_rows(get_daily_picks(target_date))
+    if not rows:
+        result = {"status": "noop", "reason": "没有可补充 AI 风控的 14:50 真实账本记录", "selection_date": target_date}
+        print(result)
+        return result
+    if not force and _all_ai_supplement_completed(rows):
+        result = {"status": "noop", "reason": "AI 风控补充已完成，未重复推送", "selection_date": target_date, "count": len(rows)}
+        print(result)
+        return result
+
+    started_at = datetime.now().isoformat(timespec="seconds")
+    codes = [str(row.get("code") or "") for row in rows]
+    names = [str(row.get("name") or "") for row in rows]
+    ai_rows = [_row_for_ai(row) for row in rows]
+    ai_interview = run_1446_ai_interview(codes, names, ai_rows)
+    ai_block = str(ai_interview.get("markdown") or "").strip()
+    content = f"""14:50 AI舆情与风险排查补充
+日期: {target_date}
+生成时间: {started_at}
+标的数量: {len(rows)}
+
+说明: 14:50 主交易指令已先行推送；本报告只做舆情和公告风险补充，不改写量化排序、买入代码、快照价或快照时间。
+
+{ai_block}
+"""
+    push_result = send_pushplus(f"14:50 AI风控补充: {len(rows)}只", content) if send_push else {"status": "dry_run"}
+    push_ok = push_result.get("status") in {"sent", "partial"}
+    updated_count = _update_daily_pick_ai_interview(target_date, rows, ai_interview) if update_db and push_ok else 0
+    result = {
+        "status": "sent" if push_ok else push_result.get("status", "unknown"),
+        "task": "ai_supplement",
+        "selection_date": target_date,
+        "count": len(rows),
+        "ai_status": ai_interview.get("status"),
+        "ai_model": ai_interview.get("model"),
+        "updated_count": updated_count,
+        "pushplus": push_result,
+    }
+    print(result)
+    return result
+
+
+def prewarm_top_pick(run_scan: bool = PREWARM_SCAN_ENABLED) -> dict[str, Any]:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    today = date.today()
+    if not is_trading_day(today):
+        result = {"status": "skipped", "task": "prewarm_top_pick", "reason": "非交易日不预热", "time": now}
+        print(result)
+        return result
+
+    started = time.time()
+    ollama_ensure = _ensure_ollama_ready()
+    scan_result: Optional[dict[str, Any]] = None
+    scan_error = ""
+    if run_scan:
+        try:
+            scan_started = time.time()
+            scan = scan_market(
+                limit=PRODUCTION_TOTAL_PICK_LIMIT,
+                persist_snapshot=False,
+                cache_prediction=False,
+                async_persist=False,
+            )
+            scan_result = {
+                "status": "ok",
+                "elapsed_seconds": round(time.time() - scan_started, 3),
+                "rows": len(scan.get("rows") or []),
+                "model_status": scan.get("model_status"),
+            }
+        except Exception as exc:
+            scan_error = str(exc)
+            scan_result = {"status": "failed", "error": scan_error}
+
+    ai_started = time.time()
+    ai_response = chat_completion(
+        "你是本地量化工作站健康检查，只输出极短JSON。",
+        '{"ok": true, "task": "prewarm"}',
+        temperature=0.0,
+        max_tokens=12,
+    )
+    result = {
+        "status": "ready" if ai_response.get("ok") and not scan_error else "degraded",
+        "task": "prewarm_top_pick",
+        "time": now,
+        "elapsed_seconds": round(time.time() - started, 3),
+        "scan": scan_result or {"status": "skipped"},
+        "ollama_ensure": ollama_ensure,
+        "ollama": {
+            "ok": bool(ai_response.get("ok")),
+            "model": ai_response.get("model"),
+            "elapsed_seconds": round(time.time() - ai_started, 3),
+            "error": ai_response.get("error", ""),
+        },
+    }
+    print(result)
+    return result
+
+
+def _ensure_ollama_ready() -> dict[str, Any]:
+    started = time.time()
+    if _ollama_tags_ready(timeout=2):
+        return {"status": "ready", "elapsed_seconds": round(time.time() - started, 3)}
+    try:
+        subprocess.run(["/usr/bin/open", "-gja", "Ollama"], timeout=5, check=False)
+    except Exception as exc:
+        return {"status": "open_failed", "elapsed_seconds": round(time.time() - started, 3), "error": str(exc)}
+    for _ in range(20):
+        if _ollama_tags_ready(timeout=2):
+            return {"status": "started", "elapsed_seconds": round(time.time() - started, 3)}
+        time.sleep(1)
+    return {"status": "timeout", "elapsed_seconds": round(time.time() - started, 3)}
+
+
+def _ollama_tags_ready(timeout: int = 2) -> bool:
+    try:
+        session = requests.Session()
+        session.trust_env = False
+        response = session.get("http://127.0.0.1:11434/api/tags", timeout=timeout, proxies={"http": None, "https": None})
+        return response.ok
+    except Exception:
+        return False
+
+
 def preview_trade_markdown(selection_date: str = "latest", limit: int = PRODUCTION_TOTAL_PICK_LIMIT) -> dict[str, Any]:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = _preview_rows(selection_date, limit=limit)
@@ -256,6 +451,143 @@ def preview_trade_markdown(selection_date: str = "latest", limit: int = PRODUCTI
 """
     print(content)
     return {"status": "dry_run", "selection_date": preview_date, "count": len(rows), "content": content}
+
+
+def _deferred_ai_interview(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    items = []
+    for row in rows:
+        code = _normalize_a_share_code(row.get("code") or "")
+        name = str(row.get("name") or code)
+        items.append(
+            {
+                "code": code,
+                "name": name,
+                "risk_level": "待补充",
+                "verdict": "AI舆情已转入异步补充，不阻塞14:50交易主推送。",
+                "reason": "主推送只使用量化结构化结果；Ollama 风控报告完成后会单独补发。",
+                "action_hint": "按量化规则执行，等待AI补充",
+            }
+        )
+    return {
+        "status": "deferred",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "model": "async_supplement",
+        "summary": "AI舆情与风险排查已异步补发，不阻塞14:50主交易指令。",
+        "items": items,
+        "news": {},
+        "raw_content": "",
+        "markdown": "\n".join(
+            [
+                "### AI舆情与风险排查",
+                "- 状态：deferred / 模型：async_supplement",
+                "- 总评：AI舆情与风险排查已异步补发，不阻塞14:50主交易指令。",
+                *[
+                    f"- 【{item['name']}({item['code']})】风险:{item['risk_level']} / 建议:{item['action_hint']} / {item['verdict']}；{item['reason']}"
+                    for item in items
+                ],
+            ]
+        ),
+    }
+
+
+def _spawn_ai_supplement(selection_date: str, enabled: bool = True) -> dict[str, Any]:
+    if not enabled:
+        return {"status": "skipped", "reason": "ai_supplement_disabled"}
+    try:
+        AI_SUPPLEMENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = AI_SUPPLEMENT_LOG.open("a", encoding="utf-8")
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "quant_core.execution.pushplus_tasks",
+                "ai-supplement",
+                "--date",
+                selection_date,
+            ],
+            cwd="/Users/eudis/ths",
+            stdout=log_fh,
+            stderr=log_fh,
+            start_new_session=True,
+        )
+        log_fh.close()
+        return {"status": "spawned", "pid": process.pid, "log": str(AI_SUPPLEMENT_LOG)}
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc), "log": str(AI_SUPPLEMENT_LOG)}
+
+
+def _row_for_ai(row: dict[str, Any]) -> dict[str, Any]:
+    out = dict(_winner_payload(row) or {})
+    for key in (
+        "id",
+        "code",
+        "name",
+        "strategy_type",
+        "snapshot_price",
+        "selection_price",
+        "selection_change",
+        "win_rate",
+        "suggested_position",
+        "core_theme",
+        "theme_momentum_3d",
+    ):
+        if row.get(key) is not None:
+            out[key] = row.get(key)
+    out["code"] = _normalize_a_share_code(out.get("code") or row.get("code") or "")
+    out["name"] = str(out.get("name") or row.get("name") or out["code"])
+    return out
+
+
+def _all_ai_supplement_completed(rows: list[dict[str, Any]]) -> bool:
+    if not rows:
+        return False
+    for row in rows:
+        raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+        result = raw.get("ai_interview_result") if isinstance(raw.get("ai_interview_result"), dict) else {}
+        if str(result.get("source") or "") != "async_ai_supplement":
+            return False
+        if str(result.get("status") or "") not in {"ok", "invalid_json"}:
+            return False
+    return True
+
+
+def _update_daily_pick_ai_interview(selection_date: str, rows: list[dict[str, Any]], interview: dict[str, Any]) -> int:
+    by_code = {
+        _normalize_a_share_code(item.get("code") or ""): item
+        for item in interview.get("items", [])
+        if isinstance(item, dict) and item.get("code")
+    }
+    if not by_code:
+        return 0
+    updated = 0
+    with connect() as conn:
+        for row in rows:
+            pick_id = row.get("id")
+            code = _normalize_a_share_code(row.get("code") or "")
+            item = by_code.get(code)
+            if not pick_id or not item:
+                continue
+            raw = dict(row.get("raw") or {})
+            winner = dict(raw.get("winner") or {})
+            winner["ai_interview"] = item
+            raw["winner"] = winner
+            raw["ai_interview_result"] = {
+                "source": "async_ai_supplement",
+                "status": interview.get("status"),
+                "model": interview.get("model"),
+                "created_at": interview.get("created_at"),
+                "summary": interview.get("summary"),
+            }
+            conn.execute(
+                """
+                UPDATE daily_picks
+                SET raw_json = ?
+                WHERE id = ? AND selection_date = ? AND code = ?
+                """,
+                (json.dumps(raw, ensure_ascii=False), int(pick_id), selection_date, code),
+            )
+            updated += 1
+    return updated
 
 
 def _pick_line(row: dict[str, Any], exists: bool = False) -> str:
@@ -361,7 +693,12 @@ def _limit_top_push_rows(rows: list[dict[str, Any]], limit: int = PRODUCTION_TOT
     except (TypeError, ValueError):
         cap = int(PRODUCTION_TOTAL_PICK_LIMIT)
     cap = max(1, min(int(PRODUCTION_TOTAL_PICK_LIMIT), cap))
-    return sorted(list(rows or []), key=_push_row_sort_key, reverse=True)[:cap]
+    active_rows = [
+        row
+        for row in list(rows or [])
+        if str(row.get("strategy_type") or _winner_payload(row).get("strategy_type") or "") in ACTIVE_PUSH_STRATEGY_TYPES
+    ]
+    return sorted(active_rows, key=_push_row_sort_key, reverse=True)[:cap]
 
 
 def _push_row_sort_key(row: dict[str, Any]) -> tuple[float, float, float, float]:
@@ -472,23 +809,6 @@ def _ai_summary(row: dict[str, Any]) -> str:
     return f"风险{risk} / {hint} / {detail}".strip()
 
 
-def _pushplus_token() -> str:
-    token = (PUSHPLUS_TOKEN or os.getenv("PUSHPLUS_TOKEN") or "").strip()
-    if token:
-        return token
-    env_path = BASE_DIR / ".env"
-    if not env_path.exists():
-        return ""
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        if key.strip() == "PUSHPLUS_TOKEN":
-            return value.strip().strip('"').strip("'")
-    return ""
-
-
 def _split_markdown(content: str, max_length: int) -> list[str]:
     if len(content) <= max_length:
         return [content]
@@ -533,6 +853,7 @@ def _compact_task_result(
     pushplus: dict[str, Any],
     daily_pick: dict[str, Any] | None = None,
     mac_sniper: dict[str, Any] | None = None,
+    ai_supplement: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "status": status,
@@ -556,6 +877,8 @@ def _compact_task_result(
         payload["daily_pick"] = daily_pick
     if mac_sniper is not None:
         payload["mac_sniper"] = mac_sniper
+    if ai_supplement is not None:
+        payload["ai_supplement"] = ai_supplement
     return payload
 
 
@@ -574,11 +897,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="PushPlus 定时通知任务")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("heartbeat", help="发送项目运行正常心跳")
-    top_parser = sub.add_parser("top-pick", help="推送实时最高预期溢价股票")
+    top_parser = sub.add_parser("top-pick", help="推送当前启用策略分策略 Top1")
     top_parser.add_argument("--dry-run", action="store_true", help="只打印一键狙击 Markdown，不发送微信、不扫描、不写库")
     top_parser.add_argument("--preview-date", default="latest", help="dry-run 预览日期，默认 latest 使用最近一次出票")
     resend_parser = sub.add_parser("resend-today", help="补发今日未标记为已推送的影子测试标的")
     resend_parser.add_argument("--dry-run", action="store_true", help="只检查补发候选，不发送微信、不写推送状态")
+    ai_parser = sub.add_parser("ai-supplement", help="异步补发14:50候选的AI舆情与风险排查")
+    ai_parser.add_argument("--date", default="today", help="补发日期，默认 today")
+    ai_parser.add_argument("--dry-run", action="store_true", help="运行AI但不推送、不写库")
+    ai_parser.add_argument("--force", action="store_true", help="即使已补发也重新生成")
+    prewarm_parser = sub.add_parser("prewarm-top-pick", help="14:45 预热14:50出票链路和Ollama")
+    prewarm_parser.add_argument("--no-scan", action="store_true", help="只预热Ollama，不运行全市场扫描")
     args = parser.parse_args()
 
     if args.command == "heartbeat":
@@ -590,6 +919,10 @@ def main() -> None:
             top_pick()
     elif args.command == "resend-today":
         resend_today(send_push=not args.dry_run)
+    elif args.command == "ai-supplement":
+        ai_supplement(selection_date=args.date, send_push=not args.dry_run, force=args.force, update_db=not args.dry_run)
+    elif args.command == "prewarm-top-pick":
+        prewarm_top_pick(run_scan=not args.no_scan)
 
 
 if __name__ == "__main__":

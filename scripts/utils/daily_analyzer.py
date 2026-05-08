@@ -3,8 +3,10 @@ import pandas as pd
 import xgboost as xgb
 import os
 import numpy as np
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 import json
 import re
 import warnings
@@ -12,27 +14,28 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ================= 配置区 =================
-PUSH_TOKEN = os.getenv("PUSHPLUS_TOKEN", "").strip()
 BASE_DIR = "/Users/eudis/ths"  # 从你的系统配置中锁定绝对路径
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+from quant_core.execution.pushplus_tasks import send_pushplus
+
 MODEL_PATH = os.path.join(BASE_DIR, "overnight_xgboost.json")
 OUTPUT_JSON = os.path.join(BASE_DIR, "models", "latest_top_50.json") # 网页端读取的缓存文件
 # =========================================
 
 def send_wechat_msg(title, content):
     """微信推送函数"""
-    if not PUSH_TOKEN:
-        print("未配置 PUSHPLUS_TOKEN，跳过 PushPlus 推送。")
-        return
-    url = "http://www.pushplus.plus/send"
-    data = {"token": PUSH_TOKEN, "title": title, "content": content, "template": "txt"}
-    try:
-        res = requests.post(url, json=data, timeout=10)
-        if res.json()['code'] == 200:
-            print(f"✅ 推送成功：{title}")
-        else:
-            print(f"❌ 推送失败：{res.text}")
-    except Exception as e:
-        print(f"❌ 网络推送异常: {e}")
+    result = send_pushplus(title, content)
+    print(
+        {
+            "title": title,
+            "status": result.get("status"),
+            "token_count": result.get("token_count"),
+            "sent_count": result.get("sent_count"),
+            "failed_count": result.get("failed_count"),
+        }
+    )
 
 def get_realtime_data_sina():
     """新浪(Sina)底层全市场快照"""

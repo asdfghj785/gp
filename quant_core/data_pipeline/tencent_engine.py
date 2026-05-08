@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 import pandas as pd
 import requests
 
 
 TENCENT_MKLINE_URL = "http://ifzq.gtimg.cn/appstock/app/kline/mkline"
+TENCENT_FQKLINE_URL = "http://ifzq.gtimg.cn/appstock/app/fqkline/get"
 TENCENT_REALTIME_URL = "http://qt.gtimg.cn/q={symbol}"
 
 
@@ -47,6 +48,62 @@ def get_tencent_m5(code: str, count: int = 48) -> pd.DataFrame:
     for col in ["open", "close", "high", "low", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
     return df.sort_values("datetime").reset_index(drop=True)
+
+
+def get_tencent_daily(code: str, count: int = 1000, adjust: str = "qfq") -> pd.DataFrame:
+    """Fetch daily K lines from Tencent.
+
+    ``adjust='qfq'`` returns Tencent's forward-adjusted daily bars. The payload
+    has no turnover/amount fields, so downstream archival code should preserve
+    richer existing rows and use this only to fill missing dates.
+    """
+    symbol = tencent_symbol(code)
+    safe_adjust = str(adjust or "qfq").lower()
+    if safe_adjust not in {"qfq", "none"}:
+        raise ValueError("Tencent daily only supports adjust='qfq' or 'none'")
+    endpoint = TENCENT_FQKLINE_URL if safe_adjust == "qfq" else "http://ifzq.gtimg.cn/appstock/app/kline/kline"
+    suffix = ",qfq" if safe_adjust == "qfq" else ""
+    response = _request_get(
+        endpoint,
+        params={"param": f"{symbol},day,,,{max(1, int(count))}{suffix}"},
+        timeout=10,
+    )
+    payload = response.json()
+    node = ((payload.get("data") or {}).get(symbol) or {})
+    rows = node.get("qfqday" if safe_adjust == "qfq" else "day") or node.get("day") or []
+    if not rows:
+        return _empty_daily_frame()
+
+    parsed: list[dict[str, Any]] = []
+    for row in rows:
+        if len(row) < 6:
+            continue
+        parsed.append(
+            {
+                "date": pd.to_datetime(row[0], errors="coerce"),
+                "open": _safe_float(row[1]),
+                "close": _safe_float(row[2]),
+                "high": _safe_float(row[3]),
+                "low": _safe_float(row[4]),
+                "volume": _safe_float(row[5]),
+                "amount": 0.0,
+            }
+        )
+    df = pd.DataFrame(parsed)
+    if df.empty:
+        return _empty_daily_frame()
+    df = df.dropna(subset=["date"])
+    for col in ["open", "close", "high", "low", "volume", "amount"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["open", "close", "high", "low"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["pre_close"] = df["close"].shift(1)
+    df["change_pct"] = (df["close"] / df["pre_close"] - 1.0) * 100.0
+    df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+    df["code"] = normalize_stock_code(code)
+    df["symbol"] = symbol
+    df["source"] = f"tencent.daily.{safe_adjust}"
+    return df
 
 
 def get_tencent_realtime(code: str) -> dict[str, Any]:
@@ -112,7 +169,7 @@ def normalize_stock_code(code: str) -> str:
     return digits[-6:]
 
 
-def _request_get(url: str, params: dict[str, Any] | None = None, timeout: int = 8) -> requests.Response:
+def _request_get(url: str, params: Optional[dict[str, Any]] = None, timeout: int = 8) -> requests.Response:
     session = requests.Session()
     session.trust_env = False
     response = session.get(url, params=params, timeout=timeout, proxies={})
@@ -123,6 +180,10 @@ def _request_get(url: str, params: dict[str, Any] | None = None, timeout: int = 
 
 def _empty_m5_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=["datetime", "open", "close", "high", "low", "volume"])
+
+
+def _empty_daily_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=["date", "open", "close", "high", "low", "volume", "amount", "pre_close", "change_pct", "code", "symbol", "source"])
 
 
 def _field(fields: list[str], index: int) -> str:

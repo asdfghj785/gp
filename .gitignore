@@ -41,6 +41,10 @@ overnight_xgboost.json
 overnight_xgboost.json.bak_*
 overnight_premium_xgboost.json.bak_*
 !overnight_premium_xgboost.json
+models/experiments/
+scripts/research/*.parquet
+scripts/research/*.csv
+scripts/research/*_latest.json
 
 # Local environment / secrets
 .env

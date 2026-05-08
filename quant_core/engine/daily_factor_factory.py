@@ -95,6 +95,28 @@ def generate_daily_factors(df: pd.DataFrame) -> pd.DataFrame:
     amount = frame["amount"]
     ret = close.pct_change()
     typical = (high + low + close) / 3
+    pre_close = pd.to_numeric(frame["pre_close"], errors="coerce") if "pre_close" in frame.columns else close.shift(1)
+    pre_close = pre_close.where(pre_close > 0, close.shift(1))
+    change_pct = (
+        pd.to_numeric(frame["change_pct"], errors="coerce")
+        if "change_pct" in frame.columns
+        else pd.to_numeric(frame.get("pctChg", pd.Series(np.nan, index=frame.index)), errors="coerce")
+    )
+    change_pct = change_pct.where(change_pct.notna(), (safe_div(close, pre_close) - 1) * 100)
+    turnover = pd.to_numeric(frame.get("turnover", frame["turn"]), errors="coerce").fillna(frame["turn"])
+    prior_volume_ma5 = volume.shift(1).rolling(5, min_periods=3).mean()
+    volume_ratio = pd.to_numeric(frame.get("volume_ratio", safe_div(volume, prior_volume_ma5)), errors="coerce")
+    code_text = frame["code"].fillna("").astype(str).str.extract(r"(\d{6})", expand=False).fillna("")
+    name_text = frame.get("name", pd.Series("", index=frame.index)).fillna("").astype(str).str.upper()
+
+    frame["pre_close"] = pre_close
+    frame["change_pct"] = change_pct
+    frame["turnover"] = turnover
+    frame["volume_ratio"] = volume_ratio
+    frame["is_st"] = name_text.str.contains("ST", regex=False, na=False).astype(float)
+    frame["is_mainboard"] = code_text.str.startswith(("00", "60"), na=False).astype(float)
+    frame["is_chinext"] = code_text.str.startswith(("30", "301"), na=False).astype(float)
+    frame["is_star"] = code_text.str.startswith(("688", "689"), na=False).astype(float)
 
     for window in FACTOR_WINDOWS:
         ma = close.rolling(window, min_periods=1).mean()
@@ -136,15 +158,52 @@ def generate_daily_factors(df: pd.DataFrame) -> pd.DataFrame:
     factors["macd_signal"] = macd_signal
     factors["macd_hist"] = macd - macd_signal
     factors["macd_hist_delta"] = factors["macd_hist"].diff()
-    factors["body_pct"] = safe_div(close - open_, open_)
-    factors["upper_shadow_pct"] = safe_div(high - np.maximum(open_, close), close)
-    factors["lower_shadow_pct"] = safe_div(np.minimum(open_, close) - low, close)
+    factors["body_pct"] = safe_div(close - open_, pre_close) * 100
+    factors["upper_shadow_pct"] = safe_div(high - np.maximum(open_, close), pre_close) * 100
+    factors["lower_shadow_pct"] = safe_div(np.minimum(open_, close) - low, pre_close) * 100
+    factors["amplitude_pct"] = safe_div(high - low, pre_close) * 100
     factors["bar_range_pct"] = safe_div(high - low, close)
     factors["close_location_value"] = safe_div((close - low) - (high - close), high - low)
-    factors["gap_pct"] = safe_div(open_, close.shift(1)) - 1
+    factors["gap_pct"] = (safe_div(open_, pre_close) - 1) * 100
     factors["amount_per_volume"] = safe_div(amount, volume)
     factors["obv"] = obv_value
     factors["obv_delta_5"] = obv_value.diff(5)
+    for window in (3, 5, 10, 20, 60):
+        factors[f"return_{window}d"] = (safe_div(close, close.shift(window)) - 1) * 100
+    for window in (5, 10, 20, 30, 60):
+        ma = close.rolling(window, min_periods=1).mean()
+        factors[f"ma{window}_bias"] = (safe_div(close, ma) - 1) * 100
+    ma20 = close.rolling(20, min_periods=1).mean()
+    ma60 = close.rolling(60, min_periods=1).mean()
+    high60 = high.rolling(60, min_periods=1).max()
+    low60 = low.rolling(60, min_periods=1).min()
+    factors["ma20_ma60_spread"] = (safe_div(ma20, ma60) - 1) * 100
+    factors["high_position_60d"] = safe_div(close - low60, high60 - low60).clip(lower=0.0, upper=1.0)
+    factors["low_position_60d"] = safe_div(low - low60, high60 - low60).clip(lower=0.0, upper=1.0)
+    factors["drawdown_60d"] = (safe_div(close, high60) - 1) * 100
+    factors["pullback_from_60d_high"] = factors["drawdown_60d"]
+    for window in (5, 10, 20):
+        volume_ma = volume.rolling(window, min_periods=1).mean()
+        amount_ma = amount.rolling(window, min_periods=1).mean()
+        factors[f"volume_ratio_to_{window}d"] = safe_div(volume, volume_ma)
+        factors[f"amount_ratio_to_{window}d"] = safe_div(amount, amount_ma)
+        factors[f"turnover_mean_{window}d"] = turnover.rolling(window, min_periods=1).mean()
+        factors[f"volatility_{window}d"] = ret.rolling(window, min_periods=2).std(ddof=0) * 100
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr10 = true_range.rolling(10, min_periods=5).mean()
+    factors["vol_surge_ratio"] = safe_div(volume, prior_volume_ma5)
+    factors["price_compression"] = safe_div(atr10, close)
+    factors["close_to_high_proximity"] = safe_div(high - close, high - low).clip(lower=0.0, upper=1.0).fillna(0.0)
+    factors["entry_price"] = close
+    factors["buy5m_entry_price"] = close
 
     theme_factors = theme_relative_factor_frame(
         frame,

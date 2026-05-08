@@ -43,13 +43,26 @@ MIN_KLINE_DIR = Path(os.getenv("QUANT_MIN_KLINE_DIR", str(BASE_DIR / "data" / "m
 CORE_DB_DIR = Path(os.getenv("QUANT_CORE_DB_DIR", str(BASE_DIR / "data" / "core_db")))
 SQLITE_PATH = Path(os.getenv("QUANT_SQLITE_PATH", str(CORE_DB_DIR / "quant_workstation.sqlite3")))
 MODELS_DIR = Path(os.getenv("QUANT_MODELS_DIR", str(BASE_DIR / "models")))
+PRODUCTION_MODELS_DIR = MODELS_DIR / "production"
 MODEL_PATH = Path(os.getenv("QUANT_MODEL_PATH", str(MODELS_DIR / "overnight_xgboost.json")))
 PREMIUM_MODEL_PATH = Path(os.getenv("QUANT_PREMIUM_MODEL_PATH", str(MODELS_DIR / "overnight_premium_xgboost.json")))
 DIPBUY_PREMIUM_MODEL_PATH = Path(os.getenv("QUANT_DIPBUY_PREMIUM_MODEL_PATH", str(MODELS_DIR / "dipbuy_premium_xgboost.json")))
 REVERSAL_MODEL_PATH = Path(os.getenv("QUANT_REVERSAL_MODEL_PATH", str(MODELS_DIR / "reversal_t3_xgboost.json")))
 MAIN_WAVE_MODEL_PATH = Path(os.getenv("QUANT_MAIN_WAVE_MODEL_PATH", str(MODELS_DIR / "main_wave_t3_xgboost.json")))
-GLOBAL_DAILY_MODEL_PATH = Path(os.getenv("QUANT_GLOBAL_DAILY_MODEL_PATH", str(MODELS_DIR / "xgboost_daily_swing_global_v1.json")))
-GLOBAL_DAILY_META_PATH = Path(os.getenv("QUANT_GLOBAL_DAILY_META_PATH", str(MODELS_DIR / "xgboost_daily_swing_global_v1.meta.json")))
+GLOBAL_SNIPER_MODEL_PATH = Path(
+    os.getenv(
+        "QUANT_GLOBAL_SNIPER_MODEL_PATH",
+        str(PRODUCTION_MODELS_DIR / "xgboost_global_sniper_v6_0_extreme_burst.json"),
+    )
+)
+GLOBAL_SNIPER_META_PATH = Path(
+    os.getenv(
+        "QUANT_GLOBAL_SNIPER_META_PATH",
+        str(PRODUCTION_MODELS_DIR / "xgboost_global_sniper_v6_0_extreme_burst.meta.json"),
+    )
+)
+GLOBAL_DAILY_MODEL_PATH = GLOBAL_SNIPER_MODEL_PATH
+GLOBAL_DAILY_META_PATH = GLOBAL_SNIPER_META_PATH
 INTRADAY_EXIT_MODEL_PATH = Path(os.getenv("QUANT_INTRADAY_EXIT_MODEL_PATH", str(MODELS_DIR / "intraday_exit_xgboost.json")))
 INTRADAY_EXIT_META_PATH = Path(os.getenv("QUANT_INTRADAY_EXIT_META_PATH", str(MODELS_DIR / "intraday_exit_xgboost.meta.json")))
 LATEST_TOP50_PATH = Path(os.getenv("QUANT_LATEST_TOP50", str(MODELS_DIR / "latest_top_50.json")))
@@ -59,16 +72,46 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN", "").strip()
 PROFIT_TARGET_PCT = float(os.getenv("QUANT_PROFIT_TARGET_PCT", "1.00"))
 BREAKOUT_HIGH_TARGET_PCT = float(os.getenv("QUANT_BREAKOUT_HIGH_TARGET_PCT", "2.00"))
-BREAKOUT_MIN_SCORE = _env_float_floor("QUANT_BREAKOUT_MIN_SCORE", os.getenv("QUANT_MIN_COMPOSITE_SCORE", "72.00"), 72.00)
+BREAKOUT_MIN_SCORE = _env_float_floor("QUANT_BREAKOUT_MIN_SCORE", os.getenv("QUANT_MIN_COMPOSITE_SCORE", "62.00"), 62.00)
+ST_BREAKOUT_MIN_SCORE = _env_float_floor("QUANT_ST_BREAKOUT_MIN_SCORE", os.getenv("QUANT_MIN_COMPOSITE_SCORE", "62.00"), 62.00)
+ST_BREAKOUT_POSITION_CAP = _env_float_floor("QUANT_ST_BREAKOUT_POSITION_CAP", "0.05", 0.01)
 DIPBUY_MIN_SCORE = float(os.getenv("QUANT_DIPBUY_MIN_SCORE", "99.00"))
 REVERSAL_MIN_SCORE = _env_float_floor("QUANT_REVERSAL_MIN_SCORE", "6.00", 6.00)
 MAIN_WAVE_MIN_SCORE = _env_float_floor("QUANT_MAIN_WAVE_MIN_SCORE", "6.60", 6.60)
-GLOBAL_MIN_SCORE = _env_float_floor("QUANT_GLOBAL_MIN_SCORE", "0.90", 0.90)
+GLOBAL_MIN_SCORE = 0.60
 MIN_COMPOSITE_SCORE = BREAKOUT_MIN_SCORE
 LATE_PULL_TRAP_THRESHOLD_PCT = float(os.getenv("QUANT_LATE_PULL_TRAP_THRESHOLD_PCT", "4.00"))
+
+# 卖出风控配置使用小数收益率单位：-0.04 表示 -4%，0.06 表示 +6%。
+RISK_CONTROL_PROFILES = {
+    "default": {
+        "hard_stop": -0.03,
+        "trailing_active": 0.03,
+        "trailing_retrace": 0.01,
+        "eod_stop": -0.02,
+    },
+    "ST特情": {
+        "hard_stop": -0.04,
+        "trailing_active": 0.04,
+        "trailing_retrace": 0.02,
+        "eod_stop": -0.015,
+    },
+    "尾盘突破": {
+        "hard_stop": -0.04,
+        "trailing_active": 0.04,
+        "trailing_retrace": 0.02,
+        "eod_stop": -0.015,
+    },
+    "全局狙击_V6": {
+        "hard_stop": -0.05,
+        "trailing_active": 0.06,
+        "trailing_retrace": 0.025,
+        "eod_stop": -0.03,
+    },
+}
 PRODUCTION_STRATEGY_TYPES = tuple(
     item.strip()
-    for item in os.getenv("QUANT_PRODUCTION_STRATEGIES", "全局动量狙击,右侧主升浪,尾盘突破").split(",")
+    for item in os.getenv("QUANT_PRODUCTION_STRATEGIES", "全局动量狙击,尾盘突破,尾盘突破-ST特情").split(",")
     if item.strip()
 )
 PAUSED_STRATEGY_TYPES = tuple(
@@ -77,10 +120,25 @@ PAUSED_STRATEGY_TYPES = tuple(
     if item.strip()
 )
 DEPRECATED_PRODUCTION_STRATEGY_TYPES = PAUSED_STRATEGY_TYPES
-PRODUCTION_TOTAL_PICK_LIMIT = _env_int_floor("QUANT_PRODUCTION_TOTAL_PICK_LIMIT", "2", 1)
+PRODUCTION_TOTAL_PICK_LIMIT = _env_int_floor("QUANT_PRODUCTION_TOTAL_PICK_LIMIT", "3", 1)
+JQ_FETCH_ENABLED = os.getenv("QUANT_ENABLE_JQ_FETCH", "0").strip().lower() in {"1", "true", "yes", "on"}
+V3_SNIPER_PUSHPLUS_ENABLED = os.getenv("QUANT_ENABLE_V3_SNIPER_PUSHPLUS", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def check_push_config(print_warning: bool = True) -> dict[str, Any]:
+    try:
+        from quant_core.pushplus_tokens import pushplus_config_status
+
+        return pushplus_config_status(print_warning=print_warning)
+    except Exception as exc:
+        if print_warning:
+            print(f"\033[91m[CRITICAL] PushPlus token 表检查失败，回退 .env：{exc}\033[0m")
+
     token = (os.getenv("PUSHPLUS_TOKEN") or PUSHPLUS_TOKEN or "").strip()
     if not token:
         status = {

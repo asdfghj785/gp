@@ -27,6 +27,30 @@ def get_core_universe() -> list[str]:
     return clean_codes
 
 
+def get_st_universe(include_daily_picks: bool = True) -> list[str]:
+    """Return main-board ST/*ST candidates for data backfill and ST special validation."""
+    name_map = _latest_name_map_from_db()
+    if include_daily_picks:
+        name_map.update(_st_name_map_from_daily_picks())
+    codes = set(name_map) | _codes_from_daily_parquets(DATA_DIR)
+    st_codes: list[str] = []
+    for code in sorted(codes):
+        if not _is_core_mainboard_code(code):
+            continue
+        name = name_map.get(code, "")
+        if _is_st_name(name):
+            st_codes.append(code)
+    return st_codes
+
+
+def get_st_name_map(include_daily_picks: bool = True) -> dict[str, str]:
+    """Return latest known names for ST universe codes."""
+    name_map = _latest_name_map_from_db()
+    if include_daily_picks:
+        name_map.update(_st_name_map_from_daily_picks())
+    return {code: name_map.get(code, "") for code in get_st_universe(include_daily_picks=include_daily_picks)}
+
+
 def _latest_name_map_from_db() -> dict[str, str]:
     if not SQLITE_PATH.exists():
         return {}
@@ -54,6 +78,31 @@ def _latest_name_map_from_db() -> dict[str, str]:
     return out
 
 
+def _st_name_map_from_daily_picks() -> dict[str, str]:
+    if not SQLITE_PATH.exists():
+        return {}
+    try:
+        with sqlite3.connect(SQLITE_PATH) as conn:
+            rows = conn.execute(
+                """
+                SELECT code, name
+                FROM daily_picks
+                WHERE strategy_type = '尾盘突破-ST特情'
+                   OR upper(name) LIKE '%ST%'
+                ORDER BY selection_date ASC, id ASC
+                """
+            ).fetchall()
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for code, name in rows:
+        clean = _normalize_code(code)
+        text = str(name or "").strip()
+        if clean and _is_st_name(text):
+            out[clean] = text
+    return out
+
+
 def _codes_from_daily_parquets(data_dir: Path) -> set[str]:
     if not data_dir.exists():
         return set()
@@ -77,6 +126,11 @@ def _is_core_mainboard_code(code: str) -> bool:
 def _is_risky_name(name: str) -> bool:
     text = str(name or "").strip().upper()
     return any(keyword in text for keyword in RISK_NAME_KEYWORDS)
+
+
+def _is_st_name(name: str) -> bool:
+    text = str(name or "").strip().upper()
+    return "ST" in text and "退" not in text
 
 
 def _normalize_code(value: object) -> str:

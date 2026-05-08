@@ -494,19 +494,28 @@ def _next3_trading_dates(trading_dates: list[str]) -> dict[str, list[str]]:
 
 def _minute_coverage_index(required_dates: set[str]) -> dict[str, set[str]]:
     coverage: dict[str, set[str]] = {}
-    root = MIN_KLINE_DIR / "5m"
-    for path in sorted(root.glob("*.parquet")):
-        code = path.stem[-6:]
-        try:
-            dt = pd.to_datetime(pd.read_parquet(path, columns=["datetime"])["datetime"], errors="coerce").dropna()
-        except Exception:
-            continue
-        if dt.empty:
-            continue
-        counts = dt.dt.strftime("%Y-%m-%d").value_counts()
-        full_days = {str(day) for day, count in counts.items() if int(count) >= MIN_FULL_DAY_BARS and (not required_dates or str(day) in required_dates)}
-        if full_days:
-            coverage[code] = full_days
+    init_db()
+    params: list[Any] = []
+    where = "WHERE trade_date IS NOT NULL AND trade_date != ''"
+    if required_dates:
+        placeholders = ",".join(["?"] * len(required_dates))
+        where += f" AND trade_date IN ({placeholders})"
+        params.extend(sorted(required_dates))
+    query = f"""
+        SELECT code, trade_date, COUNT(*) AS bars
+        FROM stock_minute_5m
+        {where}
+        GROUP BY code, trade_date
+        HAVING bars >= ?
+    """
+    params.append(MIN_FULL_DAY_BARS)
+    with connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    for row in rows:
+        code = str(row["code"] or "").zfill(6)[-6:]
+        day = str(row["trade_date"] or "")
+        if code and day:
+            coverage.setdefault(code, set()).add(day)
     return coverage
 
 
@@ -520,10 +529,20 @@ def _load_trade_minute_window(code: str, future_days: list[str]) -> pd.DataFrame
 
 
 def _load_code_minute_frame(code: str) -> pd.DataFrame:
-    path = MIN_KLINE_DIR / "5m" / f"{str(code).zfill(6)}.parquet"
-    if not path.exists():
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT datetime, trade_date, open, high, low, close, volume, amount, 0.0 AS money
+            FROM stock_minute_5m
+            WHERE code = ?
+            ORDER BY datetime ASC
+            """,
+            (str(code).zfill(6)[-6:],),
+        ).fetchall()
+    if not rows:
         return pd.DataFrame()
-    df = pd.read_parquet(path)
+    df = pd.DataFrame([dict(row) for row in rows])
     if df.empty or "datetime" not in df.columns:
         return pd.DataFrame()
     out = df.copy()

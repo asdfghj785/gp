@@ -36,10 +36,11 @@ defineEmits(['update:active'])
 
 const navItems = [
   { id: 'dashboard', mark: 'D', label: 'Dashboard', hint: '总览与今日信号' },
-  { id: 'ledger', mark: 'S', label: 'Shadow Test', hint: '分月影子账本' },
+  { id: 'ledger', mark: 'L', label: '真实账本', hint: '实盘闭环数据' },
+  { id: 'backtest', mark: 'B', label: '回测模拟', hint: '完整5m回测数据' },
   { id: 'account', mark: '¥', label: '资金池', hint: '仓位金额与试射' },
   { id: 'minute', mark: 'M', label: '单票行情库', hint: '日K、5m 与原始表格' },
-  { id: 'validation', mark: 'V', label: 'Validation', hint: '同步与校验报告' },
+  { id: 'pushplus', mark: 'P', label: 'PushPlus', hint: '多Token推送管理' },
 ]
 </script>
 

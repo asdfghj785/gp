@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, time as dt_time, timedelta
 from functools import lru_cache
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
+import requests
 
 from quant_core.config import (
     BREAKOUT_MIN_SCORE,
@@ -28,10 +30,15 @@ from quant_core.config import (
     PRODUCTION_TOTAL_PICK_LIMIT,
     REVERSAL_MIN_SCORE,
     REVERSAL_MODEL_PATH,
+    SQLITE_PATH,
+    ST_BREAKOUT_MIN_SCORE,
+    ST_BREAKOUT_POSITION_CAP,
 )
 from quant_core.data_pipeline.concept_engine import CONCEPT_CATALOG_PATH, CONCEPT_INDEX_PATH, get_stock_concept_map
 from quant_core.data_pipeline.intraday_snapshot import attach_late_pull_trap
 from quant_core.data_pipeline.market import fetch_market_indices, fetch_sina_snapshot
+from quant_core.data_pipeline.trading_calendar import is_trading_day, latest_trading_day_on_or_before
+from quant_core.data_pipeline.tencent_engine import TENCENT_REALTIME_URL, tencent_symbol
 from quant_core.data_pipeline.sector_engine import get_stock_sector_map
 from quant_core.engine.daily_factor_factory import THEME_FACTOR_COLUMNS, generate_daily_factors
 from quant_core.storage import connect, save_prediction_snapshot, upsert_daily_rows
@@ -64,6 +71,7 @@ FEATURE_COLS = [
     "market_avg_change",
     "market_down_count",
 ]
+HISTORICAL_PLAYBACK_LOCK_TIME = dt_time(14, 50)
 DIPBUY_TEMPORAL_FEATURE_COLS = [
     "近5日最高涨幅",
     "今日急跌度",
@@ -90,23 +98,27 @@ DIPBUY_FEATURE_COLS = [
 ]
 DIPBUY_STRATEGY_TYPE = "首阴低吸"
 BREAKOUT_STRATEGY_TYPE = "尾盘突破"
+ST_BREAKOUT_STRATEGY_TYPE = "尾盘突破-ST特情"
 REVERSAL_STRATEGY_TYPE = "中线超跌反转"
 MAIN_WAVE_STRATEGY_TYPE = "右侧主升浪"
 GLOBAL_MOMENTUM_STRATEGY_TYPE = "全局动量狙击"
 SWING_STRATEGY_TYPES = {REVERSAL_STRATEGY_TYPE, MAIN_WAVE_STRATEGY_TYPE, GLOBAL_MOMENTUM_STRATEGY_TYPE}
+BREAKOUT_LIKE_STRATEGY_TYPES = {BREAKOUT_STRATEGY_TYPE, ST_BREAKOUT_STRATEGY_TYPE}
 STRATEGY_PRIORITY = {
     GLOBAL_MOMENTUM_STRATEGY_TYPE: 4,
     MAIN_WAVE_STRATEGY_TYPE: 3,
     REVERSAL_STRATEGY_TYPE: 2,
     BREAKOUT_STRATEGY_TYPE: 1,
+    ST_BREAKOUT_STRATEGY_TYPE: 0.8,
     DIPBUY_STRATEGY_TYPE: 0,
 }
 PRODUCTION_OUTPUT_STRATEGIES = [
     strategy_type
     for strategy_type in PRODUCTION_STRATEGY_TYPES
-    if strategy_type in {GLOBAL_MOMENTUM_STRATEGY_TYPE, MAIN_WAVE_STRATEGY_TYPE, BREAKOUT_STRATEGY_TYPE}
+    if strategy_type in {GLOBAL_MOMENTUM_STRATEGY_TYPE, BREAKOUT_STRATEGY_TYPE, ST_BREAKOUT_STRATEGY_TYPE}
     and strategy_type not in set(PAUSED_STRATEGY_TYPES)
 ]
+PRODUCTION_OUTPUT_STRATEGY_SET = set(PRODUCTION_OUTPUT_STRATEGIES)
 REVERSAL_FEATURE_COLS = [
     "body_pct",
     "upper_shadow_pct",
@@ -169,9 +181,18 @@ HIGH_LIQUIDITY_AMOUNT = 800_000_000_000
 DIPBUY_SENTIMENT_BONUS = 10.0
 LIVE_VOLUME_EXTRAPOLATION_FACTOR = 1.05
 LIVE_NEAR_LIMIT_CHANGE_PCT = 8.5
+ST_NEAR_LIMIT_CHANGE_PCT = 4.5
+ST_LIMIT_UP_BLOCK_PCT = 4.8
+ST_LIMIT_UP_RATIO = 1.05
+ST_MAIN_BOARD_LIMIT_CHANGE_DATE = "2026-07-06"
+ST_LIMIT_MIN_5M_VOLUME_LOTS = 500.0
+ST_LIMIT_MIN_15M_VOLUME_LOTS = 1500.0
+ST_LIMIT_MIN_VISIBLE_SELL_LOTS = 500.0
 GLOBAL_MOMENTUM_MAX_LIVE_CHANGE_PCT = 9.0
 ABSOLUTE_BOTTOM_PROBA = 0.55
 GLOBAL_MOMENTUM_DYNAMIC_ABSOLUTE_FLOOR = GLOBAL_MIN_SCORE
+GLOBAL_SNIPER_PRODUCTION_VERSION = "v6_0_extreme_burst"
+GLOBAL_SNIPER_SELECTION_MODE = "v6_extreme_top1_p60"
 PRODUCTION_MAX_PICKS_PER_STRATEGY = 1
 RISK_WARNING_DYNAMIC_FLOOR = "⚠️ 动态下探: 逆势相对龙头，注意控制仓位"
 KELLY_WIN_LOSS_RATIO = 1.5
@@ -179,7 +200,12 @@ HALF_KELLY_FACTOR = 0.5
 BASE_POSITION_MIN = 0.10
 BASE_POSITION_MAX = 0.30
 DYNAMIC_FLOOR_POSITION = 0.05
-REGULAR_ARMY_STRATEGIES = {BREAKOUT_STRATEGY_TYPE, GLOBAL_MOMENTUM_STRATEGY_TYPE, MAIN_WAVE_STRATEGY_TYPE}
+REGULAR_ARMY_STRATEGIES = {
+    BREAKOUT_STRATEGY_TYPE,
+    ST_BREAKOUT_STRATEGY_TYPE,
+    GLOBAL_MOMENTUM_STRATEGY_TYPE,
+    MAIN_WAVE_STRATEGY_TYPE,
+}
 LIMIT_UP_MAIN_BOARD_BLOCK_PCT = 9.8
 LIMIT_UP_GROWTH_BOARD_BLOCK_PCT = 19.8
 THEME_EMOTION_WEIGHT = 0.18
@@ -190,9 +216,6 @@ THEME_EXTREME_HOT_SCORE = 82.0
 THEME_LAGGARD_RS_FLOOR = 0.0
 THEME_LAGGARD_MAX_PENALTY = 12.0
 THEME_EXTREME_REVERSAL_PENALTY = 10.0
-PAUSED_STRATEGY_TYPE_SET = set(PAUSED_STRATEGY_TYPES)
-
-
 def _apply_total_pick_limit(df: pd.DataFrame, requested_limit: int) -> pd.DataFrame:
     if df.empty:
         return df
@@ -296,6 +319,14 @@ def _load_global_daily_model():
         return None, f"全局日线模型加载失败: {exc}", []
 
 
+def _st_breakout_mask(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(False, index=df.index, dtype=bool)
+    name_source = df["名称"] if "名称" in df.columns else df.get("name", pd.Series("", index=df.index))
+    name = name_source.fillna("").astype(str).str.upper()
+    return name.str.contains("ST", regex=False, na=False)
+
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "code" not in df.columns:
         return pd.DataFrame()
@@ -318,7 +349,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     out = _add_market_context(out)
     out = out[~out["纯代码"].str.startswith(("30", "68", "4", "8", "92"), na=False)].copy()
-    out = out[~out["名称"].str.contains("ST|退", case=False, na=False)].copy()
+    out = out[~out["名称"].str.contains("退", case=False, na=False)].copy()
+    out["ST特情标记"] = _st_breakout_mask(out).astype(float)
     out = out[(out["最新价"] > 0) & (out["昨收"] > 0)].copy()
     tradable_mask = _not_limit_up_tradable_mask(out)
     out["涨停不可交易标记"] = (~tradable_mask).astype(float)
@@ -351,16 +383,36 @@ def score_candidates(df: pd.DataFrame, production_global_hard_filter: bool = Fal
         return scored, "ready"
 
     scored["strategy_type"] = BREAKOUT_STRATEGY_TYPE
+    st_breakout_mask = _st_breakout_mask(scored) | (_num(scored, "ST特情标记") >= 0.5)
+    scored.loc[st_breakout_mask, "strategy_type"] = ST_BREAKOUT_STRATEGY_TYPE
     scored["预期溢价"] = _fallback_expected_premium(scored)
-    reversal_mask = _reversal_physical_mask(scored)
-    main_wave_mask = _main_wave_physical_mask(scored)
-    _log_dipbuy_diagnostics(scored)
-    dipbuy_mask = _dipbuy_physical_mask(scored) & ~reversal_mask & ~main_wave_mask
+    disabled_mask = pd.Series(False, index=scored.index, dtype=bool)
+    enable_dipbuy = DIPBUY_STRATEGY_TYPE in PRODUCTION_OUTPUT_STRATEGY_SET
+    enable_reversal = REVERSAL_STRATEGY_TYPE in PRODUCTION_OUTPUT_STRATEGY_SET
+    enable_main_wave = MAIN_WAVE_STRATEGY_TYPE in PRODUCTION_OUTPUT_STRATEGY_SET
+    reversal_mask = (_reversal_physical_mask(scored) & ~st_breakout_mask) if enable_reversal else disabled_mask.copy()
+    main_wave_mask = (_main_wave_physical_mask(scored) & ~st_breakout_mask) if enable_main_wave else disabled_mask.copy()
+    if enable_dipbuy:
+        _log_dipbuy_diagnostics(scored)
+        dipbuy_mask = _dipbuy_physical_mask(scored) & ~st_breakout_mask & ~reversal_mask & ~main_wave_mask
+    else:
+        dipbuy_mask = disabled_mask.copy()
     premium_model, premium_error = _load_premium_model()
-    dipbuy_model, dipbuy_error = _load_dipbuy_premium_model()
-    reversal_model, reversal_error = _load_reversal_model()
-    main_wave_model, main_wave_error = _load_main_wave_model()
+    dipbuy_model, dipbuy_error = _load_dipbuy_premium_model() if enable_dipbuy else (None, "dipbuy_disabled")
+    reversal_model, reversal_error = _load_reversal_model() if enable_reversal else (None, "reversal_disabled")
+    main_wave_model, main_wave_error = _load_main_wave_model() if enable_main_wave else (None, "main_wave_disabled")
     status_parts: list[str] = []
+    disabled_legacy = [
+        strategy
+        for strategy, enabled in (
+            (DIPBUY_STRATEGY_TYPE, enable_dipbuy),
+            (REVERSAL_STRATEGY_TYPE, enable_reversal),
+            (MAIN_WAVE_STRATEGY_TYPE, enable_main_wave),
+        )
+        if not enabled
+    ]
+    if disabled_legacy:
+        status_parts.append(f"legacy_strategy_scoring_disabled:{','.join(disabled_legacy)}")
 
     if premium_model is not None:
         try:
@@ -373,7 +425,7 @@ def score_candidates(df: pd.DataFrame, production_global_hard_filter: bool = Fal
     else:
         status_parts.append(premium_error or "breakout_model_unavailable")
 
-    if dipbuy_mask.any():
+    if enable_dipbuy and dipbuy_mask.any():
         scored.loc[dipbuy_mask, "strategy_type"] = DIPBUY_STRATEGY_TYPE
         if dipbuy_model is not None:
             try:
@@ -383,10 +435,10 @@ def score_candidates(df: pd.DataFrame, production_global_hard_filter: bool = Fal
                 status_parts.append(f"首阴低吸回归模型失败，已降级规则估算: {exc}")
         else:
             status_parts.append(dipbuy_error or "dipbuy_model_unavailable")
-    else:
+    elif enable_dipbuy:
         status_parts.append("dipbuy_no_physical_match")
 
-    if reversal_mask.any():
+    if enable_reversal and reversal_mask.any():
         scored.loc[reversal_mask, "strategy_type"] = REVERSAL_STRATEGY_TYPE
         if reversal_model is not None:
             try:
@@ -396,10 +448,10 @@ def score_candidates(df: pd.DataFrame, production_global_hard_filter: bool = Fal
                 status_parts.append(f"中线超跌反转模型失败，已降级规则估算: {exc}")
         else:
             status_parts.append(reversal_error or "reversal_model_unavailable")
-    else:
+    elif enable_reversal:
         status_parts.append("reversal_no_physical_match")
 
-    if main_wave_mask.any():
+    if enable_main_wave and main_wave_mask.any():
         main_wave_index = scored.index[main_wave_mask]
         if main_wave_model is not None:
             try:
@@ -419,7 +471,7 @@ def score_candidates(df: pd.DataFrame, production_global_hard_filter: bool = Fal
             non_reversal_index = main_wave_index[~scored.loc[main_wave_index, "strategy_type"].eq(REVERSAL_STRATEGY_TYPE)]
             scored.loc[non_reversal_index, "strategy_type"] = MAIN_WAVE_STRATEGY_TYPE
             status_parts.append(main_wave_error or "main_wave_model_unavailable")
-    else:
+    elif enable_main_wave:
         status_parts.append("main_wave_no_physical_match")
 
     scored["预期溢价"] = pd.to_numeric(scored["预期溢价"], errors="coerce").replace([np.inf, -np.inf], 0).fillna(0)
@@ -453,7 +505,7 @@ def score_candidates(df: pd.DataFrame, production_global_hard_filter: bool = Fal
 
 
 def _append_global_momentum_candidates(scored: pd.DataFrame, production_hard_filter: bool = False) -> tuple[pd.DataFrame, str]:
-    """Add the global daily XGBoost model as the fourth independent legion."""
+    """Add the global daily XGBoost model as an independent production strategy."""
     if scored.empty:
         return scored, "global_momentum_empty_pool"
     model, error, feature_cols = _load_global_daily_model()
@@ -668,6 +720,16 @@ def _stitch_global_daily_frame_from_live_row(row: pd.Series, history_days: int =
 
 def _align_global_daily_features(frame: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
     out = frame.copy()
+    if "entry_price" not in out.columns and "close" in out.columns:
+        out["entry_price"] = out["close"]
+    if "buy5m_entry_price" not in out.columns and "close" in out.columns:
+        out["buy5m_entry_price"] = out["close"]
+    if "buy5m_bar_count" not in out.columns:
+        out["buy5m_bar_count"] = 0.0
+    if "tail_accel" not in out.columns:
+        out["tail_accel"] = 1.0
+    if "intra_volatility" not in out.columns:
+        out["intra_volatility"] = 0.0
     for col in feature_cols:
         if col not in out.columns:
             out[col] = np.nan if col in THEME_FACTOR_COLUMNS else 0.0
@@ -800,9 +862,9 @@ def apply_production_filters(df: pd.DataFrame, gate: dict[str, Any] | None = Non
 
 
 def filter_paused_strategies(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or not PAUSED_STRATEGY_TYPE_SET or "strategy_type" not in df.columns:
+    if df.empty or "strategy_type" not in df.columns:
         return df
-    return df[~df["strategy_type"].fillna("").astype(str).isin(PAUSED_STRATEGY_TYPE_SET)].copy()
+    return df[df["strategy_type"].fillna("").astype(str).isin(PRODUCTION_OUTPUT_STRATEGY_SET)].copy()
 
 
 def _strategy_min_score(strategy_type: str) -> float:
@@ -814,6 +876,8 @@ def _strategy_min_score(strategy_type: str) -> float:
         return MAIN_WAVE_MIN_SCORE
     if strategy_type == GLOBAL_MOMENTUM_STRATEGY_TYPE:
         return GLOBAL_MIN_SCORE
+    if strategy_type == ST_BREAKOUT_STRATEGY_TYPE:
+        return ST_BREAKOUT_MIN_SCORE
     return BREAKOUT_MIN_SCORE
 
 
@@ -828,8 +892,8 @@ def _strategy_requires_absolute_floor(strategy_type: str) -> bool:
 
 
 def _strategy_dynamic_absolute_floor(strategy_type: str) -> float:
-    if strategy_type == BREAKOUT_STRATEGY_TYPE:
-        return BREAKOUT_MIN_SCORE
+    if strategy_type in BREAKOUT_LIKE_STRATEGY_TYPES:
+        return ST_BREAKOUT_MIN_SCORE if strategy_type == ST_BREAKOUT_STRATEGY_TYPE else BREAKOUT_MIN_SCORE
     if strategy_type == GLOBAL_MOMENTUM_STRATEGY_TYPE:
         return max(GLOBAL_MIN_SCORE, GLOBAL_MOMENTUM_DYNAMIC_ABSOLUTE_FLOOR)
     if strategy_type == MAIN_WAVE_STRATEGY_TYPE:
@@ -930,7 +994,7 @@ def apply_strategy_sort_score(df: pd.DataFrame, gate: dict[str, Any] | None = No
         modes = scored["market_gate_mode"].fillna("晴天").astype(str)
     is_dipbuy = scored["strategy_type"].eq(DIPBUY_STRATEGY_TYPE)
     is_swing = scored["strategy_type"].isin(SWING_STRATEGY_TYPES)
-    is_breakout = scored["strategy_type"].eq(BREAKOUT_STRATEGY_TYPE)
+    is_breakout = scored["strategy_type"].isin(BREAKOUT_LIKE_STRATEGY_TYPES)
     is_reversal = scored["strategy_type"].eq(REVERSAL_STRATEGY_TYPE)
     is_main_wave = scored["strategy_type"].eq(MAIN_WAVE_STRATEGY_TYPE)
     is_global = scored["strategy_type"].eq(GLOBAL_MOMENTUM_STRATEGY_TYPE)
@@ -1003,7 +1067,7 @@ def prepare_historical_playback_candidates(
     end_date: str | None = None,
 ) -> dict[str, Any]:
     """Build scored historical candidates with the same feature and model path used by production."""
-    latest_date = end_date or _latest_historical_trade_date()
+    latest_date = end_date or _latest_historical_playback_trade_date()
     if latest_date is None:
         return {
             "candidates": pd.DataFrame(),
@@ -1068,6 +1132,22 @@ def _latest_historical_trade_date() -> str | None:
     return str(row["latest_date"]) if row and row["latest_date"] else None
 
 
+def _latest_historical_playback_trade_date(now: datetime | None = None) -> str | None:
+    current = now or datetime.now()
+    calendar_cap = current.date()
+    if is_trading_day(calendar_cap) and current.time() < HISTORICAL_PLAYBACK_LOCK_TIME:
+        calendar_cap = calendar_cap - timedelta(days=1)
+    latest_completed = latest_trading_day_on_or_before(calendar_cap)
+    if latest_completed is None:
+        return None
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT MAX(date) AS latest_date FROM stock_daily WHERE date <= ?",
+            (latest_completed.isoformat(),),
+        ).fetchone()
+    return str(row["latest_date"]) if row and row["latest_date"] else None
+
+
 def _load_historical_daily_rows(start_date: str, end_date: str) -> pd.DataFrame:
     with connect() as conn:
         raw = pd.read_sql_query(
@@ -1084,7 +1164,14 @@ def _load_historical_daily_rows(start_date: str, end_date: str) -> pd.DataFrame:
     if raw.empty:
         return raw
     raw["code"] = raw["code"].astype(str).str.extract(r"(\d{6})")[0].fillna("")
-    raw["name"] = raw["name"].fillna("")
+    raw["name"] = raw["name"].fillna("").astype(str).str.strip()
+    missing_name = (raw["name"] == "") | (raw["name"] == raw["code"])
+    if missing_name.any():
+        mapped = raw.loc[missing_name, "code"].map(_latest_stock_name_map_cached()).fillna("").astype(str).str.strip()
+        has_name = mapped != ""
+        if has_name.any():
+            target_index = mapped[has_name].index
+            raw.loc[target_index, "name"] = mapped.loc[target_index]
     raw["date"] = pd.to_datetime(raw["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     numeric_cols = ["open", "high", "low", "close", "pre_close", "change_pct", "volume", "amount", "turnover", "volume_ratio"]
     for col in numeric_cols:
@@ -1267,7 +1354,7 @@ def scan_market(
             "id": None,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "model_status": f"{model_status}; 生产过滤后无合格标的",
-            "strategy": f"生产策略：实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；准涨停未封板、高位爆量、尾盘诱多直接剔除；当前没有股票满足四轨动态底线。",
+            "strategy": f"生产策略：实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；准涨停未封板、高位爆量、尾盘诱多直接剔除；当前没有股票满足启用策略动态底线。",
             "market_gate": gate,
             "intraday_snapshot": intraday_snapshot,
             "rows": [],
@@ -1278,12 +1365,23 @@ def scan_market(
     df = select_strategy_top_picks(df, limit_per_strategy=PRODUCTION_MAX_PICKS_PER_STRATEGY)
     df = _apply_total_pick_limit(df, limit)
     rows = [_row_to_api(row) for _, row in df.iterrows()]
-    snapshot_id = save_prediction_snapshot("quad_xgboost_regressor" if "regressor_ready" in model_status else "rule_fallback", rows) if cache_prediction else None
+    snapshot_id = save_prediction_snapshot("v6_extreme_burst_production", rows) if cache_prediction else None
     payload = {
         "id": snapshot_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_status": model_status,
-        "strategy": f"生产策略：当前启用策略各取 Top{PRODUCTION_MAX_PICKS_PER_STRATEGY}，总输出上限 Top{PRODUCTION_TOTAL_PICK_LIMIT}；无达标票时按合规池 99 分位动态下探 1 只并提示风偏；尾盘突破预测次日开盘预期溢价，中线超跌反转/右侧主升浪/全局动量狙击复用 T+3 波段收益口径；实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；突破门槛>={BREAKOUT_MIN_SCORE:.1f}，反转门槛>={REVERSAL_MIN_SCORE:.1f}%，主升浪门槛>={MAIN_WAVE_MIN_SCORE:.1f}%，全局狙击概率>={GLOBAL_MIN_SCORE:.2f}，绝对安全底线>={ABSOLUTE_BOTTOM_PROBA:.2f}；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多直接剔除；近3日断头铡刀和上影线强过滤仅约束尾盘突破，波段策略豁免。",
+        "selection_mode": GLOBAL_SNIPER_SELECTION_MODE,
+        "threshold": GLOBAL_MIN_SCORE,
+        "top_k": PRODUCTION_MAX_PICKS_PER_STRATEGY,
+        "production_model": {
+            "version": GLOBAL_SNIPER_PRODUCTION_VERSION,
+            "label": "V6.0 极寒爆发大脑",
+            "path": str(GLOBAL_DAILY_MODEL_PATH),
+            "meta_path": str(GLOBAL_DAILY_META_PATH),
+            "threshold": GLOBAL_MIN_SCORE,
+            "selection_mode": GLOBAL_SNIPER_SELECTION_MODE,
+        },
+        "strategy": f"生产策略：当前启用全局动量狙击、尾盘突破与尾盘突破-ST特情，各取 Top{PRODUCTION_MAX_PICKS_PER_STRATEGY}，总输出上限 Top{PRODUCTION_TOTAL_PICK_LIMIT}；全局狙击已切换 V6.0 极寒爆发大脑，只取概率 Top1 且 P>={GLOBAL_MIN_SCORE:.2f}；无达标票时按合规池 99 分位动态下探 1 只并提示风偏；尾盘突破/ST特情预测次日开盘预期溢价，全局动量狙击使用 T+3 波段收益口径；实时 14:50 快照以最新价平替收盘价，成交量/成交额按 {LIVE_VOLUME_EXTRAPOLATION_FACTOR:.2f} 外推；普通突破门槛>={BREAKOUT_MIN_SCORE:.1f}，ST特情门槛>={ST_BREAKOUT_MIN_SCORE:.1f}，绝对安全底线>={ABSOLUTE_BOTTOM_PROBA:.2f}；雷暴或大盘下跌且缩量时空仓；高位爆量、尾盘诱多直接剔除；近3日断头铡刀和上影线强过滤仅约束尾盘突破类策略。",
         "market_gate": gate,
         "intraday_snapshot": intraday_snapshot,
         "rows": rows,
@@ -1319,7 +1417,7 @@ def _scan_historical_market(
             "created_at": f"{trade_date}T14:50:00",
             "prediction_date": trade_date,
             "model_status": f"{model_status}; 历史目标日无候选池",
-            "strategy": "V4.4 Historical Playback: production scan_market(target_date) returned empty pool.",
+            "strategy": "Production Historical Playback: scan_market(target_date) returned empty pool.",
             "market_gate": {"blocked": True, "mode": "空池", "reasons": ["目标日无有效候选"]},
             "rows": [],
         }
@@ -1331,7 +1429,7 @@ def _scan_historical_market(
             "created_at": f"{trade_date}T14:50:00",
             "prediction_date": trade_date,
             "model_status": f"{model_status}; 历史大盘风控触发，强制空仓",
-            "strategy": "V4.4 Historical Playback: production market_risk_gate blocked the day.",
+            "strategy": "Production Historical Playback: production market_risk_gate blocked the day.",
             "market_gate": gate,
             "rows": [],
         }
@@ -1343,7 +1441,7 @@ def _scan_historical_market(
             "created_at": f"{trade_date}T14:50:00",
             "prediction_date": trade_date,
             "model_status": f"{model_status}; 历史生产过滤后无合格标的",
-            "strategy": "V4.4 Historical Playback: production filters returned no legal pool.",
+            "strategy": "Production Historical Playback: production filters returned no legal pool.",
             "market_gate": gate,
             "rows": [],
         }
@@ -1351,13 +1449,13 @@ def _scan_historical_market(
     df = select_strategy_top_picks(df, limit_per_strategy=PRODUCTION_MAX_PICKS_PER_STRATEGY)
     df = _apply_total_pick_limit(df, limit)
     rows = [_row_to_api(row) for _, row in df.iterrows()]
-    snapshot_id = save_prediction_snapshot("historical_playback_v44", rows) if cache_prediction else None
+    snapshot_id = save_prediction_snapshot("historical_playback_production", rows) if cache_prediction else None
     return {
         "id": snapshot_id,
         "created_at": f"{trade_date}T14:50:00",
         "prediction_date": trade_date,
         "model_status": model_status,
-        "strategy": f"V4.4 Historical Playback: scan_market(target_date={trade_date}) 复用生产过滤、动态底线、Half-Kelly 仓位和分策略 Top{PRODUCTION_MAX_PICKS_PER_STRATEGY} / 总 Top{PRODUCTION_TOTAL_PICK_LIMIT} 出票上限。",
+        "strategy": f"Production Historical Playback: scan_market(target_date={trade_date}) 复用当前生产过滤、动态底线、Half-Kelly 仓位和全局动量狙击/尾盘突破/尾盘突破-ST特情分策略 Top{PRODUCTION_MAX_PICKS_PER_STRATEGY} / 总 Top{PRODUCTION_TOTAL_PICK_LIMIT} 出票上限。",
         "market_gate": gate,
         "rows": rows,
     }
@@ -1378,6 +1476,21 @@ def select_strategy_top_picks(df: pd.DataFrame, limit_per_strategy: int = PRODUC
         pool = df[strategy_series.eq(strategy_type)].copy()
         if pool.empty:
             continue
+        removed_st_limit = 0
+        if strategy_type == ST_BREAKOUT_STRATEGY_TYPE:
+            before_st_limit_filter = len(pool)
+            unbuyable_mask = pool.apply(_st_limit_up_unbuyable_row, axis=1).fillna(False).astype(bool)
+            pool = pool.loc[~unbuyable_mask].copy()
+            removed_st_limit = before_st_limit_filter - len(pool)
+            if removed_st_limit:
+                print(
+                    f"[STLimitFilter] strategy={strategy_type} "
+                    f"removed_unbuyable_limit_up={removed_st_limit} "
+                    f"min_5m_lots={ST_LIMIT_MIN_5M_VOLUME_LOTS:.0f} "
+                    f"min_15m_lots={ST_LIMIT_MIN_15M_VOLUME_LOTS:.0f}"
+                )
+            if pool.empty:
+                continue
         pool = pool.sort_values(["排序评分", "预期溢价", "综合评分"], ascending=[False, False, False])
         score = _strategy_selection_score(pool, strategy_type).replace([np.inf, -np.inf], 0).fillna(0)
         legal_pool = pool.assign(score=score)
@@ -1394,7 +1507,7 @@ def select_strategy_top_picks(df: pd.DataFrame, limit_per_strategy: int = PRODUC
             kept = _take_unique_pick_indices(qualified_pool, used_codes, selection_limit)
             if kept:
                 picked = legal_pool.loc[kept].copy()
-                picked["risk_warning"] = ""
+                picked["risk_warning"] = _strategy_base_risk_warning(strategy_type, removed_st_limit)
                 picked["selection_tier"] = "base"
                 picked["dynamic_floor"] = dynamic_floor
                 picked["下探底线"] = dynamic_floor
@@ -1408,7 +1521,11 @@ def select_strategy_top_picks(df: pd.DataFrame, limit_per_strategy: int = PRODUC
         top_score = float(score.loc[top_idx])
         if top_score >= dynamic_floor and top_score >= absolute_floor:
             picked = legal_pool.loc[[top_idx]].copy()
-            picked["risk_warning"] = RISK_WARNING_DYNAMIC_FLOOR
+            picked["risk_warning"] = (
+                _strategy_base_risk_warning(strategy_type, removed_st_limit, dynamic_floor=True)
+                if strategy_type == ST_BREAKOUT_STRATEGY_TYPE
+                else RISK_WARNING_DYNAMIC_FLOOR
+            )
             picked["selection_tier"] = "dynamic_floor"
             picked["dynamic_floor"] = dynamic_floor
             picked["下探底线"] = dynamic_floor
@@ -1427,6 +1544,15 @@ def select_strategy_top_picks(df: pd.DataFrame, limit_per_strategy: int = PRODUC
     out = pd.concat(selected, ignore_index=False)
     out["策略优先级"] = out.get("策略优先级", out["strategy_type"].map(STRATEGY_PRIORITY).fillna(1)).astype(float)
     return out.sort_values(["策略优先级", "排序评分", "预期溢价", "综合评分"], ascending=[False, False, False, False])
+
+
+def _strategy_base_risk_warning(strategy_type: str, removed_st_limit: int = 0, dynamic_floor: bool = False) -> str:
+    if strategy_type != ST_BREAKOUT_STRATEGY_TYPE:
+        return ""
+    base = "ST/*ST 特情动态下探：仅作独立小仓位验证" if dynamic_floor else "ST/*ST 特情分支：仅作独立小仓位验证"
+    if removed_st_limit > 0:
+        base += f"；已自动顺延替补，剔除 {removed_st_limit} 只涨停封死或尾盘成交机会不足候选"
+    return base
 
 
 def _pick_code(row: pd.Series) -> str:
@@ -1576,9 +1702,10 @@ def _prepare_live_inference_snapshot(snapshot: pd.DataFrame) -> pd.DataFrame:
             * LIVE_VOLUME_EXTRAPOLATION_FACTOR
         )
     change = pd.to_numeric(out["change_pct"], errors="coerce").replace([np.inf, -np.inf], 0).fillna(0.0).round(4)
-    main_board_near_limit = change >= LIVE_NEAR_LIMIT_CHANGE_PCT
-    main_board_sealed = change >= 9.5
-    out["准涨停未封板标记"] = (main_board_near_limit & ~main_board_sealed).astype(float)
+    st_5pct_limit = _st_5pct_limit_mask(out)
+    near_limit = change >= LIVE_NEAR_LIMIT_CHANGE_PCT
+    sealed_limit = change >= 9.5
+    out["准涨停未封板标记"] = ((~st_5pct_limit) & near_limit & ~sealed_limit).astype(float)
     out["涨停不可交易标记"] = (~_not_limit_up_tradable_mask(out)).astype(float)
     out["live_proxy_factor"] = LIVE_VOLUME_EXTRAPOLATION_FACTOR
     return out
@@ -1610,12 +1737,170 @@ def _not_limit_up_tradable_mask(df: pd.DataFrame) -> pd.Series:
     limit_pct.loc[growth_board] = LIMIT_UP_GROWTH_BOARD_BLOCK_PCT
     exact_limit_ratio = pd.Series(1.10, index=df.index, dtype="float64")
     exact_limit_ratio.loc[growth_board] = 1.20
+    st_5pct_limit = _st_5pct_limit_mask(df)
+    limit_pct.loc[st_5pct_limit] = ST_LIMIT_UP_BLOCK_PCT
+    exact_limit_ratio.loc[st_5pct_limit] = ST_LIMIT_UP_RATIO
     synthetic_limit_price = (pre_close * exact_limit_ratio).round(2)
     explicit_limit_price = _first_existing_num(df, ["limit_up_price", "up_limit", "涨停价"])
     limit_price = explicit_limit_price.where(explicit_limit_price.notna() & (explicit_limit_price > 0), synthetic_limit_price)
     blocked = (current_price >= limit_price) | (change_pct > limit_pct)
+    st_blocked = st_5pct_limit & (current_price > limit_price)
+    blocked.loc[st_5pct_limit] = st_blocked.loc[st_5pct_limit]
     valid = current_price.notna() & (current_price > 0) & pre_close.notna() & (pre_close > 0)
     return (valid & ~blocked.fillna(True)).fillna(False)
+
+
+def _st_5pct_limit_mask(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(False, index=df.index, dtype=bool)
+    st_mask = _st_breakout_mask(df)
+    if "ST特情标记" in df.columns:
+        st_mask = st_mask | (_num(df, "ST特情标记") >= 0.5)
+    if "strategy_type" in df.columns:
+        st_mask = st_mask | df["strategy_type"].fillna("").astype(str).eq(ST_BREAKOUT_STRATEGY_TYPE)
+    trade_dates = pd.to_datetime(
+        df["date"] if "date" in df.columns else pd.Series("", index=df.index),
+        errors="coerce",
+    )
+    change_day = pd.Timestamp(ST_MAIN_BOARD_LIMIT_CHANGE_DATE)
+    before_change = trade_dates.isna() | (trade_dates < change_day)
+    return (st_mask & before_change).fillna(False)
+
+
+def _st_limit_up_unbuyable_row(row: pd.Series) -> bool:
+    name = str(row.get("名称") or row.get("name") or "").upper()
+    strategy = str(row.get("strategy_type") or "")
+    if "ST" not in name and strategy != ST_BREAKOUT_STRATEGY_TYPE:
+        return False
+    trade_date = str(row.get("date") or row.get("selection_date") or "")[:10]
+    current_price = _row_first_float(row, ["最新价", "current_price", "now", "price", "trade", "close"])
+    pre_close = _row_first_float(row, ["昨收", "pre_close"])
+    if current_price is None or pre_close is None or current_price <= 0 or pre_close <= 0:
+        return False
+    ratio = 1.10 if trade_date >= ST_MAIN_BOARD_LIMIT_CHANGE_DATE else ST_LIMIT_UP_RATIO
+    limit_price = round(pre_close * ratio, 2)
+    if current_price < limit_price - 1e-6:
+        return False
+    code = str(row.get("纯代码") or row.get("code") or "")
+    if _is_historical_trade_date(trade_date):
+        return _historical_st_limit_low_liquidity(code, trade_date, limit_price)
+    return _live_st_limit_order_book_sealed(code, limit_price)
+
+
+def _is_historical_trade_date(trade_date: str) -> bool:
+    if not trade_date:
+        return False
+    try:
+        return pd.Timestamp(trade_date).date() < datetime.now().date()
+    except Exception:
+        return False
+
+
+def _row_first_float(row: pd.Series, keys: list[str]) -> Optional[float]:
+    for key in keys:
+        if key not in row:
+            continue
+        try:
+            value = float(row.get(key))
+        except (TypeError, ValueError):
+            continue
+        if pd.notna(value):
+            return value
+    return None
+
+
+@lru_cache(maxsize=4096)
+def _historical_st_limit_low_liquidity(code: str, trade_date: str, limit_price: float) -> bool:
+    clean = normalize_stock_code_text(code)
+    if not clean or not trade_date or not SQLITE_PATH.exists():
+        return False
+    try:
+        with sqlite3.connect(SQLITE_PATH) as conn:
+            row = conn.execute(
+                """
+                SELECT open, high, low, close, volume
+                FROM stock_minute_5m
+                WHERE code = ? AND datetime = ?
+                LIMIT 1
+                """,
+                (clean, f"{trade_date} 14:50:00"),
+            ).fetchone()
+            volume_15m_row = conn.execute(
+                """
+                SELECT COALESCE(SUM(volume), 0)
+                FROM stock_minute_5m
+                WHERE code = ?
+                  AND datetime IN (?, ?, ?)
+                """,
+                (
+                    clean,
+                    f"{trade_date} 14:40:00",
+                    f"{trade_date} 14:45:00",
+                    f"{trade_date} 14:50:00",
+                ),
+            ).fetchone()
+    except Exception:
+        return False
+    if not row:
+        return False
+    try:
+        open_price, high_price, low_price, close_price, volume = [float(item or 0) for item in row]
+        last_15m_volume = float((volume_15m_row or [0])[0] or 0)
+    except (TypeError, ValueError):
+        return False
+    flat_limit = min(open_price, high_price, low_price, close_price) >= float(limit_price) - 1e-6
+    weak_tail_liquidity = (
+        volume < ST_LIMIT_MIN_5M_VOLUME_LOTS
+        or last_15m_volume < ST_LIMIT_MIN_15M_VOLUME_LOTS
+    )
+    return bool(flat_limit and weak_tail_liquidity)
+
+
+@lru_cache(maxsize=1024)
+def _live_st_limit_order_book_sealed(code: str, limit_price: float) -> bool:
+    clean = normalize_stock_code_text(code)
+    if not clean:
+        return False
+    try:
+        symbol = tencent_symbol(clean)
+        session = requests.Session()
+        session.trust_env = False
+        response = session.get(TENCENT_REALTIME_URL.format(symbol=symbol), timeout=4, proxies={})
+        response.raise_for_status()
+        text = response.content.decode("gbk", errors="ignore")
+        start = text.find('"')
+        end = text.rfind('"')
+        if start < 0 or end <= start:
+            return False
+        fields = text[start + 1 : end].split("~")
+        if len(fields) < 29:
+            return False
+        current_price = _safe_field_float(fields, 3)
+        sell_levels = [(19, 20), (21, 22), (23, 24), (25, 26), (27, 28)]
+        sell_volume_at_limit = 0.0
+        for price_idx, vol_idx in sell_levels:
+            price = _safe_field_float(fields, price_idx)
+            volume = _safe_field_float(fields, vol_idx)
+            if price > 0 and abs(price - float(limit_price)) < 1e-6:
+                sell_volume_at_limit += max(0.0, volume)
+        return bool(
+            current_price >= float(limit_price) - 1e-6
+            and sell_volume_at_limit < ST_LIMIT_MIN_VISIBLE_SELL_LOTS
+        )
+    except Exception:
+        return False
+
+
+def normalize_stock_code_text(value: object) -> str:
+    digits = "".join(ch for ch in str(value or "").strip() if ch.isdigit())
+    return digits[-6:] if len(digits) >= 6 else ""
+
+
+def _safe_field_float(fields: list[str], index: int) -> float:
+    try:
+        return float(fields[index])
+    except (IndexError, TypeError, ValueError):
+        return 0.0
 
 
 def _dynamic_win_rate_thresholds(df: pd.DataFrame) -> pd.Series:
@@ -1896,6 +2181,14 @@ def _load_recent_history_from_db(codes: list[str], current_date: str) -> pd.Data
 
 def _format_history_frame(history: pd.DataFrame) -> pd.DataFrame:
     history["纯代码"] = history["code"].astype(str).str.extract(r"(\d{6})")[0]
+    history["name"] = history["name"].fillna("").astype(str).str.strip()
+    missing_name = (history["name"] == "") | (history["name"] == history["纯代码"])
+    if missing_name.any():
+        mapped = history.loc[missing_name, "纯代码"].map(_latest_stock_name_map_cached()).fillna("").astype(str).str.strip()
+        has_name = mapped != ""
+        if has_name.any():
+            target_index = mapped[has_name].index
+            history.loc[target_index, "name"] = mapped.loc[target_index]
     history["名称"] = history["name"].fillna("")
     history["最新价"] = pd.to_numeric(history["close"], errors="coerce").fillna(0)
     history["涨跌幅"] = pd.to_numeric(history["change_pct"], errors="coerce").fillna(0)
@@ -1912,6 +2205,29 @@ def _format_history_frame(history: pd.DataFrame) -> pd.DataFrame:
     history["name"] = history["name"].fillna("")
     history["名称"] = history["名称"].fillna("")
     return history
+
+
+@lru_cache(maxsize=1)
+def _latest_stock_name_map_cached() -> dict[str, str]:
+    query = """
+        SELECT code, name, date
+        FROM stock_daily
+        WHERE COALESCE(TRIM(name), '') <> ''
+        ORDER BY date DESC
+    """
+    try:
+        with connect() as conn:
+            rows = conn.execute(query).fetchall()
+    except Exception:
+        return {}
+
+    names: dict[str, str] = {}
+    for row in rows:
+        code = str(row["code"] or "").zfill(6)
+        name = str(row["name"] or "").strip()
+        if code and name and name != code and code not in names:
+            names[code] = name
+    return names
 
 
 def _persist_snapshot(snapshot: pd.DataFrame) -> None:
@@ -2227,8 +2543,23 @@ def _row_to_api(row: pd.Series) -> dict[str, Any]:
     strategy_type = str(row.get("strategy_type", BREAKOUT_STRATEGY_TYPE))
     position_probability = _position_probability(row)
     suggested_position = calculate_suggested_position(position_probability, tier)
+    if strategy_type == ST_BREAKOUT_STRATEGY_TYPE:
+        suggested_position = min(suggested_position, ST_BREAKOUT_POSITION_CAP)
     absolute_floor = _optional_float_value(row.get("absolute_floor"), _strategy_dynamic_absolute_floor(strategy_type))
-    return attach_pick_theme_fields({
+    is_global_sniper = strategy_type == GLOBAL_MOMENTUM_STRATEGY_TYPE
+    production_model = (
+        {
+            "version": GLOBAL_SNIPER_PRODUCTION_VERSION,
+            "label": "V6.0 极寒爆发大脑",
+            "path": str(GLOBAL_DAILY_MODEL_PATH),
+            "meta_path": str(GLOBAL_DAILY_META_PATH),
+            "threshold": GLOBAL_MIN_SCORE,
+            "selection_mode": GLOBAL_SNIPER_SELECTION_MODE,
+        }
+        if is_global_sniper
+        else None
+    )
+    payload = {
         "code": str(row["纯代码"]),
         "name": str(row["名称"]),
         "strategy_type": strategy_type,
@@ -2323,4 +2654,9 @@ def _row_to_api(row: pd.Series) -> dict[str, Any]:
         "t3_close_return_pct": round(float(row.get("t3_close_return_pct")), 4) if pd.notna(row.get("t3_close_return_pct")) else None,
         "t3_settlement_price": round(float(row.get("t3_settlement_price")), 4) if pd.notna(row.get("t3_settlement_price")) else None,
         "t3_settlement_return_pct": round(float(row.get("t3_settlement_return_pct")), 4) if pd.notna(row.get("t3_settlement_return_pct")) else None,
-    }, row)
+    }
+    if production_model:
+        payload["model_version"] = GLOBAL_SNIPER_PRODUCTION_VERSION
+        payload["selection_mode"] = GLOBAL_SNIPER_SELECTION_MODE
+        payload["production_model"] = production_model
+    return attach_pick_theme_fields(payload, row)

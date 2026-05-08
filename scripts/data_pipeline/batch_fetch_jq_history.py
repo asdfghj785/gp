@@ -7,14 +7,13 @@ from pathlib import Path
 from typing import Sequence
 
 import pandas as pd
-from jqdatasdk import get_price, get_query_count
 from tqdm import tqdm
 
 BASE_DIR = Path("/Users/eudis/ths")
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from quant_core.config import MIN_KLINE_DIR
+from quant_core.config import JQ_FETCH_ENABLED, MIN_KLINE_DIR
 from quant_core.data_pipeline.fetch_minute_data import init_jq, normalize_code
 from quant_core.utils.stock_filter import get_core_universe
 
@@ -28,6 +27,17 @@ FIELDS = ["open", "close", "high", "low", "volume", "money"]
 
 
 def batch_fetch_jq_history(limit: int | None = None, force: bool = False, one: bool = False) -> dict[str, object]:
+    if not JQ_FETCH_ENABLED:
+        return {
+            "status": "disabled",
+            "reason": "聚宽冷数据获取已停用；保留本地历史缓存，新增分钟热数据走腾讯/Ashare 归档。",
+            "universe": 0,
+            "success": 0,
+            "skipped": 0,
+            "failed": 0,
+            "range": f"{START_DATE} -> {END_DATE}",
+        }
+
     init_jq()
     universe = get_core_universe()
     if one:
@@ -80,6 +90,11 @@ def batch_fetch_jq_history(limit: int | None = None, force: bool = False, one: b
 
 
 def _fetch_one_jq(code: str) -> pd.DataFrame:
+    if not JQ_FETCH_ENABLED:
+        return pd.DataFrame(columns=_columns())
+
+    from jqdatasdk import get_price
+
     jq_code = normalize_code(code)
     raw = get_price(
         jq_code,
@@ -148,7 +163,12 @@ def _is_complete_file(path: Path) -> bool:
 
 
 def _quota_spare() -> int | None:
+    if not JQ_FETCH_ENABLED:
+        return None
+
     try:
+        from jqdatasdk import get_query_count
+
         raw = get_query_count()
     except Exception:
         return None

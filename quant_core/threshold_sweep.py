@@ -7,7 +7,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-from quant_core.config import DIPBUY_MIN_SCORE, PROFIT_TARGET_PCT
+from quant_core.config import BASE_DIR, DIPBUY_MIN_SCORE, PROFIT_TARGET_PCT
 from quant_core.engine.predictor import (
     BREAKOUT_STRATEGY_TYPE,
     DIPBUY_STRATEGY_TYPE,
@@ -28,19 +28,30 @@ class SweepResult:
 
 def sweep_thresholds(
     months: int = 12,
-    start: float = 60.0,
-    end: float = 69.0,
+    start: float = 64.0,
+    end: float = 72.0,
     step: float = 0.5,
     refresh: bool = False,
 ) -> list[SweepResult]:
-    prepared = prepare_evaluated_candidates(months, refresh=refresh)
-    evaluated = prepared.get("evaluated", pd.DataFrame())
+    evaluated = _load_evaluated_candidates(months, refresh=refresh)
     if evaluated.empty:
         return []
 
     risk_pool = _apply_risk_filters(evaluated)
     thresholds = list(_threshold_range(start, end, step))
     return [_evaluate_threshold(risk_pool, threshold) for threshold in thresholds]
+
+
+def _load_evaluated_candidates(months: int, refresh: bool) -> pd.DataFrame:
+    if not refresh:
+        path = BASE_DIR / "data" / "strategy_cache" / f"evaluated_candidates_m{int(months)}.parquet"
+        if path.exists():
+            try:
+                return pd.read_parquet(path)
+            except Exception:
+                pass
+    prepared = prepare_evaluated_candidates(months, refresh=refresh)
+    return prepared.get("evaluated", pd.DataFrame())
 
 
 def format_markdown_table(rows: list[SweepResult]) -> str:
@@ -60,15 +71,24 @@ def choose_sweet_spot(rows: list[SweepResult]) -> SweepResult | None:
     qualified = [
         row
         for row in rows
-        if row.win_rate >= 60.0 and row.avg_open_premium >= 1.5 and 120 <= row.trade_count <= 150
+        if row.win_rate >= 85.0
+        and row.avg_open_premium >= 2.0
+        and row.max_loss_streak <= 3
+        and row.trade_count > 25
     ]
     if qualified:
         return max(qualified, key=lambda row: (row.trade_count, row.win_rate, row.avg_open_premium))
 
-    fallback = [row for row in rows if row.win_rate >= 60.0 and row.avg_open_premium >= 1.5]
+    fallback = [
+        row
+        for row in rows
+        if row.win_rate >= 85.0
+        and row.avg_open_premium >= 2.0
+        and row.max_loss_streak <= 3
+    ]
     if not fallback:
         return None
-    return min(fallback, key=lambda row: (abs(row.trade_count - 135), -row.win_rate, -row.avg_open_premium))
+    return max(fallback, key=lambda row: (row.trade_count, row.win_rate, row.avg_open_premium))
 
 
 def _apply_risk_filters(df: pd.DataFrame) -> pd.DataFrame:
@@ -76,6 +96,9 @@ def _apply_risk_filters(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     filtered = df.copy()
+    filtered = filtered[_strategy(filtered).eq(BREAKOUT_STRATEGY_TYPE)].copy()
+    if filtered.empty:
+        return filtered
     if "纯代码" in filtered.columns:
         filtered = filtered[~filtered["纯代码"].astype(str).str.startswith(("68", "689"), na=False)].copy()
     filtered = _attach_historical_market_modes(filtered)
@@ -126,16 +149,14 @@ def _apply_variable_score_gate(df: pd.DataFrame, breakout_threshold: float) -> p
     filtered = df.copy()
     strategy = _strategy(filtered)
     score = _num(filtered, "综合评分")
-    is_dipbuy = strategy.eq(DIPBUY_STRATEGY_TYPE)
-    is_breakout = strategy.eq(BREAKOUT_STRATEGY_TYPE) | ~is_dipbuy
-    qualified = ((is_breakout) & (score >= breakout_threshold)) | ((is_dipbuy) & (score >= DIPBUY_MIN_SCORE))
+    is_breakout = strategy.eq(BREAKOUT_STRATEGY_TYPE)
+    qualified = is_breakout & (score >= breakout_threshold)
     filtered = filtered[qualified].copy()
     if filtered.empty:
         return filtered
 
     filtered["strategy_type"] = strategy.loc[filtered.index]
     threshold = pd.Series(float(breakout_threshold), index=filtered.index, dtype="float64")
-    threshold.loc[filtered["strategy_type"].eq(DIPBUY_STRATEGY_TYPE)] = DIPBUY_MIN_SCORE
     filtered["生产门槛"] = threshold
     return apply_strategy_sort_score(filtered)
 
@@ -185,8 +206,8 @@ def _num(df: pd.DataFrame, col: str) -> pd.Series:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sweep breakout score thresholds using cached evaluated candidates.")
     parser.add_argument("--months", type=int, default=12)
-    parser.add_argument("--start", type=float, default=60.0)
-    parser.add_argument("--end", type=float, default=69.0)
+    parser.add_argument("--start", type=float, default=64.0)
+    parser.add_argument("--end", type=float, default=72.0)
     parser.add_argument("--step", type=float, default=0.5)
     parser.add_argument("--refresh", action="store_true", help="Refresh evaluated candidates before sweeping.")
     args = parser.parse_args()
@@ -199,7 +220,7 @@ def main() -> None:
     print(format_markdown_table(rows))
     sweet_spot = choose_sweet_spot(rows)
     if sweet_spot is None:
-        print("\n甜蜜点：未找到同时满足胜率>=60%、平均溢价>=1.5%的门槛。")
+        print("\n甜蜜点：未找到同时满足胜率>=85%、平均溢价>=2%、最大连亏<=3、出手次数>25的降阈值门槛。")
     else:
         print(
             "\n甜蜜点："

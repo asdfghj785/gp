@@ -7,5 +7,4 @@ requests
 beautifulsoup4
 pyarrow
 akshare
-jqdatasdk
 tqdm

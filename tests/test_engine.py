@@ -9,7 +9,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from quant_core.engine.predictor import scan_market  # noqa: E402
+from quant_core.engine.predictor import PRODUCTION_OUTPUT_STRATEGIES, scan_market  # noqa: E402
 
 
 def main() -> None:
@@ -33,7 +33,7 @@ def main() -> None:
     print(f"returned_rows: {len(rows)}")
     print("")
 
-    for strategy in ["右侧主升浪", "中线超跌反转", "尾盘突破"]:
+    for strategy in PRODUCTION_OUTPUT_STRATEGIES:
         row = top_by_strategy.get(strategy)
         if not row:
             print(f"[{strategy}] Top1: 空仓 / 未达到门槛")

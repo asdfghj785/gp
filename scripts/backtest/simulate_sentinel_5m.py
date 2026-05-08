@@ -19,11 +19,22 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 try:
-    from quant_core.config import MIN_KLINE_DIR, PAUSED_STRATEGY_TYPES, SQLITE_PATH
+    from quant_core.config import MIN_KLINE_DIR, PAUSED_STRATEGY_TYPES, RISK_CONTROL_PROFILES, SQLITE_PATH
+    from quant_core.sentinel_cache import daily_picks_signature, sell_strategy_contract
+    from quant_core.storage import minute_5m_window
 except Exception:  # pragma: no cover - standalone fallback
     SQLITE_PATH = BASE_DIR / "data" / "core_db" / "quant_workstation.sqlite3"
     MIN_KLINE_DIR = BASE_DIR / "data" / "min_kline"
     PAUSED_STRATEGY_TYPES = ("右侧主升浪", "中线超跌反转")
+    RISK_CONTROL_PROFILES = {
+        "default": {"hard_stop": -0.03, "trailing_active": 0.03, "trailing_retrace": 0.01, "eod_stop": -0.02},
+        "ST特情": {"hard_stop": -0.04, "trailing_active": 0.04, "trailing_retrace": 0.02, "eod_stop": -0.015},
+        "尾盘突破": {"hard_stop": -0.04, "trailing_active": 0.04, "trailing_retrace": 0.02, "eod_stop": -0.015},
+        "全局狙击_V6": {"hard_stop": -0.05, "trailing_active": 0.06, "trailing_retrace": 0.025, "eod_stop": -0.03},
+    }
+    daily_picks_signature = None
+    sell_strategy_contract = None
+    minute_5m_window = None
 
 PRE_ADJUSTED_5M_DIR = Path("/Users/eudis/5min/organized_5min_pre_adj")
 PROJECT_HOT_5M_DIR = MIN_KLINE_DIR / "5m"
@@ -32,23 +43,30 @@ _PRE_ADJUSTED_SYMBOL_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
 _PRE_ADJUSTED_CACHE_READY: set[str] = set()
 
 REGULAR_ARMY_STRATEGIES = {"右侧主升浪", "中线超跌反转"}
-SNIPER_BREAKOUT_STRATEGIES = {"全局动量狙击", "尾盘突破"}
+SNIPER_BREAKOUT_STRATEGIES = {"全局动量狙击", "尾盘突破", "尾盘突破-ST特情"}
 STRATEGY_PRIORITY = {
     "全局动量狙击": 4,
     "右侧主升浪": 3,
     "中线超跌反转": 2,
     "尾盘突破": 1,
+    "尾盘突破-ST特情": 0.8,
     "首阴低吸": 0,
 }
 
-REGULAR_INTRADAY_DISASTER_STOP_PCT = 0.06
-SNIPER_INTRADAY_DISASTER_STOP_PCT = 0.04
-REGULAR_EOD_STRUCTURAL_STOP_PCT = 0.03
-SNIPER_EOD_STRUCTURAL_STOP_PCT = 0.015
-TRAILING_ARM_PCT = 0.04
-TRAILING_PULLBACK_PCT = 0.02
-DEFAULT_BUY_TIME = time(14, 50)
-EOD_STRUCTURAL_STOP_TIMES = {time(14, 50), time(14, 55)}
+_SELL_CONTRACT = sell_strategy_contract() if sell_strategy_contract else {}
+_RISK_CONTROL_PROFILES = _SELL_CONTRACT.get("risk_control_profiles") or RISK_CONTROL_PROFILES
+REGULAR_INTRADAY_DISASTER_STOP_PCT = float(_SELL_CONTRACT.get("regular_intraday_disaster_stop_pct", 0.06))
+SNIPER_INTRADAY_DISASTER_STOP_PCT = float(_SELL_CONTRACT.get("sniper_intraday_disaster_stop_pct", 0.04))
+REGULAR_EOD_STRUCTURAL_STOP_PCT = float(_SELL_CONTRACT.get("regular_eod_structural_stop_pct", 0.03))
+SNIPER_EOD_STRUCTURAL_STOP_PCT = float(_SELL_CONTRACT.get("sniper_eod_structural_stop_pct", 0.015))
+TRAILING_ARM_PCT = float(_SELL_CONTRACT.get("trailing_arm_pct", 0.04))
+TRAILING_PULLBACK_PCT = float(_SELL_CONTRACT.get("trailing_pullback_pct", 0.02))
+DEFAULT_BUY_TIME = time.fromisoformat(str(_SELL_CONTRACT.get("default_buy_time", "14:50")))
+EOD_STRUCTURAL_STOP_TIMES = {
+    time.fromisoformat(str(value))
+    for value in _SELL_CONTRACT.get("eod_structural_stop_times", ["14:50", "14:55"])
+}
+STRICT_5M_EXIT_START_DATE = "2024-04-09"
 
 
 @dataclass(frozen=True)
@@ -66,6 +84,9 @@ class BuyRecord:
     selection_change: float
     snapshot_vol_ratio: float
     suggested_position: Optional[float]
+    open_price: Optional[float]
+    open_premium: Optional[float]
+    open_checked_at: str
     close_date: str
     close_price: Optional[float]
     close_return_pct: Optional[float]
@@ -151,8 +172,8 @@ def load_buy_records(db_path: Path, start_date: str, end_date: str) -> list[BuyR
             SELECT id, selection_date, target_date, selected_at, code, name,
                    strategy_type, win_rate, selection_change, snapshot_price,
                    selection_price, snapshot_vol_ratio, suggested_position,
-                   tier, close_date, close_price, close_return_pct, close_reason,
-                   raw_json
+                   tier, open_price, open_premium, open_checked_at,
+                   close_date, close_price, close_return_pct, close_reason, raw_json
             FROM daily_picks
             WHERE selection_date >= ?
               AND selection_date <= ?
@@ -193,6 +214,9 @@ def load_buy_records(db_path: Path, start_date: str, end_date: str) -> list[BuyR
                 selection_change=safe_float(row["selection_change"]),
                 snapshot_vol_ratio=safe_float(row["snapshot_vol_ratio"]),
                 suggested_position=suggested_position_float,
+                open_price=safe_optional_float(row["open_price"]),
+                open_premium=safe_optional_float(row["open_premium"]),
+                open_checked_at=str(row["open_checked_at"] or ""),
                 close_date=str(row["close_date"] or "")[:10],
                 close_price=safe_optional_float(row["close_price"]),
                 close_return_pct=safe_optional_float(row["close_return_pct"]),
@@ -485,6 +509,29 @@ def merge_5m_windows(primary: pd.DataFrame, supplemental: pd.DataFrame) -> pd.Da
 
 
 def load_5m_window(record: BuyRecord, minute_root: Path, replay_end_date: Optional[str]) -> pd.DataFrame:
+    sqlite_bars = load_sqlite_5m_window(record, replay_end_date)
+    if not sqlite_bars.empty:
+        return sqlite_bars
+    print(f"⚠️ [Warning] {record.name}({record.code}) 统一分钟表 stock_minute_5m 无覆盖，已跳过旧聚宽/5min 源。")
+    return pd.DataFrame()
+
+
+def load_sqlite_5m_window(record: BuyRecord, replay_end_date: Optional[str]) -> pd.DataFrame:
+    if minute_5m_window is None:
+        return pd.DataFrame()
+    buy_ts = selected_at_timestamp(record)
+    replay_end = f"{replay_end_date} 15:00:00" if replay_end_date else None
+    try:
+        frame = minute_5m_window(record.code, buy_ts.strftime("%Y-%m-%d %H:%M:%S"), replay_end)
+    except Exception as exc:
+        print(f"⚠️ [Warning] {record.name}({record.code}) 读取统一分钟表失败：{exc}")
+        return pd.DataFrame()
+    if frame.empty:
+        return frame
+    return normalize_5m_frame(frame, record, replay_end_date, "sqlite.stock_minute_5m")
+
+
+def load_5m_window_legacy(record: BuyRecord, minute_root: Path, replay_end_date: Optional[str]) -> pd.DataFrame:
     if is_pre_adjusted_zip_root(minute_root):
         cold = load_pre_adjusted_zip_window(record, minute_root, replay_end_date, warn_missing=False)
         hot = load_project_hot_5m_window(record, replay_end_date)
@@ -569,6 +616,13 @@ def load_pre_adjusted_zip_window(
 
 
 def infer_t3_date(record: BuyRecord, trading_dates: list[str], bars: pd.DataFrame) -> Optional[str]:
+    target_date = str(record.target_date or "")[:10]
+    if target_date and not bars.empty and "trade_date" in bars.columns:
+        target_rows = bars.loc[bars["trade_date"] == target_date]
+        if not target_rows.empty:
+            last_ts = pd.Timestamp(target_rows["datetime"].iloc[-1])
+            if last_ts.time() >= time(14, 55):
+                return target_date
     calendar_t3 = t_plus_n_date(record.buy_date, trading_dates, n=3)
     if calendar_t3:
         return calendar_t3
@@ -602,20 +656,96 @@ def is_sniper_record(record: BuyRecord) -> bool:
     return record.tier == "dynamic_floor"
 
 
+def risk_control_profile_key(record: BuyRecord) -> str:
+    raw = record.raw if isinstance(record.raw, dict) else {}
+    winner = raw.get("winner") if isinstance(raw.get("winner"), dict) else {}
+    explicit = str(
+        raw.get("risk_control_profile")
+        or raw.get("risk_profile_key")
+        or winner.get("risk_control_profile")
+        or winner.get("risk_profile_key")
+        or ""
+    ).strip()
+    if explicit and explicit in _RISK_CONTROL_PROFILES:
+        return explicit
+    strategy_type = str(record.strategy_type or "").strip()
+    if strategy_type == "全局动量狙击":
+        return "全局狙击_V6"
+    if strategy_type == "尾盘突破-ST特情":
+        return "ST特情"
+    if strategy_type == "尾盘突破":
+        return "尾盘突破"
+    if strategy_type in _RISK_CONTROL_PROFILES:
+        return strategy_type
+    return "default"
+
+
+def risk_control_profile(record: BuyRecord) -> dict[str, float]:
+    default_profile = _RISK_CONTROL_PROFILES.get("default") or {}
+    profile = {key: safe_float(value) for key, value in default_profile.items()}
+    selected = _RISK_CONTROL_PROFILES.get(risk_control_profile_key(record)) or {}
+    profile.update({key: safe_float(value) for key, value in selected.items()})
+    if not profile:
+        if is_sniper_record(record):
+            return {
+                "hard_stop": -SNIPER_INTRADAY_DISASTER_STOP_PCT,
+                "trailing_active": TRAILING_ARM_PCT,
+                "trailing_retrace": TRAILING_PULLBACK_PCT,
+                "eod_stop": -SNIPER_EOD_STRUCTURAL_STOP_PCT,
+            }
+        return {
+            "hard_stop": -REGULAR_INTRADAY_DISASTER_STOP_PCT,
+            "trailing_active": TRAILING_ARM_PCT,
+            "trailing_retrace": TRAILING_PULLBACK_PCT,
+            "eod_stop": -REGULAR_EOD_STRUCTURAL_STOP_PCT,
+        }
+    return profile
+
+
+def profile_abs_pct(record: BuyRecord, key: str, fallback: float) -> float:
+    value = safe_float(risk_control_profile(record).get(key), fallback)
+    return abs(value) if value else abs(fallback)
+
+
+def pct_reason_token(pct: float) -> str:
+    text = f"{pct * 100.0:.4f}".rstrip("0").rstrip(".")
+    return f"{text.replace('.', '_')}pct"
+
+
+def pct_label_from_token(token: str) -> str:
+    value = token.replace("pct", "").replace("_", ".")
+    try:
+        number = float(value)
+    except ValueError:
+        return value
+    return f"{number:g}%"
+
+
+def trailing_exit_reason(arm_pct: float, pullback_pct: float) -> str:
+    return f"动态追踪止盈_{pct_reason_token(arm_pct)}引信_{pct_reason_token(pullback_pct)}回撤"
+
+
+def trailing_reason_labels(reason: str) -> tuple[str, str]:
+    match = re.search(r"动态追踪止盈_(.+?)引信_(.+?)回撤", reason)
+    if not match:
+        return "4%", "2%"
+    return pct_label_from_token(match.group(1)), pct_label_from_token(match.group(2))
+
+
 def intraday_disaster_stop_config(record: BuyRecord) -> tuple[str, float]:
-    if is_sniper_record(record):
-        return "盘中暴雷止损_敢死队_4pct", 1.0 - SNIPER_INTRADAY_DISASTER_STOP_PCT
-    return "盘中暴雷止损_正规军_6pct", 1.0 - REGULAR_INTRADAY_DISASTER_STOP_PCT
+    fallback = SNIPER_INTRADAY_DISASTER_STOP_PCT if is_sniper_record(record) else REGULAR_INTRADAY_DISASTER_STOP_PCT
+    stop_pct = profile_abs_pct(record, "hard_stop", fallback)
+    return f"盘中暴雷止损_{risk_control_profile_key(record)}_{pct_reason_token(stop_pct)}", 1.0 - stop_pct
 
 
 def eod_structural_stop_config(record: BuyRecord) -> tuple[str, float]:
-    if is_sniper_record(record):
-        return "尾盘破位卖出_敢死队_1_5pct", 1.0 - SNIPER_EOD_STRUCTURAL_STOP_PCT
-    return "尾盘破位卖出_正规军_3pct", 1.0 - REGULAR_EOD_STRUCTURAL_STOP_PCT
+    fallback = SNIPER_EOD_STRUCTURAL_STOP_PCT if is_sniper_record(record) else REGULAR_EOD_STRUCTURAL_STOP_PCT
+    stop_pct = profile_abs_pct(record, "eod_stop", fallback)
+    return f"尾盘破位卖出_{risk_control_profile_key(record)}_{pct_reason_token(stop_pct)}", 1.0 - stop_pct
 
 
-def strict_trailing_exit_price(highest_price: float, close_price: float) -> float:
-    trigger_price = highest_price * (1.0 - TRAILING_PULLBACK_PCT)
+def strict_trailing_exit_price(highest_price: float, close_price: float, pullback_pct: float) -> float:
+    trigger_price = highest_price * (1.0 - pullback_pct)
     return min(trigger_price, close_price)
 
 
@@ -627,7 +757,15 @@ def simulate_one(
 ) -> SimulationResult:
     bars = load_5m_window(record, minute_root, replay_end_date)
     if bars.empty:
-        fallback = historical_t3_fallback_result(record, record.cost_price, 0, None, "缺失5m数据")
+        fallback = incomplete_5m_fallback_result(
+            record=record,
+            highest_price=record.cost_price,
+            bars_replayed=0,
+            t3_date=None,
+            trading_dates=trading_dates,
+            replay_end_date=replay_end_date,
+            trigger_reason="缺失5m数据",
+        )
         if fallback:
             return fallback
         return SimulationResult(
@@ -657,6 +795,8 @@ def simulate_one(
 
     highest_price = record.cost_price
     trailing_active = False
+    trailing_arm_pct = profile_abs_pct(record, "trailing_active", TRAILING_ARM_PCT)
+    trailing_pullback_pct = profile_abs_pct(record, "trailing_retrace", TRAILING_PULLBACK_PCT)
     disaster_stop_reason, disaster_stop_ratio = intraday_disaster_stop_config(record)
     disaster_stop_price = record.cost_price * disaster_stop_ratio
     eod_stop_reason, eod_stop_ratio = eod_structural_stop_config(record)
@@ -671,7 +811,7 @@ def simulate_one(
         bar_ts = pd.Timestamp(bar["datetime"])
         bar_time = bar_ts.strftime("%Y-%m-%d %H:%M:%S")
 
-        highest_price = max(highest_price, bar_high)
+        result_highest_price = max(highest_price, bar_high)
 
         if bar_low <= disaster_stop_price:
             return build_result(
@@ -680,21 +820,18 @@ def simulate_one(
                 exit_reason=disaster_stop_reason,
                 exit_time=bar_time,
                 exit_price=disaster_stop_price,
-                highest_price=highest_price,
+                highest_price=result_highest_price,
                 bars_replayed=idx + 1,
                 t3_date=t3_date,
             )
 
-        if highest_price >= record.cost_price * (1.0 + TRAILING_ARM_PCT):
-            trailing_active = True
-
-        trailing_trigger_price = highest_price * (1.0 - TRAILING_PULLBACK_PCT)
+        trailing_trigger_price = highest_price * (1.0 - trailing_pullback_pct)
         if trailing_active and bar_low <= trailing_trigger_price:
-            exit_price = strict_trailing_exit_price(highest_price, bar_close)
+            exit_price = strict_trailing_exit_price(highest_price, bar_close, trailing_pullback_pct)
             return build_result(
                 record=record,
                 coverage_status="covered",
-                exit_reason="动态追踪止盈_4pct引信_2pct回撤",
+                exit_reason=trailing_exit_reason(trailing_arm_pct, trailing_pullback_pct),
                 exit_time=bar_time,
                 exit_price=exit_price,
                 highest_price=highest_price,
@@ -709,7 +846,7 @@ def simulate_one(
                 exit_reason=eod_stop_reason,
                 exit_time=bar_time,
                 exit_price=bar_close,
-                highest_price=highest_price,
+                highest_price=result_highest_price,
                 bars_replayed=idx + 1,
                 t3_date=t3_date,
             )
@@ -721,14 +858,32 @@ def simulate_one(
                 exit_reason="T+3强制平仓",
                 exit_time=bar_time,
                 exit_price=bar_close,
-                highest_price=highest_price,
+                highest_price=result_highest_price,
                 bars_replayed=idx + 1,
                 t3_date=t3_date,
             )
 
-    fallback = historical_t3_fallback_result(record, highest_price, len(bars), t3_date, "未到T+3或数据未覆盖到T+3")
+        highest_price = result_highest_price
+        if highest_price >= record.cost_price * (1.0 + trailing_arm_pct):
+            trailing_active = True
+
+    fallback = incomplete_5m_fallback_result(
+        record=record,
+        highest_price=highest_price,
+        bars_replayed=len(bars),
+        t3_date=t3_date,
+        trading_dates=trading_dates,
+        replay_end_date=replay_end_date,
+        trigger_reason="未到T+3或数据未覆盖到T+3",
+    )
     if fallback:
         return fallback
+    last_bar_time = ""
+    if not bars.empty:
+        last_bar_time = pd.Timestamp(bars["datetime"].iloc[-1]).strftime("%Y-%m-%d %H:%M:%S")
+    warning = "有 5m 数据但未触发止损/追踪止盈，且未覆盖到 T+3 14:55-15:00 bar。"
+    if last_bar_time:
+        warning = f"5m 已回放至 {last_bar_time}，未触发止损/追踪止盈/尾盘结构止损；未覆盖到 T+3 14:55-15:00 bar。"
     return SimulationResult(
         pick_id=record.pick_id,
         code=record.code,
@@ -746,7 +901,7 @@ def simulate_one(
         highest_gain_pct=round((highest_price / record.cost_price - 1.0) * 100.0, 4),
         bars_replayed=len(bars),
         t3_date=t3_date,
-        warning="有 5m 数据但未触发止损/追踪止盈，且未覆盖到 T+3 14:55-15:00 bar。",
+        warning=warning,
     )
 
 
@@ -780,6 +935,147 @@ def build_result(
         bars_replayed=int(bars_replayed),
         t3_date=t3_date,
     )
+
+
+def allow_daily_t3_fallback(record: BuyRecord) -> bool:
+    return str(record.buy_date or "")[:10] < STRICT_5M_EXIT_START_DATE
+
+
+def incomplete_5m_fallback_result(
+    record: BuyRecord,
+    highest_price: float,
+    bars_replayed: int,
+    t3_date: Optional[str],
+    trading_dates: list[str],
+    replay_end_date: Optional[str],
+    trigger_reason: str,
+) -> Optional[SimulationResult]:
+    if record.strategy_type == "全局动量狙击":
+        return global_t3_fallback_result(
+            record,
+            highest_price,
+            bars_replayed,
+            t3_date,
+            trading_dates,
+            replay_end_date,
+            trigger_reason,
+        )
+    if record.strategy_type in {"尾盘突破", "尾盘突破-ST特情"}:
+        return next_open_fallback_result(record, highest_price, bars_replayed, trading_dates, replay_end_date, trigger_reason)
+    return None
+
+
+def global_t3_fallback_result(
+    record: BuyRecord,
+    highest_price: float,
+    bars_replayed: int,
+    t3_date: Optional[str],
+    trading_dates: list[str],
+    replay_end_date: Optional[str],
+    trigger_reason: str,
+) -> Optional[SimulationResult]:
+    settlement_date = record.target_date or t3_date or t_plus_n_date(record.buy_date, trading_dates, n=3) or ""
+    replay_end = str(replay_end_date or date.today().isoformat())[:10]
+    if settlement_date and settlement_date > replay_end:
+        return None
+    close_price = None
+    if settlement_date:
+        close_price = stock_daily_price(record.code, settlement_date, "close")
+    if (close_price is None or close_price <= 0) and str(record.close_date or "")[:10] == settlement_date:
+        close_price = record.close_price
+    if close_price is None or close_price <= 0:
+        winner = record.raw.get("winner") if isinstance(record.raw.get("winner"), dict) else {}
+        close_price = _first_number(
+            winner.get("t3_settlement_price"),
+            winner.get("t3_close"),
+            winner.get("close_price"),
+        )
+    if close_price is None or close_price <= 0 or not settlement_date:
+        return None
+    close_return = (float(close_price) / record.cost_price - 1.0) * 100.0
+    effective_highest = max(float(highest_price or 0), record.cost_price, float(close_price))
+    highest_gain_pct = (effective_highest / record.cost_price - 1.0) * 100.0
+    return SimulationResult(
+        pick_id=record.pick_id,
+        code=record.code,
+        name=record.name,
+        buy_date=record.buy_date,
+        strategy_type=record.strategy_type,
+        tier=record.tier,
+        cost_price=round(record.cost_price, 4),
+        coverage_status="daily_t3_fallback",
+        exit_reason="无完整5m数据_T+3收盘结算",
+        exit_time=f"{settlement_date} 15:00:00",
+        exit_price=round(float(close_price), 4),
+        yield_pct=round(float(close_return), 4),
+        highest_price=round(effective_highest, 4),
+        highest_gain_pct=round(highest_gain_pct, 4),
+        bars_replayed=int(bars_replayed),
+        t3_date=settlement_date,
+        warning=f"{trigger_reason}；全局动量狙击无完整 5m 覆盖，按 T+3 日线 15:00 收盘价结算。",
+    )
+
+
+def next_open_fallback_result(
+    record: BuyRecord,
+    highest_price: float,
+    bars_replayed: int,
+    trading_dates: list[str],
+    replay_end_date: Optional[str],
+    trigger_reason: str,
+) -> Optional[SimulationResult]:
+    settlement_date = record.target_date or t_plus_n_date(record.buy_date, trading_dates, n=1) or ""
+    replay_end = str(replay_end_date or date.today().isoformat())[:10]
+    if settlement_date and settlement_date > replay_end:
+        return None
+    open_price = record.open_price
+    if (open_price is None or open_price <= 0) and settlement_date:
+        open_price = stock_daily_price(record.code, settlement_date, "open")
+    if open_price is None or open_price <= 0:
+        winner = record.raw.get("winner") if isinstance(record.raw.get("winner"), dict) else {}
+        open_price = _first_number(winner.get("open_price"), winner.get("next_open"), winner.get("t1_open"))
+    if open_price is None or open_price <= 0 or not settlement_date:
+        return None
+    open_return = record.open_premium
+    if open_return is None:
+        open_return = (float(open_price) / record.cost_price - 1.0) * 100.0
+    effective_highest = max(float(highest_price or 0), record.cost_price, float(open_price))
+    highest_gain_pct = (effective_highest / record.cost_price - 1.0) * 100.0
+    return SimulationResult(
+        pick_id=record.pick_id,
+        code=record.code,
+        name=record.name,
+        buy_date=record.buy_date,
+        strategy_type=record.strategy_type,
+        tier=record.tier,
+        cost_price=round(record.cost_price, 4),
+        coverage_status="next_open_fallback",
+        exit_reason="无完整5m数据_T+1开盘结算",
+        exit_time=f"{settlement_date} 09:30:00",
+        exit_price=round(float(open_price), 4),
+        yield_pct=round(float(open_return), 4),
+        highest_price=round(effective_highest, 4),
+        highest_gain_pct=round(highest_gain_pct, 4),
+        bars_replayed=int(bars_replayed),
+        t3_date=settlement_date,
+        warning=f"{trigger_reason}；尾盘突破/ST特情无完整 5m 覆盖，按 T+1 日线 09:30 开盘价结算。",
+    )
+
+
+def stock_daily_price(code: str, trade_date: str, column: str) -> Optional[float]:
+    if column not in {"open", "close"} or not trade_date:
+        return None
+    try:
+        with connect_db(SQLITE_PATH) as conn:
+            row = conn.execute(
+                f"SELECT {column} FROM stock_daily WHERE code = ? AND date = ? LIMIT 1",
+                (normalize_code(code), trade_date),
+            ).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return safe_optional_float(row[column])
 
 
 def historical_t3_fallback_result(
@@ -848,6 +1144,10 @@ def classify_exit_category(reason: Any) -> str:
     text = str(reason or "")
     if text == "T+3日线兜底平仓":
         return "T+3日线兜底平仓"
+    if text == "无完整5m数据_T+3收盘结算":
+        return "无完整5m_T+3收盘"
+    if text == "无完整5m数据_T+1开盘结算":
+        return "无完整5m_T+1开盘"
     if text.startswith("盘中暴雷止损"):
         return "盘中暴雷止损"
     if text.startswith("尾盘破位卖出"):
@@ -856,10 +1156,10 @@ def classify_exit_category(reason: Any) -> str:
         return "硬止损"
     if "追踪止盈" in text:
         return "追踪止盈"
-    if "T+3" in text:
-        return "T+3强制平仓"
     if "缺失" in text or "未到" in text or "无法" in text:
         return "缺失或未结算"
+    if "T+3" in text:
+        return "T+3强制平仓"
     return text or "未知"
 
 
@@ -880,6 +1180,8 @@ def build_report_payload(
             "any_5m_count": 0,
             "covered_count": 0,
             "daily_t3_fallback_count": 0,
+            "next_open_fallback_count": 0,
+            "no_complete_5m_fallback_count": 0,
             "evaluated_count": 0,
             "win_count": 0,
             "loss_count": 0,
@@ -898,6 +1200,7 @@ def build_report_payload(
     any_5m_count = int(pd.to_numeric(df["bars_replayed"], errors="coerce").fillna(0).gt(0).sum())
     covered_count = int((df["coverage_status"] == "covered").sum())
     daily_t3_fallback_count = int((df["coverage_status"] == "daily_t3_fallback").sum())
+    next_open_fallback_count = int((df["coverage_status"] == "next_open_fallback").sum())
     win_count = int((evaluated["yield_pct"] > 0).sum()) if not evaluated.empty else 0
     loss_count = int(len(evaluated) - win_count)
 
@@ -938,6 +1241,8 @@ def build_report_payload(
         "any_5m_count": any_5m_count,
         "covered_count": covered_count,
         "daily_t3_fallback_count": daily_t3_fallback_count,
+        "next_open_fallback_count": next_open_fallback_count,
+        "no_complete_5m_fallback_count": daily_t3_fallback_count + next_open_fallback_count,
         "evaluated_count": int(len(evaluated)),
         "win_count": win_count,
         "loss_count": loss_count,
@@ -948,7 +1253,7 @@ def build_report_payload(
         "reason_counts": reason_counts,
         "category_counts": category_counts,
         "strategy_performance": strategy_performance,
-        "rule": "V5.6 5m 前复权回放：盘中防爆 -6%/-4%，+4% 激活后回撤 -2% 追踪止盈，14:50/14:55 尾盘结构止损 -3%/-1.5%，T+3 最后一根 5m 强制结算；若本地 5m 后续缺口但 daily_picks 已有历史闭环，则用日线 T+3 结算价兜底纳入胜率。",
+        "rule": "V5.6 5m 回放：按实盘 RISK_CONTROL_PROFILES 分策略风控；只有完整 5m 覆盖且触发/到达结算点的样本使用 5m 卖出；无完整 5m 覆盖时，全局动量狙击按 T+3 15:00 收盘价结算，尾盘突破/ST特情按 T+1 09:30 开盘价结算。",
     }
     record_by_id = {record.pick_id: record for record in records}
     rows = [
@@ -968,6 +1273,7 @@ def _payload_envelope(
     db_path: Path,
     minute_root: Path,
 ) -> dict[str, Any]:
+    signature = daily_picks_signature(start_date, end_date, db_path=db_path) if daily_picks_signature else None
     return {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "source": "sentinel_5m_backtest",
@@ -979,6 +1285,7 @@ def _payload_envelope(
         "rows": rows,
         "paused_strategy_types": list(PAUSED_STRATEGY_TYPES),
         "pick_mode": "daily_strategy_top1",
+        "daily_picks_signature": signature,
     }
 
 
@@ -1111,16 +1418,27 @@ def human_exit_reason(reason: Any) -> str:
         "尾盘破位卖出_正规军_3pct": "5m尾盘破位卖出：正规军-3%",
         "尾盘破位卖出_敢死队_1_5pct": "5m尾盘破位卖出：敢死队-1.5%",
         "T+3日线兜底平仓": "历史日线闭环兜底",
+        "无完整5m数据_T+3收盘结算": "无完整5m数据：T+3收盘结算",
+        "无完整5m数据_T+1开盘结算": "无完整5m数据：T+1开盘结算",
         "未到T+3或数据未覆盖到T+3": "5m未覆盖到T+3",
         "缺失5m数据": "缺失5m数据",
     }
-    return labels.get(text, text or "未知")
+    if text in labels:
+        return labels[text]
+    if text.startswith("动态追踪止盈"):
+        return "5m动态追踪止盈"
+    if text.startswith("盘中暴雷止损"):
+        return "5m盘中暴雷止损"
+    if text.startswith("尾盘破位卖出"):
+        return "5m尾盘破位卖出"
+    return text or "未知"
 
 
 def sell_strategy_label(result: SimulationResult) -> str:
     reason = str(result.exit_reason or "")
-    if reason == "动态追踪止盈_4pct引信_2pct回撤":
-        return "V5.6非对称5m风控：+4%激活/-2%回撤追踪止盈"
+    if reason.startswith("动态追踪止盈"):
+        arm_label, pullback_label = trailing_reason_labels(reason)
+        return f"V5.6非对称5m风控：+{arm_label}激活/-{pullback_label}回撤追踪止盈"
     if reason.startswith("盘中暴雷止损"):
         return "V5.6非对称5m风控：盘中防爆止损"
     if reason.startswith("尾盘破位卖出"):
@@ -1129,11 +1447,19 @@ def sell_strategy_label(result: SimulationResult) -> str:
         return "V5.6非对称5m风控：T+3最后5m强制平仓"
     if reason == "T+3日线兜底平仓":
         return "历史日线闭环兜底结算（本地5m后续缺失）"
+    if reason == "无完整5m数据_T+3收盘结算":
+        return "无完整5m数据：全局狙击按T+3收盘结算"
+    if reason == "无完整5m数据_T+1开盘结算":
+        return "无完整5m数据：尾盘/ST按T+1开盘结算"
     if result.coverage_status == "daily_t3_fallback":
-        return "历史日线闭环兜底结算（本地5m后续缺失）"
+        return "无完整5m数据：全局狙击按T+3收盘结算"
+    if result.coverage_status == "next_open_fallback":
+        return "无完整5m数据：尾盘/ST按T+1开盘结算"
     if result.coverage_status == "missing_5m":
         return "5m数据缺失：等待真实账本闭环"
     if result.coverage_status == "open_or_incomplete":
+        if int(result.bars_replayed or 0) > 0:
+            return "5m已回放至最新本地数据：未触发卖出，继续持仓"
         return "5m数据未覆盖到结算点：等待真实账本闭环"
     return "V5.6非对称5m风控"
 
@@ -1245,10 +1571,10 @@ def print_report(records: list[BuyRecord], results: list[SimulationResult], star
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="V5.6 盘中巡逻兵 5m K-Line Simulator")
-    parser.add_argument("--start-date", default=previous_month_27(), help="默认上个月 27 日")
+    parser.add_argument("--start-date", default=STRICT_5M_EXIT_START_DATE, help="默认使用影子账本历史起点 2024-04-09")
     parser.add_argument("--end-date", default=date.today().isoformat(), help="默认今天")
     parser.add_argument("--db-path", default=str(SQLITE_PATH))
-    parser.add_argument("--minute-root", default=str(PRE_ADJUSTED_5M_DIR))
+    parser.add_argument("--minute-root", default="sqlite.stock_minute_5m", help="兼容参数；生产默认只读统一 SQLite 分钟表")
     parser.add_argument("--output-json", default="", help="输出标准账本缓存 JSON；默认写入 data/strategy_cache/sentinel_5m_backtest_*.json")
     parser.add_argument("--no-cache", action="store_true", help="只打印报告，不写 JSON 缓存")
     return parser.parse_args()
@@ -1265,7 +1591,8 @@ def main() -> None:
         print(f"区间 {args.start_date} -> {args.end_date} 没有读取到买入记录。")
         return
 
-    prime_pre_adjusted_zip_cache(records, minute_root, args.end_date)
+    if args.minute_root != "sqlite.stock_minute_5m":
+        prime_pre_adjusted_zip_cache(records, minute_root, args.end_date)
     results = [simulate_one(record, minute_root, trading_dates, args.end_date) for record in records]
     payload = build_report_payload(records, results, args.start_date, args.end_date, db_path, minute_root)
     if not args.no_cache:
